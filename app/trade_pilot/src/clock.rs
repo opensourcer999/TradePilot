@@ -55,6 +55,33 @@ impl Clock for SystemClock {
     }
 }
 
+/// A clock that runs like the real one from a chosen moment on: for the demo pictures, which must show an open market whenever they
+/// are made.
+#[derive(Clone, Copy, Debug)]
+pub struct ShiftedClock {
+    offset: chrono::Duration,
+}
+
+impl ShiftedClock {
+    /// A clock that reads `new_york` (a New York local time) now and runs on from there.
+    #[must_use]
+    pub fn from_new_york(new_york: NaiveDateTime) -> Self {
+        use chrono::TimeZone;
+        let start = chrono_tz::America::New_York.from_local_datetime(&new_york).earliest().map_or_else(Utc::now, |t| t.with_timezone(&Utc));
+        Self { offset: start - Utc::now() }
+    }
+}
+
+impl Clock for ShiftedClock {
+    fn utc(&self) -> DateTime<Utc> {
+        Utc::now() + self.offset
+    }
+
+    fn instant(&self) -> Instant {
+        Instant::now()
+    }
+}
+
 /// Whether `period` has passed since `last` (or nothing was done yet); when it has, `last` becomes `now`. For work that runs at most
 /// once every `period`.
 pub fn due(last: &mut Option<Instant>, now: Instant, period: std::time::Duration) -> bool {

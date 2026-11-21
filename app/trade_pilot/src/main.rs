@@ -31,6 +31,7 @@ mod schedule_editor;
 mod schedule_export;
 mod schedule_form;
 mod schedule_run;
+mod settings_help;
 mod storage;
 mod templates;
 #[cfg(test)]
@@ -82,6 +83,8 @@ fn main() -> eframe::Result<()> {
     });
     // With --screenshot: draws the UI as if TWS were connected (no connection is made).
     let preview_connected = args.iter().any(|a| a == "--preview-connected");
+    // With --screenshot: made-up trades and prices on a dummy paper account instead of the person's own data (pictures for the README).
+    let demo = args.iter().any(|a| a == "--demo");
     // Screenshots of the Reports tabs: --reports-tab overview|equity|daily|log.
     let reports_tab = args.iter().position(|a| a == "--reports-tab").and_then(|i| args.get(i + 1)).cloned();
     // With --screenshot --preview-connected: an example Instant Order with its confirmation open.
@@ -136,6 +139,9 @@ fn main() -> eframe::Result<()> {
             }
             if preview_connected {
                 app.preview_connected();
+            }
+            if demo {
+                app.preview_demo();
             }
             if let Some(action) = &preview_confirm {
                 app.preview_instant_confirm(action);

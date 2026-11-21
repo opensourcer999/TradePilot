@@ -17,6 +17,16 @@ fn validates_configurable_tws_endpoint() {
 }
 
 #[test]
+fn the_client_id_is_a_whole_number_from_zero_and_empty_means_the_default() {
+    assert_eq!(parse_client_id(" 7 "), Ok(7));
+    assert_eq!(parse_client_id("0"), Ok(0));
+    assert_eq!(parse_client_id(""), Ok(IB_CLIENT_ID));
+    assert!(parse_client_id("-1").is_err());
+    assert!(parse_client_id("1.5").is_err());
+    assert!(parse_client_id("abc").is_err());
+}
+
+#[test]
 fn parses_real_account_summary_and_position_messages() {
     let summary = ["63", "1", "9001", "DU123", "NetLiquidation", "123456.78", "USD", ""].map(str::to_string);
     assert_eq!(parse_account_summary(&summary).unwrap(), Some(("DU123".into(), "NetLiquidation".into(), "123456.78".into(), "USD".into())));

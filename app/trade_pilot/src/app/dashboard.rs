@@ -176,7 +176,7 @@ impl App {
     /// The raw executions of today as a collapsible table; open when the list of trades is empty.
     fn executions_section(&self, ui: &mut egui::Ui, open: bool) {
         ui.add_space(12.0);
-        let heading = format!("{} ({})", self.tr("Executions from TWS", "Ausführungen von TWS"), self.today_trades.len());
+        let heading = format!("{} ({})", self.tr("Executions from TWS", "Ausführungen der TWS"), self.today_trades.len());
         egui::CollapsingHeader::new(RichText::new(heading).size(13.0).color(muted_text())).default_open(open).show(ui, |ui| {
             ui.add_space(4.0);
             let columns = [

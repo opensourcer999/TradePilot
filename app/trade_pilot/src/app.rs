@@ -4,10 +4,13 @@ mod closing;
 mod conditions_page;
 mod custom_trade;
 mod dashboard;
+mod demo;
 mod early_exit;
+mod housekeeping;
 mod indicators;
 mod instant_order;
 mod logs_page;
+mod margin_retry;
 mod market_pages;
 mod news;
 mod news_translate;
@@ -17,8 +20,11 @@ mod reentry;
 mod reports_page;
 mod schedules_page;
 mod settings_page;
+mod stop_conversion;
+mod stop_split;
 mod template_editor;
 mod templates_page;
+mod ticker;
 mod timed_exit;
 mod triggers;
 
@@ -51,9 +57,9 @@ use crate::schedule_run::{
 use crate::storage;
 use crate::storage::{
     append_execution, append_log, append_trade, executions_path, list_backups, load_commissions, load_executions, load_settings, load_trades,
-    load_trading_mode, log_path, mode_dir, read_backup, seed_mode_dir, settings_path, trades_path, update_trade, write_backup, write_settings,
-    write_trading_mode, AlertFlags, ConvertFlags, ExitLevels, MailFlags, MiscFlags, NotifyFlags, PersistedSettings, RelSettings, StopAdjustment,
-    StopAdjustments, StopSafetyFlags, StoredExecution, StoredLeg, StoredTrade, SymbolConfig, TimeFlags, ViewFlags,
+    load_trading_mode, log_path, mode_dir, seed_mode_dir, settings_path, trades_path, update_trade, write_backup, write_settings, write_trading_mode,
+    AlertFlags, ConvertFlags, ExitLevels, MailFlags, MiscFlags, NotifyFlags, PersistedSettings, RelSettings, StopAdjustment, StopAdjustments, StopSafetyFlags,
+    StoredExecution, StoredLeg, StoredTrade, SymbolConfig, TimeFlags, ViewFlags,
 };
 use crate::template_form::{
     custom_target_types, parse_dec, CalendarLeg, CalendarLegForm, Field, LongSideForm, Part, ShortSideForm, Side, TemplateError, TemplateForm, TimeField,
@@ -79,15 +85,15 @@ use crate::trade_summary::{credit_summary, delta_total, display_currency, displa
 use crate::widgets::{
     bar_button, bar_button_danger, bar_separator, change_chip, data_table, data_table_rows, draw_gauge, draw_nav_icon, empty_state, form_combo, form_number,
     form_text, form_toggle, format_delta, framed_card, gauge_card, gauge_card_height, kpi_card, labeled, line_chart, load_logo_texture, market_badge, nav_item,
-    navy_bar, next_selection, section_header, segmented, set_grid_font_size, setting_row, sparkline, stat_tile, status_item, sweep_active, time_picker,
-    toggle_switch, trade_table, two_way_slider, validated, white_card, GaugeSpec, TableCell, TableColumn, TradeRowView, CARD_SCROLLBAR_GAP, PCR_TICKS,
-    STATUS_ERROR, STATUS_NEUTRAL, STATUS_OK, STATUS_PENDING, WIN_TICKS,
+    navy_bar, next_selection, section_header, segmented, set_compact_grid, set_grid_font_size, setting_row, sparkline, stat_tile, status_item, sweep_active,
+    time_picker, toggle_switch, trade_table, two_way_slider, validated, white_card, GaugeSpec, TableCell, TableColumn, TradeRowView, CARD_SCROLLBAR_GAP,
+    PCR_TICKS, STATUS_ERROR, STATUS_NEUTRAL, STATUS_OK, STATUS_PENDING, WIN_TICKS,
 };
 use broker::{
-    connect_to_tws, looks_like_paper_account, parse_tws_endpoint, ExecutionRow, IbComboLeg, IbContract, IbOrder, OrderHandling, Position, TwsCommand, TwsEvent,
-    IB_CLIENT_ID, IB_TWS_HOST, IB_TWS_PORT, TICK_ASK, TICK_ASK_SIZE, TICK_BID, TICK_BID_SIZE, TICK_CLOSE, TICK_DELAYED_ASK, TICK_DELAYED_ASK_SIZE,
-    TICK_DELAYED_BID, TICK_DELAYED_BID_SIZE, TICK_DELAYED_CLOSE, TICK_DELAYED_LAST, TICK_DELAYED_LAST_SIZE, TICK_DELAYED_OPEN, TICK_LAST, TICK_LAST_SIZE,
-    TICK_OPEN,
+    connect_to_tws, looks_like_paper_account, parse_client_id, parse_tws_endpoint, ExecutionRow, IbComboLeg, IbContract, IbOrder, OrderHandling, Position,
+    TwsCommand, TwsEvent, IB_CLIENT_ID, IB_TWS_HOST, IB_TWS_PORT, TICK_ASK, TICK_ASK_SIZE, TICK_BID, TICK_BID_SIZE, TICK_CLOSE, TICK_DELAYED_ASK,
+    TICK_DELAYED_ASK_SIZE, TICK_DELAYED_BID, TICK_DELAYED_BID_SIZE, TICK_DELAYED_CLOSE, TICK_DELAYED_LAST, TICK_DELAYED_LAST_SIZE, TICK_DELAYED_OPEN,
+    TICK_LAST, TICK_LAST_SIZE, TICK_OPEN,
 };
 use core_types::{calculate_greeks, IV_TOLERANCE};
 use eframe::egui::{self, Color32, RichText};
@@ -300,6 +306,10 @@ struct SentTemplateOrder {
     /// `fill_wait` seconds. Only for orders transmitted right away; one held in TWS for review
     /// is never changed or cancelled by this app.
     fill: Option<FillAttempts>,
+    /// How often this entry was sent again after a margin rejection before this order (0 for the first order).
+    margin_attempt: u32,
+    /// When this order, refused for margin, is to be sent again (see `margin_retry`).
+    retry_due: Option<Instant>,
 }
 
 /// The re-pricing state of one sent template order.
@@ -560,8 +570,8 @@ fn stored_commissions(live: bool) -> std::collections::HashMap<String, Decimal> 
 
 /// One stored trade as the Dashboard counts it, valued at the chain's current quotes.
 fn stored_record(t: &StoredTrade, chains: &OptionChains) -> Option<TradeRecord> {
-    if t.entry_unknown {
-        return None; // never counted: its entry price is not known
+    if t.entry_unknown || t.is_split() {
+        return None; // never counted: its entry price is not known, or its sides count instead
     }
     let price_open = t.price_open;
     // A finished trade counts at its closing price; an open one (or an unknown status) live.
@@ -846,6 +856,8 @@ pub struct App {
     folder_pick: Option<std::sync::mpsc::Receiver<Option<String>>>,
     new_symbol: String,
     new_symbol_required_dtes: String,
+    /// The quote window of the symbol being added or edited (points around the underlying; empty = the default of the symbol).
+    new_symbol_window: SymbolWindowForm,
     /// The rows selected in the lists of the Settings page.
     settings_selection: SettingsSelection,
     risk_limits: OrderRiskLimits,
@@ -865,6 +877,10 @@ pub struct App {
     session: TwsSession,
     /// The day (yyyy-MM-dd, local) the trades were last exported automatically for (see `daily_csv_tick`).
     csv_exported_day: Option<String>,
+    /// The local day the daily jobs last ran on (see `housekeeping_tick`).
+    housekeeping_day: Option<chrono::NaiveDate>,
+    /// SPX divided by the ETF of the estimate, from the last moment both had a live price (see `ticker`).
+    spx_etf_ratio: Option<f64>,
     /// Calendars (order id, strikes) whose near expiration was already reported this run.
     calendar_expiry_warned: Vec<(i32, String)>,
     /// What the watchers behind the warning mails remember (see `watch`).
@@ -1045,6 +1061,22 @@ fn index_contract(symbol: &str) -> IbContract {
     IbContract { symbol: symbol.to_string(), sec_type: "IND".to_string(), exchange: "CBOE".to_string(), currency: "USD".to_string(), ..IbContract::default() }
 }
 
+/// The contract of a row of `App::quotes`: the ETF that the SPX estimate follows outside the regular hours is a stock, the rest are
+/// indices.
+fn quote_contract(label: &str) -> IbContract {
+    if label == ticker::ESTIMATE_ETF {
+        IbContract {
+            symbol: label.to_string(),
+            sec_type: "STK".to_string(),
+            exchange: "SMART".to_string(),
+            currency: "USD".to_string(),
+            ..IbContract::default()
+        }
+    } else {
+        index_contract(label)
+    }
+}
+
 ///
 /// The values of `settings_saved` until the real ones are known: `App::new` overwrites them.
 fn blank_saved_settings() -> PersistedSettings {
@@ -1131,7 +1163,7 @@ fn confirm_buttons(ui: &mut egui::Ui, de: bool) -> (bool, bool) {
     let mut send = false;
     let mut cancel = false;
     ui.add_space(10.0);
-    ui.label(if de { "Möchtest du diesen Trade jetzt so an TWS übertragen?" } else { "Do you want to send this trade to TWS now?" });
+    ui.label(if de { "Möchtest du diesen Trade jetzt so an die TWS übertragen?" } else { "Do you want to send this trade to TWS now?" });
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         let send_label = RichText::new(if de { "Jetzt übertragen" } else { "Send now" }).color(Color32::WHITE).strong();
@@ -1335,11 +1367,23 @@ struct UiState {
     mail_status: Option<String>,
     /// The question whether the logs are really to be cleared is open.
     confirm_clear_logs: bool,
+    /// What the last restore or delete of a backup did, shown above the list of backups (text, and whether it is a problem).
+    backup_status: Option<(String, bool)>,
+    /// The backup (file name) the person is asked to confirm deleting.
+    confirm_delete_backup: Option<String>,
 }
 
 impl Default for UiState {
     fn default() -> Self {
-        Self { log_view: None, trade_filter: "All".to_string(), selected_trade: None, mail_status: None, confirm_clear_logs: false }
+        Self {
+            log_view: None,
+            trade_filter: "All".to_string(),
+            selected_trade: None,
+            mail_status: None,
+            confirm_clear_logs: false,
+            backup_status: None,
+            confirm_delete_backup: None,
+        }
     }
 }
 
@@ -1401,6 +1445,15 @@ struct ScheduleState {
     group: u8,
     /// The import card.
     import: ImportCard,
+}
+
+/// The fields of the quote window of a symbol on the Settings page, as typed.
+#[derive(Default)]
+struct SymbolWindowForm {
+    put_otm: String,
+    call_otm: String,
+    put_itm: String,
+    call_itm: String,
 }
 
 /// The rows selected in the lists of the Settings page.
@@ -1553,6 +1606,7 @@ impl App {
             folder_pick: None,
             new_symbol: String::new(),
             new_symbol_required_dtes: String::new(),
+            new_symbol_window: SymbolWindowForm::default(),
             settings_selection: SettingsSelection::default(),
             template_order_flags: TemplateOrderFlags::default(),
             risk_limits: default_risk_limits(),
@@ -1566,6 +1620,8 @@ impl App {
             exit_coverage: ExitCoverage::default(),
             session: TwsSession::new(clock.instant()),
             csv_exported_day: None,
+            housekeeping_day: None,
+            spx_etf_ratio: None,
             calendar_expiry_warned: Vec::new(),
             watch: crate::watch::WatchState::default(),
             indicators: indicators::IndicatorState::default(),
@@ -1592,8 +1648,8 @@ impl App {
         // Load persisted settings (if any) over the hardcoded defaults above, then take the
         // post-load snapshot as the "saved" baseline so the UI doesn't start up flagged dirty.
         // Tests start from the defaults: they must not read, and so not use, the real settings of the machine.
-        if let Some(loaded) = load_settings(trading_live).filter(|_| !cfg!(test)) {
-            app.apply_settings(loaded);
+        if let Some(loaded) = load_settings(trading_live, &default_settings()).filter(|_| !cfg!(test)) {
+            app.apply_loaded_settings(loaded);
         }
         app.settings_saved = app.current_settings();
         app.refresh_trades(app.clock.instant(), true);
@@ -1678,6 +1734,18 @@ impl App {
         if self.settings.settings_maintain_connection == "Enabled" {
             self.settings.settings_maintain_connection = "Always".to_string();
         }
+    }
+
+    /// The settings file of the mode as read at the start or a switch of the mode: one of an older version is taken as far as it
+    /// goes, and the log names the settings that took their default or were left out.
+    fn apply_loaded_settings(&mut self, loaded: crate::storage::Restored) {
+        if !loaded.exact() {
+            self.log(&format!(
+                "Settings file of an earlier version: not in it, so at their default: {:?}; unknown, left out: {:?}; unusable, at their default: {:?} - check them and click Save Settings",
+                loaded.missing, loaded.unknown, loaded.unusable
+            ));
+        }
+        self.apply_settings(loaded.settings);
     }
 
     /// True while the live Settings-page values differ from what's actually on disk.
@@ -1786,8 +1854,8 @@ impl App {
                 self.log(&format!("Could not save the Live/Paper mode: {error}"));
             }
         }
-        if let Some(loaded) = load_settings(live) {
-            self.apply_settings(loaded);
+        if let Some(loaded) = load_settings(live, &default_settings()) {
+            self.apply_loaded_settings(loaded);
         }
         self.settings_saved = self.current_settings();
         self.load_mode_templates(live);
@@ -1848,7 +1916,7 @@ impl App {
         if !self.session.broken_data_farms.is_empty() {
             let farms = self.session.broken_data_farms.join(", ");
             return Some(match self.settings.lang {
-                Lang::De => format!("Datenverbindung von TWS unterbrochen ({farms}) - Kurse sind eingefroren"),
+                Lang::De => format!("Datenverbindung von der TWS unterbrochen ({farms}) - Kurse sind eingefroren"),
                 Lang::En => format!("TWS data connection broken ({farms}) - prices are frozen"),
             });
         }
@@ -1861,7 +1929,7 @@ impl App {
             (market_open && silent >= STALE_PRICES_AFTER).then(|| {
                 let secs = silent.as_secs();
                 match self.settings.lang {
-                    Lang::De => format!("seit {secs}s keine neuen Kurse von TWS"),
+                    Lang::De => format!("seit {secs}s keine neuen Kurse von der TWS"),
                     Lang::En => format!("no new prices from TWS for {secs}s"),
                 }
             })
@@ -1871,7 +1939,7 @@ impl App {
             (market_open && connected_for >= NO_MARKET_DATA_AFTER).then(|| {
                 let secs = connected_for.as_secs();
                 match self.settings.lang {
-                    Lang::De => format!("seit {secs}s keine Kurse von TWS - Marktdaten-Abos in TWS prüfen"),
+                    Lang::De => format!("seit {secs}s keine Kurse von der TWS - Marktdaten-Abos in der TWS prüfen"),
                     Lang::En => format!("no prices from TWS for {secs}s - check the market data subscriptions in TWS"),
                 }
             })
@@ -1963,7 +2031,7 @@ impl App {
             let new_id = self.next_request_id();
             let Some(quote) = self.quotes.get_mut(i) else { continue };
             send_counted(&sender, TwsCommand::CancelMarketData { req_id: quote.req_id }, &mut unsent);
-            send_counted(&sender, TwsCommand::RequestMarketData { req_id: new_id, contract: index_contract(&quote.label) }, &mut unsent);
+            send_counted(&sender, TwsCommand::RequestMarketData { req_id: new_id, contract: quote_contract(&quote.label) }, &mut unsent);
             quote.req_id = new_id;
             quote.requested_at = now;
             quote.acknowledged = false;
@@ -2340,11 +2408,12 @@ impl App {
             self.instant.option_expirations.sort();
             self.instant.option_strikes.sort_by(f64::total_cmp);
             self.instant.option_params_status = if self.instant.option_expirations.is_empty() {
-                self.tr("TWS returned no expiries/strikes for this symbol.", "TWS hat keine Verfalltermine/Strikes für dieses Symbol geliefert.").to_string()
+                self.tr("TWS returned no expiries/strikes for this symbol.", "Die TWS hat keine Verfalltermine/Strikes für dieses Symbol geliefert.")
+                    .to_string()
             } else {
                 format!(
                     "{} ({} {}, {} {})",
-                    self.tr("Loaded from TWS", "Von TWS geladen"),
+                    self.tr("Loaded from TWS", "Von der TWS geladen"),
                     self.instant.option_expirations.len(),
                     self.tr("expiries", "Verfalltermine"),
                     self.instant.option_strikes.len(),
@@ -2473,7 +2542,9 @@ impl App {
     }
 
     fn connect_tws(&mut self, source: &str) {
-        let (host, port) = match parse_tws_endpoint(&self.settings.tws_host, &self.settings.tws_port) {
+        let endpoint = parse_tws_endpoint(&self.settings.tws_host, &self.settings.tws_port)
+            .and_then(|(host, port)| parse_client_id(&self.settings.settings_client_id).map(|client_id| (host, port, client_id)));
+        let (host, port, client_id) = match endpoint {
             Ok(endpoint) => endpoint,
             Err(error) => {
                 self.session.status = error;
@@ -2502,7 +2573,7 @@ impl App {
         self.instant.account.clear();
         let (cmd_sender, cmd_receiver) = mpsc::channel();
         self.tws_cmd_sender = Some(cmd_sender);
-        connect_to_tws(self.tws_sender.clone(), cmd_receiver, stop, host, port);
+        connect_to_tws(self.tws_sender.clone(), cmd_receiver, stop, host, port, client_id);
     }
 
     /// Requests real tick data for SPX and VIX (IB indices, exchange CBOE) once per TWS session,
@@ -2588,7 +2659,7 @@ impl App {
             let new_id = self.next_request_id();
             let Some(quote) = self.quotes.get_mut(i) else { continue };
             send_counted(&sender, TwsCommand::CancelMarketData { req_id: old_id }, &mut unsent);
-            send_counted(&sender, TwsCommand::RequestMarketData { req_id: new_id, contract: index_contract(&quote.label) }, &mut unsent);
+            send_counted(&sender, TwsCommand::RequestMarketData { req_id: new_id, contract: quote_contract(&quote.label) }, &mut unsent);
             quote.req_id = new_id;
             quote.requested_at = now;
             quote.attempts = quote.attempts.saturating_add(1);
@@ -2644,7 +2715,7 @@ impl App {
             let label = quote.label.clone();
             if want_daily {
                 let req_id = self.next_request_id();
-                send_counted(&sender, TwsCommand::RequestDailyBars { req_id, contract: index_contract(&label) }, &mut unsent);
+                send_counted(&sender, TwsCommand::RequestDailyBars { req_id, contract: quote_contract(&label) }, &mut unsent);
                 self.log(&format!("No tick from TWS for {label} - asking for its latest daily close (reqId {req_id})"));
                 if let Some(quote) = self.quotes.get_mut(i) {
                     quote.history_req_id = Some(req_id);
@@ -2652,7 +2723,7 @@ impl App {
             }
             if want_bars {
                 let req_id = self.next_request_id();
-                send_counted(&sender, TwsCommand::RequestLiveBars { req_id, contract: index_contract(&label) }, &mut unsent);
+                send_counted(&sender, TwsCommand::RequestLiveBars { req_id, contract: quote_contract(&label) }, &mut unsent);
                 self.log(&format!("No tick from TWS for {label} while the market is open - streaming its one-minute bars instead (reqId {req_id})"));
                 if let Some(quote) = self.quotes.get_mut(i) {
                     quote.bars_req_id = Some(req_id);
@@ -2713,6 +2784,7 @@ impl App {
             .iter()
             .enumerate()
             .rev()
+            .filter(|(_, t)| !t.is_split())
             .filter(|(_, t)| match self.ui_state.trade_filter.as_str() {
                 "Open" => t.is_open(),
                 "Closed" => !t.is_open(),
@@ -2777,7 +2849,9 @@ impl App {
         }
         self.trades_last_refresh = now;
         self.settle_expired_trades(self.market_session() == Session::AfterClose, &self.clock.new_york_today());
+        self.check_stop_splits(now);
         self.check_stop_adjustments(self.clock.new_york());
+        self.check_stop_conversions(self.clock.new_york(), now);
         self.check_early_exits(self.clock.new_york());
         self.check_timed_exits(self.clock.new_york());
         self.check_profit_target_cancels(self.clock.new_york());
@@ -3092,7 +3166,7 @@ impl App {
                 }
             } else {
                 status_item(ui, STATUS_ERROR, self.tr("Disconnected", "Getrennt"));
-                if bar_button(ui, self.tr("Connect to TWS", "Mit TWS verbinden"), true).clicked() {
+                if bar_button(ui, self.tr("Connect to TWS", "Mit der TWS verbinden"), true).clicked() {
                     action = Some("Connect");
                 }
             }
@@ -3116,9 +3190,10 @@ impl App {
                     item.on_hover_text(format!("IB:{}", self.instant.account));
                 }
 
-                // 3. SPX: last price and time, plain text; orange while prices are frozen (see the
-                // notice).
-                if let Some(spx) = self.quotes.iter().find(|q| q.label == "SPX") {
+                // 3. The price: the symbol chosen in the settings, else SPX - last price and time, plain text; orange while prices are
+                // frozen (see the notice). Outside the regular hours SPX can be an estimate, marked as one.
+                if self.other_price_item(ui, warning.is_some()) {
+                } else if let Some(spx) = self.quotes.iter().find(|q| q.label == "SPX") {
                     // A live price carries no time here: the clock of the bar (right of the curve) tells it. A close from
                     // the history says which day it is from.
                     let shown = match (spx.last, &spx.last_update, &spx.history) {
@@ -3530,6 +3605,7 @@ impl eframe::App for App {
         }
         // Settings > Appearance > Grid Font Size applies at once, also before it is saved.
         set_grid_font_size(&self.settings.settings_grid_font);
+        set_compact_grid(self.settings.misc_flags.settings_mobile_grid);
         set_date_language(self.settings.lang);
         self.color_title_bar(frame);
         self.poll_tws();
@@ -3544,15 +3620,19 @@ impl eframe::App for App {
         self.run_watchers();
         self.check_ema_triggers();
         self.request_live_data_once();
+        self.request_estimate_quote();
+        self.track_spx_ratio();
         self.retry_unanswered_quotes(self.clock.instant(), self.market_is_open());
         self.request_unanswered_history(self.clock.instant());
         self.start_option_chains();
         self.manage_chain_subscriptions(self.clock.instant(), false);
         self.refresh_trades(self.clock.instant(), false);
         self.process_fill_attempts(self.clock.instant());
+        self.margin_retry_tick(self.clock.instant());
         self.sync_instant_quote();
         self.refresh_instant_limit(self.clock.instant());
         self.maintain_connection_tick();
+        self.housekeeping_tick();
         if self.session.stop.is_some() {
             ctx.request_repaint_after(Duration::from_millis(150));
         }

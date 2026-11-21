@@ -56,17 +56,17 @@ impl App {
             plastic.paint(ui, grid.response.rect, 10.0);
         });
         ui.add_space(18.0);
-        ui.strong(self.tr("Live Positions (from TWS)", "Live-Positionen (von TWS)"));
+        ui.strong(self.tr("Live Positions (from TWS)", "Live-Positionen (von der TWS)"));
         ui.add_space(6.0);
         if self.session.server_version.is_none() {
             ui.colored_label(
                 muted_text(),
-                self.tr("Connect to TWS to retrieve real open positions.", "Mit TWS verbinden, um echte offene Positionen abzurufen."),
+                self.tr("Connect to TWS to retrieve real open positions.", "Mit der TWS verbinden, um echte offene Positionen abzurufen."),
             );
         } else if self.positions.is_empty() && !self.loaded.positions_loaded {
-            ui.colored_label(muted_text(), self.tr("Waiting for positions from TWS...", "Warte auf Positionen von TWS..."));
+            ui.colored_label(muted_text(), self.tr("Waiting for positions from TWS...", "Warte auf Positionen von der TWS..."));
         } else if self.positions.is_empty() {
-            ui.colored_label(muted_text(), self.tr("TWS reports no open positions.", "TWS meldet keine offenen Positionen."));
+            ui.colored_label(muted_text(), self.tr("TWS reports no open positions.", "Die TWS meldet keine offenen Positionen."));
         } else {
             egui::Frame::none().fill(card_bg()).show(ui, |ui| {
                 let mut plastic = PlasticRows::default();
@@ -96,11 +96,11 @@ impl App {
         ui.add_space(10.0);
         let market_closed = self.market_session() != Session::Open;
         let empty_text = if self.tws_cmd_sender.is_none() {
-            self.tr("Not connected to TWS.", "Nicht mit TWS verbunden.")
+            self.tr("Not connected to TWS.", "Nicht mit der TWS verbunden.")
         } else if market_closed && self.chains.contracts.is_empty() {
             self.tr("The US market is closed: no live option quotes.", "Die US-Börse ist geschlossen: keine Live-Optionskurse.")
         } else if self.chains.contracts.is_empty() {
-            self.tr("Waiting for the option chain from TWS...", "Warte auf die Optionskette von TWS...")
+            self.tr("Waiting for the option chain from TWS...", "Warte auf die Optionskette der TWS...")
         } else {
             self.tr("No active subscription.", "Kein aktives Abonnement.")
         };

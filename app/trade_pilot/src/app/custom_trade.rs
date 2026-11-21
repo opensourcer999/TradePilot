@@ -16,7 +16,7 @@ impl App {
         let Some(price) = self.chains.price(symbol).and_then(dec) else {
             return format!(
                 "{symbol}: {}",
-                self.tr("no price from TWS yet - please wait and preview again.", "noch kein Kurs von TWS - bitte warten und erneut Preview.")
+                self.tr("no price from TWS yet - please wait and preview again.", "noch kein Kurs von der TWS - bitte warten und erneut Preview.")
             );
         };
         let today = self.clock.local().date_naive();

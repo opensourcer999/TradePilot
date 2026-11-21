@@ -11,6 +11,7 @@ mod market_data_and_connection;
 mod orders_and_exits;
 mod reports_mails_and_closing;
 mod schedules;
+mod stop_management;
 mod template_entry_and_valuation;
 mod timed_exits_and_conditions;
 mod triggers;

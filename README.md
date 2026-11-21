@@ -1,8 +1,12 @@
 # TradePilot
 
+![TradePilot dashboard: today's P/L, premium figures, PCR and win-rate gauges, today's trades and scheduled tasks](images/dashboard.png)
+
+<sub>The dashboard with made-up demo data (paper account, no real trades).</sub>
+
 ![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)
-![Platform: Windows](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
+![Platform: Windows | macOS | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
 
 TradePilot is a free and open-source desktop application for options trading with
 Interactive Brokers' Trader Workstation (TWS), written in Rust (egui). The complete source
@@ -12,8 +16,10 @@ on, also commercially (see [License](#license)). Its features are implemented st
 TradePilot is an independent project and is not affiliated with or endorsed by Interactive
 Brokers.
 
-**Orders can only be sent for a detected paper trading account.** Live mode does not
-allow order submission. TradePilot is not investment advice; use it at your own risk.
+**Orders are sent only when the connected account matches the chosen mode:** a paper
+trading account in Paper Trading, a live account in Live. In Live every order is limited
+to 1 contract. Try everything in Paper Trading first. TradePilot is not investment advice;
+use it at your own risk.
 
 ## Features
 
@@ -35,14 +41,28 @@ allow order submission. TradePilot is not investment advice; use it at your own 
   be kept side by side and exchanged as files; the Dashboard shows what is due today.
 - **Triggers, exits and re-entries:** webhook and EMA-crossover triggers, timed exits, early exits on conditions, progressive limit closing, re-entries, custom trades and conditions on market values.
 - **News:** economic news (US first, then German and UK) on its own page and as a bulletin on the Dashboard, translated to German when the screens are German.
-- **Light and Advanced mode:** Light shows only Dashboard, Instant Order, Trade Templates, Schedules, News and Settings; switchable in the sidebar.
-- **Metal design:** one look for the whole app, modelled on brushed and polished metal: lit steel plates and frames, raised metal buttons, inset input fields, analogue dial instruments with glowing needles, LED status lights.
+- **Stop management:** the stop of an open credit trade can change its legs as the market moves (a vertical stop becomes a short
+  stop once the long has no bid or one at a set price or below, a short stop takes its long back once it has a bid again, 0-DTE
+  stops buy back only the shorts from a set time on). The stop keeps its price and is placed again on the new legs. An IronFly,
+  IronCondor-Full or ShortStrangle with a short stop can be split into one trade per side once a short is nearly worthless; each
+  side then has a stop and a profit target of its own.
+- **Safety features:** a trade can be closed automatically when it stays a set percent beyond its stop for a set time, or when
+  TWS refuses its stop for margin; an entry refused for margin can be sent again up to three times. Warnings for missing stops,
+  high slippage, a trade beyond its stop and more go by email or webhook.
+- **Housekeeping:** old log lines and files are removed after a set number of days, the settings are backed up once a day (the
+  file name carries the computer name), and the trades of the day can be written to a CSV file after the close.
+- **Metal design:** the one look of the whole app, modelled on brushed and polished metal: lit steel plates and frames, raised
+  metal buttons, inset input fields, analogue dial instruments with glowing needles, LED status lights. Tables can be switched
+  to a compact form for narrow windows.
+- **Light and Advanced page sets:** Light shows only the most important pages (Dashboard, Instant Order, Trade Templates,
+  Schedules, News and Settings), Advanced all of them; switchable in the sidebar. This is the choice of pages, not a colour scheme.
 
 
 ## Safety
 
-- Every order takes one path to TWS: the safety gate (paper account only, kill switch
-  off), the risk check (maximum order quantity), then the hand-over to the connection. An
+- Every order takes one path to TWS: the safety gate (the account matches the Live/Paper
+  mode, kill switch off), the risk check (maximum order quantity, 1 contract in Live), then
+  the hand-over to the connection. An
   order that is refused or cannot be handed over is logged as `WARNING: order N NOT sent`
   and never recorded on a trade.
 - Immediate transmission is off by default; a confirmation window shows account, legs,
@@ -55,11 +75,104 @@ allow order submission. TradePilot is not investment advice; use it at your own 
 
 ## Requirements
 
-- Windows, the [Rust toolchain](https://rustup.rs/) (version fixed in
-  `app/rust-toolchain.toml`) and the Microsoft C++ Build Tools (MSVC).
-- The Rust component `clippy` (`rustup component add clippy`).
+- The [Rust toolchain](https://rustup.rs/) (version fixed in `app/rust-toolchain.toml`,
+  installed automatically by `rustup` together with the `rustfmt` and `clippy`
+  components) and a C/C++ toolchain: the Microsoft C++ Build Tools (MSVC) on Windows,
+  the Xcode Command Line Tools on macOS, or the system's compiler and GUI development
+  libraries on Linux (see "Installing the requirements" below for each).
 - For the broker connection: a running TWS with the socket API enabled and a paper
-  trading account. Market data needs the matching permissions at Interactive Brokers.
+  trading account (a live account for the Live mode). Market data needs the matching
+  permissions at Interactive Brokers.
+
+### Installing the requirements on a Windows PC
+
+1. Install `rustup` (the Rust installer and version manager):
+   ```powershell
+   winget install Rustlang.Rustup
+   ```
+   Without `winget`, run `rustup-init.exe` from [rustup.rs](https://rustup.rs/) instead.
+2. Install the Microsoft C++ Build Tools, needed to link on Windows (MSVC). The
+   Visual Studio Installer component ID is `Microsoft.VisualStudio.Workload.VCTools`:
+   ```powershell
+   winget install Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet"
+   ```
+   Alternatively, start the Visual Studio Installer by hand and select the
+   "Desktop development with C++" workload.
+3. Open a new PowerShell window (so the updated `PATH` takes effect) and change into
+   `app/`. `rustup` reads `rust-toolchain.toml` there and installs the pinned channel
+   with the `rustfmt` and `clippy` components automatically on first use; no separate
+   `rustup component add` call is needed unless that file is missing.
+4. Run `.\build.cmd` from the project root (see "Build and run" below) to build
+   TradePilot. The first build also downloads all Cargo dependencies and can take a
+   while.
+
+To pass the application on to another Windows PC, only the matching TWS/IB Gateway
+setup is required there (see "Passing the app on"); the Rust toolchain and MSVC Build
+Tools are build-time requirements, not needed to run the finished `.exe`.
+
+### Installing the requirements on a Mac
+
+The macOS package is normally built by GitHub Actions, started from the Windows PC
+(see `documentation/macos-readme.md`); a Mac itself is only needed to build locally
+or to test the result. To build locally on a Mac:
+
+1. Install the Xcode Command Line Tools (the Mac's C/C++ toolchain, the equivalent of
+   the Windows MSVC Build Tools):
+   ```bash
+   xcode-select --install
+   ```
+2. Install `rustup`:
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
+   (or `brew install rustup-init && rustup-init`, with [Homebrew](https://brew.sh/)
+   installed first).
+3. Open a new terminal (so the updated `PATH` takes effect) and change into `app/`.
+   As on Windows, `rustup` reads `rust-toolchain.toml` there and installs the pinned
+   channel with the `rustfmt` and `clippy` components automatically on first use.
+4. From `app/`, run `./package.sh` to build (`chmod +x package.sh` first if needed; see
+   "Lokal auf dem Mac bauen" in `documentation/macos-readme.md` for details and the
+   universal-binary option). `package.sh` is only for producing a release package
+   (`.app`/DMG/ZIP); for day-to-day development use plain Cargo instead, the same way
+   as on Windows (see "Build and run" and "Tests and checks" below, from `app/`):
+   `cargo build`, `cargo run --bin trade_pilot`, `cargo test --workspace`,
+   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all`. There is
+   no macOS equivalent of `build.cmd`/`build.ps1` (PowerShell-only); VS Code with
+   rust-analyzer works the same way as on Windows. The Windows-only parts of the code
+   (`app/winui`) are excluded automatically on macOS via `cfg(windows)`, so the rest of
+   the workspace builds and tests directly on a Mac.
+
+### Installing the requirements on Linux
+
+The Linux package (tar.gz) is built by GitHub Actions on Ubuntu 22.04 (job `linux` in
+`.github/workflows/release.yml`); there is no helper script to start it from Windows or
+to build it locally like `package.sh` on the Mac, so a Linux build is either done in CI
+or by hand with Cargo.
+
+1. Install `rustup`:
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
+2. Install the system libraries the GUI (`egui`/`winit`) links against. On Debian/
+   Ubuntu:
+   ```bash
+   sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev \
+     libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+   ```
+   On other distributions, install the equivalent `-dev`/`-devel` packages (Fedora:
+   `dnf install libxkbcommon-devel mesa-libGL-devel wayland-devel libX11-devel
+   libXcursor-devel libXrandr-devel libXi-devel`; Arch:
+   `pacman -S libxkbcommon mesa wayland libx11 libxcursor libxrandr libxi`).
+3. Open a new shell and change into `app/`. `rustup` reads `rust-toolchain.toml` there
+   and installs the pinned channel with the `rustfmt` and `clippy` components
+   automatically on first use.
+4. From `app/`, use plain Cargo for development, the same as on Windows and the Mac
+   (see "Build and run" and "Tests and checks" below): `cargo build`,
+   `cargo run --bin trade_pilot`, `cargo test --workspace`,
+   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all`. To build
+   the release package (tar.gz with launcher and icon) instead, run
+   `./package-linux.sh` from `app/` (`chmod +x package-linux.sh` first if needed).
+   `app/winui` is excluded automatically via `cfg(windows)`, as on macOS.
 
 ## Build and run
 
@@ -82,6 +195,13 @@ versioned copies are removed only after the new one exists. Only the debug versi
 A build in a folder that OneDrive or a virus scanner watches can be many times slower; set
 `CARGO_TARGET_DIR` to a folder elsewhere and the script builds and looks there.
 
+The picture at the top of this file is drawn by the app itself, with made-up demo data instead of your own (no account, trades,
+settings or files of yours are shown or changed):
+
+```powershell
+.\app\target\release\trade_pilot.exe --screenshot images\dashboard.png --page dashboard --demo --width 1430 --height 990
+```
+
 ## Tests and checks
 
 From `app/`:
@@ -98,13 +218,16 @@ real TWS are ignored.
 ## TWS connection
 
 1. Start TWS, log in to the paper trading account and enable the socket API.
-2. In TradePilot choose Paper Trading (switch at the top right) and set host and port
-   (defaults `127.0.0.1` and `7497`, they must match TWS).
+2. In TradePilot choose Paper Trading (switch at the top right) and set host, port and
+   client id (defaults `127.0.0.1`, `7497` and `1`; host and port must match TWS, and the
+   client id must not be in use by another API connection). TWS reports open orders per
+   client id: keep the one the trades' orders were placed under.
 3. Click "Connect to TWS" (top left). The bar shows the connection, the account type and
-   the SPX price.
+   the SPX price, or the price of the symbol chosen under Settings > Market Data.
 
 Outside market hours TWS sends no live index ticks; TradePilot then shows the last daily
-close (display only, never used as a trading price). If no prices arrive although the
+close (display only, never used as a trading price). With "Estimate SPX Extended Hours"
+switched on, the bar shows an estimate of SPX from SPY instead, marked as one. If no prices arrive although the
 connection is up, the same user is often logged in elsewhere (IBKR Mobile, Client Portal,
 a second TWS; error 10197): log out there and reconnect.
 
@@ -130,8 +253,10 @@ The receiving computer needs TWS or IB Gateway with the API enabled.
 
 ## Data
 
-On Windows, settings, logs and data are in `%LOCALAPPDATA%\TradeWorkspace`; Paper Trading
-has its own `paper` subfolder (settings, templates, schedules, trades, executions). Trades and
+Settings, logs and data are kept per OS: `%LOCALAPPDATA%\TradeWorkspace` on Windows,
+`~/Library/Application Support/TradeWorkspace` on macOS, and `$XDG_DATA_HOME/TradeWorkspace`
+(falling back to `~/.local/share/TradeWorkspace`) on Linux. Paper Trading has its own
+`paper` subfolder (settings, templates, schedules, trades, executions). Trades and
 executions are in the SQLite database `tradepilot.db`. Templates and schedules are
 written as a whole (temporary file, then renamed); a file that cannot be read is set aside
 as `<file>.unreadable-<date-time>`, never overwritten, and saving is blocked if even that

@@ -660,6 +660,32 @@ pub fn set_grid_font_size(text: &str) {
     GRID_FONT_SIZE.store(grid_font_size_of(text), Ordering::Relaxed);
 }
 
+/// Settings > Appearance > "Mobile Friendly Grid": tables with tighter rows and spacing that leave out columns which would get too
+/// narrow, so a narrow window shows every table without cut-off text.
+static COMPACT_GRID: AtomicBool = AtomicBool::new(false);
+
+/// Switches the compact tables on or off.
+pub fn set_compact_grid(on: bool) {
+    COMPACT_GRID.store(on, Ordering::Relaxed);
+}
+
+/// The columns (by index) a compact table shows in `room` points: all of them while each gets at least `min_width` after the
+/// `spacing` between them; else columns are left out from the second to last one backwards, so the first column (what the row is) and
+/// the last one (usually its result) stay. At least those two are shown.
+fn visible_columns(weights: &[f32], room: f32, min_width: f32, spacing: f32) -> Vec<usize> {
+    let mut shown: Vec<usize> = (0..weights.len()).collect();
+    loop {
+        let count = shown.len().to_f32().unwrap_or(0.0);
+        let total: f32 = shown.iter().filter_map(|i| weights.get(*i)).sum();
+        let unit = (room - spacing * (count - 1.0)).max(0.0) / total.max(0.1);
+        let fits = shown.iter().filter_map(|i| weights.get(*i)).all(|weight| weight * unit >= min_width);
+        if fits || shown.len() <= 2 {
+            return shown;
+        }
+        shown.remove(shown.len() - 2);
+    }
+}
+
 /// The grid font size in points.
 fn grid_font_size() -> f32 {
     GRID_FONT_SIZE.load(Ordering::Relaxed).to_f32().unwrap_or(0.0)
@@ -760,10 +786,17 @@ const TABLE_INSET: f32 = 10.0;
 fn table(ui: &mut egui::Ui, id: &str, columns: &[TableColumn], rows: &[Vec<TableCell>], selectable: bool, selected: Option<usize>) -> RowClicks {
     let mut clicks = RowClicks::default();
     let font = grid_font_size();
-    let (header_height, row_height) = (font * 1.9, font * 2.0);
-    let spacing_x = 12.0;
+    let compact = COMPACT_GRID.load(Ordering::Relaxed);
+    let (header_height, row_height, spacing_x) = if compact { (font * 1.5, font * 1.6, 6.0) } else { (font * 1.9, font * 2.0, 12.0) };
     let mark_width = if selectable { font * 1.2 + spacing_x } else { 0.0 };
-    let usable = (ui.available_width() - mark_width - spacing_x * (columns.len().to_f32().unwrap_or(0.0) - 1.0) - 4.0 - 2.0 * TABLE_INSET).max(0.0);
+    let room = (ui.available_width() - mark_width - 4.0 - 2.0 * TABLE_INSET).max(0.0);
+    // A compact table leaves out the columns that would get too narrow to read, so it never needs more than the width there is.
+    let all_weights: Vec<f32> = columns.iter().map(|c| c.weight).collect();
+    let shown: Vec<usize> = if compact { visible_columns(&all_weights, room, font * 3.5, spacing_x) } else { (0..columns.len()).collect() };
+    let columns: Vec<TableColumn> = shown.iter().filter_map(|i| columns.get(*i).cloned()).collect();
+    let rows: Vec<Vec<TableCell>> = rows.iter().map(|row| shown.iter().filter_map(|i| row.get(*i).cloned()).collect()).collect();
+    let (columns, rows) = (columns.as_slice(), rows.as_slice());
+    let usable = (room - spacing_x * (columns.len().to_f32().unwrap_or(0.0) - 1.0)).max(0.0);
     let unit = usable / columns.iter().map(|c| c.weight).sum::<f32>().max(0.1);
     let width = |i: usize| columns.get(i).map_or(40.0, |c| (c.weight * unit).max(24.0));
     let mut plastic = PlasticRows::default();
@@ -1339,7 +1372,12 @@ pub fn setting_row_noted(ui: &mut egui::Ui, title: &str, hint: &str, note: &str,
     let width = (ui.available_width() - CARD_SCROLLBAR_GAP).max(0.0);
     ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
         ui.allocate_ui_with_layout(egui::vec2(width * 0.5, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.label(RichText::new(title).color(text_primary()));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).color(text_primary()));
+                if crate::settings_help::help_for(title).is_some() {
+                    help_button(ui, title);
+                }
+            });
             if !hint.is_empty() {
                 ui.label(RichText::new(hint).small().color(muted_text()));
             }
@@ -1351,6 +1389,103 @@ pub fn setting_row_noted(ui: &mut egui::Ui, title: &str, hint: &str, note: &str,
     });
     ui.add_space(6.0);
     ui.add(egui::Separator::default().spacing(0.0));
+}
+
+/// The egui memory slot of the help window that is open: the name of its setting.
+fn help_slot() -> egui::Id {
+    egui::Id::new("settings_help_open")
+}
+
+/// A small round "?" button that opens the help of the setting `name` (see `settings_help`).
+pub fn help_button(ui: &mut egui::Ui, name: &str) {
+    let button = egui::Button::new(RichText::new("?").small().strong().color(text_primary())).rounding(9.0).min_size(egui::vec2(18.0, 18.0));
+    if ui.add(button).on_hover_text(if name.is_empty() { "?" } else { name }).clicked() {
+        let name = name.to_string();
+        ui.ctx().data_mut(|data| data.insert_temp(help_slot(), name));
+    }
+}
+
+/// The sentences of a help text: it is split after a full stop, an exclamation or a question mark followed by a space, but not after
+/// an abbreviation (a word before the stop of one or two letters, or one with a stop inside, such as "z. B." or "e.g.").
+pub fn sentences(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for window in chars.windows(2) {
+        let [(at, mark), (_, next)] = window else { continue };
+        if !matches!(mark, '.' | '!' | '?') || *next != ' ' {
+            continue;
+        }
+        let before = text.get(start..*at).unwrap_or_default();
+        let word = before.rsplit(' ').next().unwrap_or_default();
+        if word.chars().count() <= 2 || word.contains('.') {
+            continue;
+        }
+        let end = at + mark.len_utf8();
+        if let Some(sentence) = text.get(start..end) {
+            parts.push(sentence.trim());
+        }
+        start = end;
+    }
+    if let Some(rest) = text.get(start..).map(str::trim).filter(|rest| !rest.is_empty()) {
+        parts.push(rest);
+    }
+    parts
+}
+
+/// The help of a setting as a card of the metal design: a "?" badge, `kicker` (where it belongs) and `title` on top, the first sentence of
+/// `text` as the lead in bold, the rest in paragraphs of two sentences, and a button `close` at the bottom right. True when it or the
+/// cross on top was clicked.
+pub fn help_card(ui: &mut egui::Ui, kicker: &str, title: &str, text: &str, close: &str) -> bool {
+    let mut closed = false;
+    framed_card(ui, |ui| {
+        ui.set_width(460.0);
+        ui.horizontal(|ui| {
+            let (badge, _) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
+            ui.painter().circle_filled(badge.center(), 16.0, ACCENT_BLUE);
+            ui.painter().circle_stroke(badge.center(), 16.0, egui::Stroke::new(1.0_f32, Color32::from_white_alpha(60)));
+            ui.painter().text(badge.center(), egui::Align2::CENTER_CENTER, "?", egui::FontId::proportional(19.0), Color32::WHITE);
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.label(RichText::new(kicker).size(11.5).color(muted_text()));
+                ui.label(RichText::new(title).size(17.0).strong().color(text_primary()));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                if ui.add(egui::Button::new(RichText::new("\u{2715}").size(13.0).color(muted_text())).frame(false)).clicked() {
+                    closed = true;
+                }
+            });
+        });
+        ui.add_space(10.0);
+        ui.add(egui::Separator::default().spacing(0.0));
+        ui.add_space(12.0);
+        let parts = sentences(text);
+        if let Some(lead) = parts.first() {
+            ui.label(RichText::new(*lead).size(14.5).strong().color(text_primary()));
+        }
+        for pair in parts.get(1..).unwrap_or_default().chunks(2) {
+            ui.add_space(8.0);
+            ui.label(RichText::new(pair.join(" ")).size(13.5).color(text_primary().gamma_multiply(0.88)));
+        }
+        ui.add_space(16.0);
+        ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 30.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let button = MetalButton::new(RichText::new(close).strong().color(Color32::WHITE)).fill(ACCENT_BLUE).rounding(8.0);
+            if ui.add_sized([120.0, 28.0], button).clicked() {
+                closed = true;
+            }
+        });
+    });
+    closed
+}
+
+/// The name of the setting whose help is open, if any.
+pub fn open_help(ctx: &egui::Context) -> Option<String> {
+    ctx.data(|data| data.get_temp::<String>(help_slot()))
+}
+
+/// Closes the help window.
+pub fn close_help(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.remove::<String>(help_slot()));
 }
 
 /// One entry of the navigation of the Settings page: a coloured badge with a symbol and the name; the chosen entry is filled.
@@ -1521,6 +1656,16 @@ impl PlasticRows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compact_table_drops_columns_from_the_second_to_last_backwards_until_the_rest_is_readable() {
+        let weights = [1.0, 1.0, 1.0, 1.0];
+        assert_eq!(visible_columns(&weights, 400.0, 50.0, 6.0), [0, 1, 2, 3], "wide enough for all");
+        assert_eq!(visible_columns(&weights, 200.0, 50.0, 6.0), [0, 1, 3], "the third column goes first");
+        assert_eq!(visible_columns(&weights, 50.0, 50.0, 6.0), [0, 3], "the first and the last always stay");
+        assert_eq!(visible_columns(&[2.0], 10.0, 50.0, 6.0), [0]);
+        assert_eq!(visible_columns(&[], 100.0, 50.0, 6.0), Vec::<usize>::new());
+    }
 
     #[test]
     fn the_choices_of_a_template_read_as_they_always_did_while_their_stored_values_differ() {

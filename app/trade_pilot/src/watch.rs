@@ -106,6 +106,13 @@ pub struct WatchState {
     /// Stops and profit targets sent again with a new price, by order id: the new price goes on the trade only once TWS
     /// confirms the change, so a modify of an order that has ended meanwhile never shows a stop that does not exist.
     pub exit_changes: HashMap<i32, Decimal>,
+    /// When a stop conversion was last started, by trade (its opening order id).
+    pub conversion_tried: HashMap<i32, Instant>,
+    /// Trades (by their opening order id) whose full stop split has started, as they were then: their stop and target prices are
+    /// gone from the trade once the orders are cancelled, the sides take them from here.
+    pub split_pending: HashMap<i32, crate::storage::StoredTrade>,
+    /// When a cancel of the split was last sent, by trade and step (`<order id>:<step>`).
+    pub split_tried: HashMap<String, Instant>,
 }
 
 /// Where a progressive limit close stands: the limit it was sent or last moved to (the price as typed: what the close pays, or for a
@@ -121,6 +128,23 @@ pub struct ProgressiveClose {
 #[must_use]
 pub fn beyond_stop(stop: Decimal, close_cost: Decimal) -> bool {
     stop > Decimal::ZERO && close_cost > stop
+}
+
+/// The percent beyond the stop typed in the settings: a number from 0 up (a comma taken as the decimal point), else `None`.
+#[must_use]
+pub fn beyond_stop_percent(text: &str) -> Option<Decimal> {
+    text.trim().replace(',', ".").parse::<Decimal>().ok().filter(|pct| *pct >= Decimal::ZERO)
+}
+
+/// Whether a credit trade is far enough past its stop to be closed: what it costs to close is at least `percent` above the stop
+/// (0 = any cost above the stop).
+#[must_use]
+pub fn far_beyond_stop(stop: Decimal, close_cost: Decimal, percent: Decimal) -> bool {
+    let Some(limit) = percent.checked_div(Decimal::ONE_HUNDRED).and_then(|share| share.checked_add(Decimal::ONE)).and_then(|factor| stop.checked_mul(factor))
+    else {
+        return false;
+    };
+    beyond_stop(stop, close_cost) && close_cost >= limit
 }
 
 #[cfg(test)]
@@ -178,5 +202,17 @@ mod tests {
         assert!(beyond_stop(d("0.90"), d("1.20")));
         assert!(!beyond_stop(d("0.90"), d("0.90")));
         assert!(!beyond_stop(d("0"), d("1")), "no stop");
+    }
+
+    #[test]
+    fn a_trade_is_closed_beyond_its_stop_only_once_the_cost_is_the_percent_above_it() {
+        assert!(far_beyond_stop(d("1.00"), d("1.10"), d("10")), "exactly 10 % above");
+        assert!(!far_beyond_stop(d("1.00"), d("1.09"), d("10")));
+        assert!(far_beyond_stop(d("1.00"), d("1.01"), d("0")), "0 % = any cost above the stop");
+        assert!(!far_beyond_stop(d("1.00"), d("1.00"), d("0")), "at the stop is not beyond it");
+        assert!(!far_beyond_stop(d("0"), d("5"), d("10")), "no stop");
+        assert_eq!(beyond_stop_percent(" 12,5 "), Some(d("12.5")));
+        assert_eq!(beyond_stop_percent("-1"), None);
+        assert_eq!(beyond_stop_percent(""), None);
     }
 }

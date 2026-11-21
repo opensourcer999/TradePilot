@@ -162,8 +162,18 @@ impl App {
             entry.qty,
             mask_account(&format!("IB:{}", order.account)),
         ));
-        self.instant.template_status = Some(format!("#{order_id}: {}", self.tr("sent to TWS", "an TWS gesendet")));
-        self.template.orders.push(SentTemplateOrder { order_id, account: order.account.clone(), entry, template: source, recorded: false, run_id, fill });
+        self.instant.template_status = Some(format!("#{order_id}: {}", self.tr("sent to TWS", "an die TWS gesendet")));
+        self.template.orders.push(SentTemplateOrder {
+            order_id,
+            account: order.account.clone(),
+            entry,
+            template: source,
+            recorded: false,
+            run_id,
+            fill,
+            margin_attempt: 0,
+            retry_due: None,
+        });
     }
 
     /// Fill attempts: an order that is still unfilled
@@ -255,6 +265,8 @@ impl App {
             return;
         };
         let run_id = sent.run_id;
+        // An entry refused for margin that is sent again keeps its schedule run working.
+        let retrying = sent.retry_due.is_some();
         if let Some(fill) = sent.fill.as_mut() {
             if order_is_final(status) {
                 fill.finished = true;
@@ -270,7 +282,7 @@ impl App {
         }
         self.instant.template_status = Some(format!("#{order_id}: {status}"));
         self.debug(&format!("template order {order_id}: {status}, remaining {remaining}, average price {avg_fill_price} - {}", fill_outcome(complete, status)));
-        if !complete && order_is_final(status) {
+        if !complete && order_is_final(status) && !retrying {
             self.schedule_order_ended(run_id, status);
         }
         if !complete {
@@ -535,7 +547,8 @@ impl App {
                 updated.exit_levels = Some(profit_levels(template, &trade, &legs, split, profit_id));
             }
         }
-        // The template's stop adjustments watch the trade from now on.
+        // The template's stop adjustments watch the trade from now on. The record is kept also without any, for the legs the stop
+        // closes: the stop conversions of the settings replace it with other legs.
         let (notes, adjustments) = stop_adjustments_of(template, prices.stop.map(|p| p.normalize().to_string()), &legs, rel, basis);
         for note in notes {
             self.log(&format!("Stop/Profit {label}: {note}"));
@@ -588,7 +601,7 @@ impl App {
             let Some(trade) = self.trades_stored.get(index).cloned() else { continue };
             let Some(adjustments) = trade.adjustments.clone() else { continue };
             let Some(item) = adjustments.items.get(usize::from(adjustments.level)).cloned() else { continue };
-            if !trade.is_open() || trade.close_order_id.is_some() || adjustments.replace_pending {
+            if !trade.is_open() || trade.close_order_id.is_some() || adjustments.replace_pending || self.split_started(trade.order_id) {
                 continue;
             }
             let price_open = trade.price_open;
@@ -830,7 +843,12 @@ impl App {
         if code != 201 {
             return;
         }
-        let Some(index) = self.trades_stored.iter().position(|t| t.is_open() && t.stop_limit_order_id == Some(order_id) && t.stop_order_id.is_none()) else {
+        // A trade that is being closed (after a margin rejection of this stop, say) gets no new stop.
+        let Some(index) = self
+            .trades_stored
+            .iter()
+            .position(|t| t.is_open() && t.stop_limit_order_id == Some(order_id) && t.stop_order_id.is_none() && t.close_order_id.is_none())
+        else {
             return;
         };
         let Some(trade) = self.trades_stored.get(index).cloned() else { return };
@@ -1197,7 +1215,7 @@ fn share_of_price(price_open: Decimal, share: Decimal) -> Option<Decimal> {
 }
 
 /// The stop adjustments of the template for a trade: what to log about the unsupported ones, and
-/// the record that watches the trade (None when no adjustment is switched on).
+/// the record that watches the trade and holds the legs of its stop (without items when no adjustment is switched on).
 fn stop_adjustments_of(
     template: &TradeTemplate,
     stop: Option<String>,
@@ -1215,9 +1233,6 @@ fn stop_adjustments_of(
                 item.order_type
             ));
         }
-    }
-    if items.is_empty() {
-        return (notes, None);
     }
     let adjustments = StopAdjustments {
         items,

@@ -420,7 +420,7 @@ fn a_broken_data_farm_is_shown_until_it_is_ok_and_then_quotes_are_requested_agai
         app.tws_sender.send(TwsEvent::FarmStatus { farm: farm.into(), ok }).unwrap();
     }
     app.poll_tws();
-    assert_eq!(app.market_data_warning(Instant::now(), true).as_deref(), Some("Datenverbindung von TWS unterbrochen (usfarm) - Kurse sind eingefroren"));
+    assert_eq!(app.market_data_warning(Instant::now(), true).as_deref(), Some("Datenverbindung von der TWS unterbrochen (usfarm) - Kurse sind eingefroren"));
     assert!(drain(&commands).is_empty(), "nothing re-requested while a farm is still down");
 
     app.tws_sender.send(TwsEvent::FarmStatus { farm: "usfarm".into(), ok: true }).unwrap();

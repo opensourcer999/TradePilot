@@ -2,12 +2,10 @@
 //! with the state of the changes and the Save button at the bottom. What the settings mean is kept in `PersistedSettings`.
 
 use super::{
-    data_table_rows, framed_card, list_backups, muted_text, nav_item, next_selection, placeholder_color, read_backup, section_header, setting_row, storage,
-    symbol_combo, text_primary, time_picker, toggle_switch, ui_mode_name, warning_banner_bg, warning_banner_text, white_card, write_backup, App, Color32,
-    Duration, Lang, PathBuf, RichText, SettingsTab, SymbolConfig, TableCell, TableColumn, ACCENT_BLUE, MAINTAIN_CONNECTION_OPTIONS, ORANGE_WARN, STATUS_ERROR,
-    STATUS_OK,
+    data_table_rows, framed_card, list_backups, muted_text, nav_item, next_selection, placeholder_color, section_header, setting_row, storage, symbol_combo,
+    text_primary, time_picker, toggle_switch, ui_mode_name, warning_banner_bg, warning_banner_text, white_card, write_backup, App, Color32, Duration, Lang,
+    PathBuf, RichText, SettingsTab, SymbolConfig, TableCell, TableColumn, ACCENT_BLUE, MAINTAIN_CONNECTION_OPTIONS, ORANGE_WARN, STATUS_ERROR, STATUS_OK,
 };
-use crate::widgets::setting_row_noted;
 use eframe::egui;
 
 impl App {
@@ -52,6 +50,30 @@ impl App {
                 });
             });
         });
+        self.settings_help_window(ui.ctx());
+    }
+
+    /// The help window of the setting whose "?" was clicked: what it is for and the background, in the language of the screens. It
+    /// closes with its button, with Escape, or when another "?" is clicked.
+    fn settings_help_window(&mut self, ctx: &egui::Context) {
+        let Some(entry) = crate::widgets::open_help(ctx).and_then(|name| crate::settings_help::help_for(&name)) else { return };
+        let lang = self.settings.lang;
+        let mut close = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let kicker = format!("{} \u{b7} {}", self.tr("Settings", "Einstellungen"), self.settings_tab_name(self.settings_tab));
+        let got_it = self.tr("Got it", "Verstanden");
+        egui::Window::new("settings_help")
+            .id(egui::Id::new("settings_help_window"))
+            .title_bar(false)
+            .frame(egui::Frame::none())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                close |= crate::widgets::help_card(ui, &kicker, entry.title(lang), entry.text(lang), got_it);
+            });
+        if close {
+            crate::widgets::close_help(ctx);
+        }
     }
 
     /// The line under the title: a coloured chip with the mode (Live or Paper) the settings belong to, and what that means.
@@ -71,17 +93,30 @@ impl App {
         });
     }
 
+    /// The name of a section of the Settings page.
+    fn settings_tab_name(&self, tab: SettingsTab) -> &'static str {
+        match tab {
+            SettingsTab::General => self.tr("General / Broker", "Allgemein / Broker"),
+            SettingsTab::Notifications => self.tr("Notifications", "Benachrichtigungen"),
+            SettingsTab::TradingFeatures => self.tr("Trading Features", "Handelsfunktionen"),
+            SettingsTab::MarketData => self.tr("Market Data", "Marktdaten"),
+            SettingsTab::SafetyFeatures => self.tr("Safety Features", "Sicherheitsfunktionen"),
+            SettingsTab::DatabaseBackup => self.tr("Database Backup", "Datenbank-Backup"),
+        }
+    }
+
     /// The navigation of the Settings page: one entry per section, each with its symbol.
     fn settings_nav(&mut self, ui: &mut egui::Ui) {
         let entries = [
-            (SettingsTab::General, "\u{2699}", self.tr("General / Broker", "Allgemein / Broker")),
-            (SettingsTab::Notifications, "\u{2709}", self.tr("Notifications", "Benachrichtigungen")),
-            (SettingsTab::TradingFeatures, "\u{26a1}", self.tr("Trading Features", "Handelsfunktionen")),
-            (SettingsTab::MarketData, "\u{1f4ca}", self.tr("Market Data", "Marktdaten")),
-            (SettingsTab::SafetyFeatures, "\u{1f6e1}", self.tr("Safety Features", "Sicherheitsfunktionen")),
-            (SettingsTab::DatabaseBackup, "\u{1f4be}", self.tr("Database Backup", "Datenbank-Backup")),
+            (SettingsTab::General, "\u{2699}"),
+            (SettingsTab::Notifications, "\u{2709}"),
+            (SettingsTab::TradingFeatures, "\u{26a1}"),
+            (SettingsTab::MarketData, "\u{1f4ca}"),
+            (SettingsTab::SafetyFeatures, "\u{1f6e1}"),
+            (SettingsTab::DatabaseBackup, "\u{1f4be}"),
         ];
-        for (tab, symbol, label) in entries {
+        for (tab, symbol) in entries {
+            let label = self.settings_tab_name(tab);
             if nav_item(ui, symbol, label, self.settings_tab == tab).clicked() {
                 self.settings_tab = tab;
             }
@@ -208,16 +243,12 @@ impl App {
                 ui.add_space(8.0);
                 egui::Frame::none().fill(warning_banner_bg()).rounding(8.0).inner_margin(10.0).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.colored_label(warning_banner_text(), "(!)");
+                        ui.colored_label(warning_banner_text(), "(i)");
                         ui.vertical(|ui| {
-                            // Both times above are plain wall-clock triggers that assume the
-                            // OS clock already reads US Eastern - a timezone mismatch affects
-                            // the 0-DTE conversion time exactly as much as Market Close, so the
-                            // banner needs to say so instead of naming Market Close only.
                             ui.label(RichText::new(self.tr("Time Zone", "Zeitzone")).strong().color(warning_banner_text()));
                             ui.label(RichText::new(self.tr(
-                                "Your computer's local time zone does not match US Eastern. You may need to adjust both the 0-DTE conversion time and the Market Close time above.",
-                                "Die lokale Zeitzone deines Computers stimmt nicht mit US Eastern überein. Du musst eventuell sowohl die 0-DTE-Umwandlungszeit als auch die Marktschluss-Zeit oben anpassen.",
+                                "Your computer is not on US Eastern time. Both times above are New York time (as the exchange keeps it), not the time of this computer.",
+                                "Dein Computer läuft nicht auf US-Eastern-Zeit. Beide Zeiten oben sind New Yorker Zeit (wie an der Börse), nicht die Zeit dieses Computers.",
                             )).color(warning_banner_text()));
                             ui.label(RichText::new(format!("UTC{local_offset_hours:+.0}")).color(warning_banner_text()));
                         });
@@ -425,12 +456,6 @@ impl App {
         });
     }
 
-    /// Settings > Notifications. Every field here is real and persisted (see `PersistedSettings`);
-    /// "Send Sample" actually sends via real SMTP/HTTP right now (see `send_notification_email`,
-    /// `send_notification_webhook`) using whatever is in the fields at the moment of the click -
-    /// click Save Settings separately to keep it for next time. "Entry filled" fires for real the
-    /// moment an order this app placed is reported filled by TWS; there's no "Stop filled / closed"
-    /// trigger yet.
     /// The SMTP part of the notification settings: the server, the login, the STARTTLS switch, the sample email and its outcome.
     fn smtp_settings_row(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
@@ -473,6 +498,9 @@ impl App {
         }
     }
 
+    /// Settings > Notifications. "Send Sample" sends at once with what is in the fields at the moment of the click; Save Settings keeps
+    /// it. "Entry filled" fires when TWS reports an order of this app filled, "Stop filled / closed" when a trade ends by its stop, its
+    /// profit target or a close order.
     fn notifications_tab(&mut self, ui: &mut egui::Ui) {
         white_card(ui, |ui| {
             section_header(ui, self.tr("Email", "E-Mail"));
@@ -512,9 +540,8 @@ impl App {
         });
     }
 
-    /// Settings > Trading Features. Every field is real and persisted. The rest (stop
-    /// conversions, profit target, net-liq override) have no automated engine behind them yet to
-    /// act on these values - saved settings, not yet live behavior; see the in-UI notes.
+    /// Settings > Trading Features. The stop conversions act through `stop_conversion`, the full stop split through `stop_split`, the
+    /// daily profit target through `alerts`.
     fn trading_features_tab(&mut self, ui: &mut egui::Ui) {
         self.webhook_settings_card(ui);
         ui.add_space(14.0);
@@ -542,9 +569,17 @@ impl App {
 
         white_card(ui, |ui| {
             section_header(ui, self.tr("IronFly/IronCondor - Full Stop Split", "IronFly/IronCondor - Full-Stop-Split"));
-            setting_row(ui, self.tr("Split short stops on IF and IC-Full", "Short-Stops bei IF und IC-Full aufteilen"), "", |ui| {
-                toggle_switch(ui, &mut self.settings.convert_flags.iron_fly_stop_split_enabled);
-            });
+            setting_row(
+                ui,
+                self.tr("Split short stops on IF and IC-Full", "Short-Stops bei IF und IC-Full aufteilen"),
+                self.tr(
+                    "IronFly, IronCondor-Full and ShortStrangle with a Short stop: once a short is at the bid price or below, the trade becomes one trade per side, each with its own stop and target",
+                    "IronFly, IronCondor-Full und ShortStrangle mit Short-Stop: sobald ein Short beim Bid-Preis oder darunter liegt, wird der Trade zu einem Trade je Seite, jeder mit eigenem Stop und Ziel",
+                ),
+                |ui| {
+                    toggle_switch(ui, &mut self.settings.convert_flags.iron_fly_stop_split_enabled);
+                },
+            );
             setting_row(ui, self.tr("Bid price to trigger split", "Bid-Preis zum Ausl\u{f6}sen des Splits"), "", |ui| {
                 crate::widgets::metal_field(ui, egui::TextEdit::singleline(&mut self.settings.iron_fly_stop_split_price).desired_width(80.0));
             });
@@ -613,11 +648,11 @@ impl App {
             ui.add_space(6.0);
             ui.label(
                 RichText::new(self.tr(
-                    "No stop-management engine implemented yet - saved, but not yet acted on automatically.",
-                    "Noch keine Stop-Verwaltungs-Engine implementiert - wird gespeichert, aber noch nicht automatisch ausgef\u{fc}hrt.",
+                    "Credit trades only. The stop keeps its price; it is cancelled and placed again on the new legs. Vertical to Short: a long without a bid, or with one at the price or below, leaves the stop. Short to Vertical: the long comes back at a bid of 0.10 or more, before the 0-DTE time.",
+                    "Nur Credit-Trades. Der Stop beh\u{e4}lt seinen Preis; er wird storniert und auf den neuen Beinen neu platziert. Vertical zu Short: ein Long ohne Bid oder mit Bid zum Preis oder darunter verl\u{e4}sst den Stop. Short zu Vertical: der Long kommt ab einem Bid von 0,10 zur\u{fc}ck, vor der 0-DTE-Zeit.",
                 ))
                 .small()
-                .color(placeholder_color()),
+                .color(muted_text()),
             );
         });
     }
@@ -716,6 +751,10 @@ impl App {
     fn load_symbol_config(&mut self, config: &SymbolConfig) {
         self.new_symbol.clone_from(&config.symbol);
         self.new_symbol_required_dtes.clone_from(&config.required_dtes);
+        self.new_symbol_window.put_otm.clone_from(&config.put_otm);
+        self.new_symbol_window.call_otm.clone_from(&config.call_otm);
+        self.new_symbol_window.put_itm.clone_from(&config.put_itm);
+        self.new_symbol_window.call_itm.clone_from(&config.call_itm);
         self.template_order_flags.new_symbol_extended_quote_strikes = config.extended_quote_strikes;
     }
 
@@ -723,16 +762,33 @@ impl App {
     fn backups_list(&mut self, ui: &mut egui::Ui, backups: &[crate::storage::BackupInfo]) {
         let position = self.settings_selection.backup.as_ref().and_then(|name| backups.iter().position(|b| &b.file_name == name));
         let selected = position.and_then(|index| backups.get(index));
-        if ui.add_enabled(selected.is_some(), crate::widgets::MetalButton::new(self.tr("Restore", "Wiederherstellen"))).clicked() {
-            if let Some(backup) = selected {
-                match read_backup(&backup.path) {
-                    Ok(settings) => {
-                        self.apply_settings(settings);
-                        self.log(&format!("Restored settings from {}", backup.file_name));
-                    }
-                    Err(error) => self.log(&format!("Could not restore backup: {error}")),
+        ui.horizontal(|ui| {
+            if ui.add_enabled(selected.is_some(), crate::widgets::MetalButton::new(self.tr("Restore", "Wiederherstellen"))).clicked() {
+                if let Some(backup) = selected {
+                    self.restore_backup_file(backup);
                 }
             }
+            if ui.add_enabled(selected.is_some(), crate::widgets::MetalButton::new(self.tr("Delete", "L\u{f6}schen"))).clicked() {
+                self.ui_state.confirm_delete_backup = selected.map(|b| b.file_name.clone());
+            }
+        });
+        if let Some(name) = self.ui_state.confirm_delete_backup.clone() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{} {name}?", self.tr("Really delete the backup", "Backup wirklich l\u{f6}schen:"))).color(ORANGE_WARN));
+                if ui.add(crate::widgets::MetalButton::new(self.tr("Yes, delete", "Ja, l\u{f6}schen"))).clicked() {
+                    if let Some(backup) = backups.iter().find(|b| b.file_name == name) {
+                        self.delete_backup_file(backup);
+                    }
+                    self.ui_state.confirm_delete_backup = None;
+                }
+                if ui.add(crate::widgets::MetalButton::new(self.tr("Cancel", "Abbrechen"))).clicked() {
+                    self.ui_state.confirm_delete_backup = None;
+                }
+            });
+        }
+        if let Some((text, problem)) = &self.ui_state.backup_status {
+            ui.add_space(4.0);
+            ui.label(RichText::new(text).color(if *problem { ORANGE_WARN } else { STATUS_OK }));
         }
         ui.add_space(4.0);
         let columns = [TableColumn::new("File", 3.0, false), TableColumn::new("Backup Date", 2.0, false), TableColumn::new("Size", 1.0, true)];
@@ -742,6 +798,56 @@ impl App {
             .collect();
         let clicks = data_table_rows(ui, "backups_table", &columns, &rows, position);
         self.settings_selection.backup = next_selection(self.settings_selection.backup.take(), clicks, |index| backups.get(index).map(|b| b.file_name.clone()));
+    }
+
+    /// "Restore": lays the backup over the settings in use and says how it went, also where the backup does not fit this version.
+    fn restore_backup_file(&mut self, backup: &crate::storage::BackupInfo) {
+        let current = self.current_settings();
+        let status = match storage::restore_backup(&backup.path, &current) {
+            Ok(restored) => {
+                let (text, problem) = restore_message(&backup.file_name, &restored, self.german());
+                self.log(&format!(
+                    "Restored settings from {} (missing: {:?}, unknown: {:?}, unusable: {:?})",
+                    backup.file_name, restored.missing, restored.unknown, restored.unusable
+                ));
+                self.apply_settings(restored.settings);
+                (text, problem)
+            }
+            Err(error) => {
+                self.log(&format!("Could not restore backup {}: {error}", backup.file_name));
+                let text = if self.german() {
+                    format!("Backup {} NICHT wiederhergestellt: {error}. Die Einstellungen sind unver\u{e4}ndert.", backup.file_name)
+                } else {
+                    format!("Backup {} NOT restored: {error}. The settings are unchanged.", backup.file_name)
+                };
+                (text, true)
+            }
+        };
+        self.ui_state.backup_status = Some(status);
+    }
+
+    /// Deletes a backup after its confirmation and says so.
+    fn delete_backup_file(&mut self, backup: &crate::storage::BackupInfo) {
+        let de = self.german();
+        let status = match storage::delete_backup(&backup.path) {
+            Ok(()) => {
+                self.log(&format!("Backup deleted: {}", backup.file_name));
+                self.settings_selection.backup = None;
+                (if de { format!("Backup {} gel\u{f6}scht.", backup.file_name) } else { format!("Backup {} deleted.", backup.file_name) }, false)
+            }
+            Err(error) => {
+                self.log(&format!("Could not delete backup {}: {error}", backup.file_name));
+                (
+                    if de {
+                        format!("Backup {} NICHT gel\u{f6}scht: {error}", backup.file_name)
+                    } else {
+                        format!("Backup {} NOT deleted: {error}", backup.file_name)
+                    },
+                    true,
+                )
+            }
+        };
+        self.ui_state.backup_status = Some(status);
     }
 
     /// The card to configure the symbols of the market data.
@@ -764,6 +870,21 @@ impl App {
             setting_row(ui, self.tr("Required DTEs", "Ben\u{f6}tigte DTEs"), "", |ui| {
                 crate::widgets::metal_field(ui, egui::TextEdit::singleline(&mut self.new_symbol_required_dtes).desired_width(100.0));
             });
+            let window_note = self.tr(
+                "Points around the underlying price that get live quotes; empty = the default of the symbol.",
+                "Punkte um den Kurs des Basiswerts, die Live-Kurse bekommen; leer = die Vorgabe des Symbols.",
+            );
+            let window = &mut self.new_symbol_window;
+            for (label, field) in [
+                (if self.settings.lang == Lang::De { "Put OTM (Punkte)" } else { "Put OTM (points)" }, &mut window.put_otm),
+                (if self.settings.lang == Lang::De { "Call OTM (Punkte)" } else { "Call OTM (points)" }, &mut window.call_otm),
+                (if self.settings.lang == Lang::De { "Put ITM (Punkte)" } else { "Put ITM (points)" }, &mut window.put_itm),
+                (if self.settings.lang == Lang::De { "Call ITM (Punkte)" } else { "Call ITM (points)" }, &mut window.call_itm),
+            ] {
+                setting_row(ui, label, window_note, |ui| {
+                    crate::widgets::metal_field(ui, egui::TextEdit::singleline(field).desired_width(80.0));
+                });
+            }
             setting_row(ui, self.tr("Extended Quote Strikes", "Erweiterte Quote-Strikes"), "", |ui| {
                 toggle_switch(ui, &mut self.template_order_flags.new_symbol_extended_quote_strikes);
             });
@@ -774,10 +895,10 @@ impl App {
                     let entry = SymbolConfig {
                         symbol: symbol.clone(),
                         required_dtes: self.new_symbol_required_dtes.trim().to_string(),
-                        put_otm: String::new(),
-                        call_otm: String::new(),
-                        put_itm: String::new(),
-                        call_itm: String::new(),
+                        put_otm: window_value(&self.new_symbol_window.put_otm),
+                        call_otm: window_value(&self.new_symbol_window.call_otm),
+                        put_itm: window_value(&self.new_symbol_window.put_itm),
+                        call_itm: window_value(&self.new_symbol_window.call_itm),
                         extended_quote_strikes: self.template_order_flags.new_symbol_extended_quote_strikes,
                     };
                     if let Some(existing) = self.settings.symbol_configs.iter_mut().find(|s| s.symbol == symbol) {
@@ -787,42 +908,48 @@ impl App {
                     }
                     self.new_symbol.clear();
                     self.new_symbol_required_dtes.clear();
+                    self.new_symbol_window = super::SymbolWindowForm::default();
                     self.template_order_flags.new_symbol_extended_quote_strikes = false;
                 }
             }
         });
     }
 
-    /// Settings > Safety Features. The missing-stop and slippage notifications are live; closing a
-    /// trade automatically and retrying an entry are only saved, so those rows carry an amber note.
-    /// The "Trade Beyond Stop" warning (`alerts.rs`) is always sent, with its own fixed delay.
+    /// Settings > Safety Features. The "Trade Beyond Stop" warning (`alerts.rs`) is always sent after 60 seconds; closing the trade
+    /// beyond its stop is an extra step with its own percent and wait.
     fn safety_features_tab(&mut self, ui: &mut egui::Ui) {
         white_card(ui, |ui| {
             section_header(ui, self.tr("Safety Features", "Sicherheitsfunktionen"));
-            let not_live = self.tr("Saved only - no effect yet", "Nur gespeichert - noch ohne Wirkung");
 
-            setting_row_noted(ui, self.tr("Close trade on stop margin rejection", "Trade bei Margin-Ablehnung des Stops schlie\u{df}en"), "", not_live, |ui| {
-                toggle_switch(ui, &mut self.settings.stop_flags.close_on_stop_margin_rejection);
-            });
-            setting_row_noted(
+            setting_row(
+                ui,
+                self.tr("Close trade on stop margin rejection", "Trade bei Margin-Ablehnung des Stops schlie\u{df}en"),
+                self.tr(
+                    "TWS refused the stop for margin: the trade is closed at market",
+                    "Die TWS lehnt den Stop wegen Margin ab: der Trade wird per Market geschlossen",
+                ),
+                |ui| {
+                    toggle_switch(ui, &mut self.settings.stop_flags.close_on_stop_margin_rejection);
+                },
+            );
+            setting_row(
                 ui,
                 self.tr("Close trade beyond stop price", "Trade jenseits des Stop-Preises schlie\u{df}en"),
-                self.tr("Off = warning only", "Aus = nur Warnung"),
                 self.tr(
-                    "Saved only - no effect yet; the warning is always sent after 60 seconds",
-                    "Nur gespeichert - noch ohne Wirkung; die Warnung kommt immer nach 60 Sekunden",
+                    "Off = warning only (always sent after 60 seconds). On = also closed once the cost to close stays the percent above the stop for the wait",
+                    "Aus = nur Warnung (kommt immer nach 60 Sekunden). An = zus\u{e4}tzlich geschlossen, wenn der Schlie\u{df}preis die Wartezeit lang um den Prozentsatz \u{fc}ber dem Stop liegt",
                 ),
                 |ui| {
                     toggle_switch(ui, &mut self.settings.stop_flags.close_beyond_stop_enabled);
                 },
             );
-            setting_row_noted(ui, self.tr("% Beyond Stop", "% jenseits des Stops"), "", not_live, |ui| {
+            setting_row(ui, self.tr("% Beyond Stop", "% jenseits des Stops"), "", |ui| {
                 crate::widgets::metal_field(ui, egui::TextEdit::singleline(&mut self.settings.close_beyond_stop_pct).desired_width(80.0));
             });
-            setting_row_noted(ui, self.tr("Wait (seconds)", "Warten (Sek.)"), "", not_live, |ui| {
+            setting_row(ui, self.tr("Wait (seconds)", "Warten (Sek.)"), "", |ui| {
                 crate::widgets::metal_field(ui, egui::TextEdit::singleline(&mut self.settings.close_beyond_stop_wait_seconds).desired_width(80.0));
             });
-            setting_row_noted(ui, self.tr("Close Order Type", "Order-Typ zum Schlie\u{df}en"), "", not_live, |ui| {
+            setting_row(ui, self.tr("Close Order Type", "Order-Typ zum Schlie\u{df}en"), "", |ui| {
                 let market = self.settings.stop_flags.close_beyond_stop_market_order;
                 ui.label(if market { self.tr("Market", "Market") } else { self.tr("Limit", "Limit") });
                 toggle_switch(ui, &mut self.settings.stop_flags.close_beyond_stop_market_order);
@@ -836,11 +963,13 @@ impl App {
             setting_row(ui, self.tr("% Slippage to Notify", "% Slippage f\u{fc}r Benachrichtigung"), "", |ui| {
                 crate::widgets::metal_field(ui, egui::TextEdit::singleline(&mut self.settings.high_slippage_pct).desired_width(80.0));
             });
-            setting_row_noted(
+            setting_row(
                 ui,
                 self.tr("Retry trade entry on margin rejection", "Trade-Eintrag bei Margin-Ablehnung wiederholen"),
-                self.tr("Off = cancel the trade", "Aus = Trade abbrechen"),
-                not_live,
+                self.tr(
+                    "On = sent again up to 3 times, 20 seconds apart. Off = cancel the trade",
+                    "An = bis zu 3-mal erneut gesendet, im Abstand von 20 Sekunden. Aus = Trade abbrechen",
+                ),
                 |ui| {
                     toggle_switch(ui, &mut self.settings.alert_flags.retry_on_margin_rejection);
                 },
@@ -848,23 +977,11 @@ impl App {
         });
     }
 
-    /// Settings > Database Backup. There is no cloud backend, so this is a real
-    /// local file export/import:
-    /// "Backup Now" really writes a file under
-    /// this app's data directory, "Available Backups" really lists what's there, "Restore" really
-    /// loads one back. Nothing here is simulated.
+    /// Settings > Database Backup: the daily backup and the CSV export, "Backup Now", and the backups in the backups folder with
+    /// Restore and Delete.
     fn database_backup_tab(&mut self, ui: &mut egui::Ui) {
         white_card(ui, |ui| {
             section_header(ui, self.tr("Daily Database Backup", "T\u{e4}gliches Datenbank-Backup"));
-            ui.label(
-                RichText::new(self.tr(
-                    "There is no cloud account to back up to - backups are written to a local file on this computer instead.",
-                    "Es gibt keinen Cloud-Account zum Sichern - Backups werden stattdessen lokal auf diesem Computer gespeichert.",
-                ))
-                .small()
-                .color(placeholder_color()),
-            );
-            ui.add_space(6.0);
             setting_row(ui, self.tr("Daily Backups Enabled", "T\u{e4}gliche Backups aktiviert"), "", |ui| {
                 toggle_switch(ui, &mut self.settings.misc_flags.daily_backup_enabled);
             });
@@ -916,5 +1033,69 @@ impl App {
                 }
             }
         });
+    }
+}
+
+/// A typed value of the quote window as it is stored: a number above 0 (a comma taken as the decimal point), else empty, which means
+/// the default of the symbol.
+fn window_value(text: &str) -> String {
+    let text = text.trim().replace(',', ".");
+    text.parse::<f64>().ok().filter(|value| *value > 0.0 && value.is_finite()).map_or_else(String::new, |_| text)
+}
+
+/// What the page says after a restore, and whether it is a warning: restored, and - if the backup is of another version - which
+/// settings kept their current value and which entries were left out. The restored settings still have to be saved.
+fn restore_message(file: &str, restored: &crate::storage::Restored, de: bool) -> (String, bool) {
+    use std::fmt::Write as _;
+    let mut text = if de {
+        format!("Backup {file} wiederhergestellt. Mit \u{201e}Einstellungen speichern\u{201c} behalten, sonst gilt es nur bis zum Beenden.")
+    } else {
+        format!("Backup {file} restored. Click \"Save Settings\" to keep it, else it lasts only until the app is closed.")
+    };
+    if restored.exact() {
+        return (text, false);
+    }
+    text.push_str(if de {
+        " Das Backup stammt von einer anderen Version, die Einstellungen haben sich seither ge\u{e4}ndert:"
+    } else {
+        " The backup is from another version; the settings have changed since:"
+    });
+    let parts = [
+        (&restored.missing, "not in the backup, they keep their current value", "nicht im Backup, sie behalten ihren aktuellen Wert"),
+        (&restored.unusable, "do not fit any more, they keep their current value", "passen nicht mehr, sie behalten ihren aktuellen Wert"),
+        (&restored.unknown, "unknown to this version, left out", "dieser Version unbekannt, weggelassen"),
+    ];
+    for (names, en, german) in parts {
+        if !names.is_empty() {
+            let _ = write!(text, " {} {} ({}).", names.len(), if de { german } else { en }, names.join(", "));
+        }
+    }
+    (text, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{restore_message, window_value};
+    use crate::storage::Restored;
+
+    #[test]
+    fn a_restore_says_it_worked_and_names_what_did_not_fit_this_version() {
+        let exact = Restored { settings: super::super::default_settings(), missing: Vec::new(), unknown: Vec::new(), unusable: Vec::new() };
+        let (text, problem) = restore_message("backup-1.json", &exact, true);
+        assert!(text.starts_with("Backup backup-1.json wiederhergestellt.") && !problem, "{text}");
+        let older = Restored { missing: vec!["light_mode".into()], unknown: vec!["old_switch".into()], ..exact };
+        let (text, problem) = restore_message("backup-1.json", &older, false);
+        assert!(problem);
+        assert!(text.contains("restored") && text.contains("1 not in the backup") && text.contains("light_mode") && text.contains("old_switch"), "{text}");
+    }
+
+    #[test]
+    fn a_window_value_is_a_number_above_zero_or_empty() {
+        assert_eq!(window_value(" 220 "), "220");
+        assert_eq!(window_value("12,5"), "12.5");
+        assert_eq!(window_value("0"), "");
+        assert_eq!(window_value("-5"), "");
+        assert_eq!(window_value("abc"), "");
+        assert_eq!(window_value(""), "");
     }
 }

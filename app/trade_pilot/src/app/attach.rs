@@ -232,7 +232,7 @@ impl App {
     /// Sends the orders. A new order is recorded on the trade once it was handed to TWS; a changed one keeps its old price on
     /// record until TWS confirms the change (`on_exit_change_status`).
     #[allow(clippy::too_many_arguments)]
-    fn place_attached_exits(
+    pub(super) fn place_attached_exits(
         &mut self,
         index: usize,
         trade: &StoredTrade,
@@ -300,7 +300,7 @@ impl App {
             return;
         }
         self.save_trade(index, updated);
-        self.instant.template_status = Some(format!("{label}: {}", self.tr("stop/target sent to TWS", "Stop/Ziel an TWS gesendet")));
+        self.instant.template_status = Some(format!("{label}: {}", self.tr("stop/target sent to TWS", "Stop/Ziel an die TWS gesendet")));
     }
 
     /// The status of an order: a change sent from the window takes effect on the trade once TWS reports the order as

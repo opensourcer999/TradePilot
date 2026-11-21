@@ -91,7 +91,7 @@ impl App {
         };
         match self.place_close_order(pending.index, limit) {
             Ok(order_id) => {
-                self.instant.template_status = Some(format!("#{order_id}: {}", self.tr("close order sent to TWS", "Close-Order an TWS gesendet")));
+                self.instant.template_status = Some(format!("#{order_id}: {}", self.tr("close order sent to TWS", "Close-Order an die TWS gesendet")));
             }
             Err(reason) => self.block_close(&reason),
         }

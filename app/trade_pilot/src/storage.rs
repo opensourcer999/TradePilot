@@ -302,10 +302,12 @@ pub fn seed_mode_dir(from: &Path, to: &Path) -> io::Result<bool> {
 /// Reads and parses `settings.json`, if it exists and is valid. Any failure (missing file, bad
 /// JSON from a future/older format) falls back to `None` so startup always proceeds with the
 /// hardcoded defaults instead of failing to launch over a settings file.
-pub fn load_settings(live: bool) -> Option<PersistedSettings> {
+/// The settings of the mode, laid over `defaults` (see `restore_from_text`): a file of an older version keeps every value it has, the
+/// settings it lacks take their default. `None` without a readable settings file.
+pub fn load_settings(live: bool, defaults: &PersistedSettings) -> Option<Restored> {
     let path = settings_path(live).ok()?;
     let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    restore_from_text(&text, defaults).ok()
 }
 
 pub fn write_settings(path: &Path, settings: &PersistedSettings) -> io::Result<()> {
@@ -322,17 +324,88 @@ pub fn append_log(path: &Path, line: &str) -> io::Result<()> {
     writeln!(file, "{line}")
 }
 
+/// Whether a line of the log file stays when the lines before `keep_from` are removed: a line that does not start with its date
+/// (`dd-mm-yyyy`) is kept, it cannot be told apart from a newer one.
+fn keeps_log_line(line: &str, keep_from: chrono::NaiveDate) -> bool {
+    line.get(..10).and_then(|date| chrono::NaiveDate::parse_from_str(date, "%d-%m-%Y").ok()).is_none_or(|date| date >= keep_from)
+}
+
+/// Removes the lines written before `keep_from` from the log file at `path`, and every other file in its folder last changed before
+/// that day. Returns how many lines and files were removed. The log file is rewritten through a temporary file, so a failure leaves
+/// it whole.
+pub fn prune_logs(path: &Path, keep_from: chrono::NaiveDate) -> io::Result<(usize, usize)> {
+    let mut lines_removed = 0;
+    if path.is_file() {
+        let text = fs::read_to_string(path)?;
+        let kept: Vec<&str> = text.lines().filter(|line| keeps_log_line(line, keep_from)).collect();
+        lines_removed = text.lines().count().saturating_sub(kept.len());
+        if lines_removed > 0 {
+            let temporary = path.with_extension("log.tmp");
+            let mut joined = kept.join("\n");
+            if !joined.is_empty() {
+                joined.push('\n');
+            }
+            fs::write(&temporary, joined)?;
+            fs::rename(&temporary, path)?;
+        }
+    }
+    let mut files_removed = 0;
+    let Some(dir) = path.parent().filter(|dir| dir.is_dir()) else {
+        return Ok((lines_removed, files_removed));
+    };
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() || entry.path() == path {
+            continue;
+        }
+        let changed: chrono::DateTime<chrono::Local> = metadata.modified()?.into();
+        if changed.date_naive() < keep_from {
+            fs::remove_file(entry.path())?;
+            files_removed += 1;
+        }
+    }
+    Ok((lines_removed, files_removed))
+}
+
 fn backups_dir() -> io::Result<PathBuf> {
     Ok(app_data_dir()?.join("backups"))
 }
 
+/// The computer name as a part of a file name: letters, digits, `-` and `_` only, at most 40 characters; empty when nothing is left.
+fn file_name_part(name: &str) -> String {
+    name.trim()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(40)
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+/// The file name of a backup written at `timestamp` on the computer `machine` (left out when empty).
+fn backup_file_name(machine: &str, timestamp: &str) -> String {
+    match file_name_part(machine) {
+        part if part.is_empty() => format!("backup-{timestamp}.json"),
+        part => format!("backup-{part}-{timestamp}.json"),
+    }
+}
+
+/// Whether a backup of the computer `machine` was written on `day` (`yyyymmdd`), told by the file names in the backup folder.
+pub fn backup_written_on(day: &str, machine: &str) -> bool {
+    let prefix = backup_file_name(machine, day);
+    let prefix = prefix.trim_end_matches(".json");
+    list_backups().is_ok_and(|backups| backups.iter().any(|b| b.file_name.starts_with(prefix)))
+}
+
 /// Writes the given settings as a real local backup file - a genuine, restorable file on
-/// disk. Returns the path written to.
+/// disk. The file name carries the computer name of the settings, so backups of several computers in one folder stay apart.
+/// Returns the path written to.
 pub fn write_backup(settings: &PersistedSettings) -> io::Result<PathBuf> {
     let dir = backups_dir()?;
     fs::create_dir_all(&dir)?;
-    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let path = dir.join(format!("backup-{timestamp}.json"));
+    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let path = dir.join(backup_file_name(&settings.backup_machine_name, &timestamp));
     let json = serde_json::to_string_pretty(settings).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     fs::write(&path, json)?;
     Ok(path)
@@ -374,10 +447,77 @@ pub fn list_backups() -> io::Result<Vec<BackupInfo>> {
     Ok(backups)
 }
 
-/// Reads a real backup file back into `PersistedSettings` (the caller then applies it).
-pub fn read_backup(path: &Path) -> io::Result<PersistedSettings> {
+/// A backup read back over the settings in use: the settings to apply, and where the backup does not fit the settings of this version.
+#[derive(Clone, PartialEq)]
+pub struct Restored {
+    /// The settings in use, with every value of the backup that fits.
+    pub settings: PersistedSettings,
+    /// Settings of this version the backup does not have (written by an older version): they keep their current value.
+    pub missing: Vec<String>,
+    /// Entries of the backup this version does not know (written by another version): they are left out.
+    pub unknown: Vec<String>,
+    /// Entries of the backup whose value does not fit the setting of the same name any more: they keep their current value.
+    pub unusable: Vec<String>,
+}
+
+impl Restored {
+    /// Whether the backup fitted the settings of this version exactly.
+    #[must_use]
+    pub fn exact(&self) -> bool {
+        self.missing.is_empty() && self.unknown.is_empty() && self.unusable.is_empty()
+    }
+}
+
+/// Lays the backup `text` over the settings `current`, entry by entry, so that a backup of another version is restored as far as it
+/// fits instead of being refused as a whole.
+///
+/// # Errors
+///
+/// The reason as text when the text is no settings backup at all (no JSON object).
+pub fn restore_from_text(text: &str, current: &PersistedSettings) -> Result<Restored, String> {
+    let backup: serde_json::Value = serde_json::from_str(text).map_err(|error| format!("the file is no settings backup ({error})"))?;
+    let serde_json::Value::Object(backup) = backup else { return Err("the file is no settings backup (no JSON object)".to_string()) };
+    let serde_json::Value::Object(base) = serde_json::to_value(current).map_err(|error| error.to_string())? else {
+        return Err("the current settings cannot be read".to_string());
+    };
+    let missing: Vec<String> = base.keys().filter(|key| !backup.contains_key(*key)).cloned().collect();
+    let unknown: Vec<String> = backup.keys().filter(|key| !base.contains_key(*key)).cloned().collect();
+    let mut merged = base.clone();
+    let mut unusable = Vec::new();
+    for (key, value) in backup.iter().filter(|(key, _)| base.contains_key(*key)) {
+        let previous = merged.insert(key.clone(), value.clone());
+        if serde_json::from_value::<PersistedSettings>(serde_json::Value::Object(merged.clone())).is_err() {
+            if let Some(previous) = previous {
+                merged.insert(key.clone(), previous);
+            }
+            unusable.push(key.clone());
+        }
+    }
+    let settings = serde_json::from_value(serde_json::Value::Object(merged)).map_err(|error| error.to_string())?;
+    Ok(Restored { settings, missing, unknown, unusable })
+}
+
+/// Reads the backup file at `path` over the settings `current` (see `restore_from_text`).
+///
+/// # Errors
+///
+/// When the file cannot be read or is no settings backup.
+pub fn restore_backup(path: &Path, current: &PersistedSettings) -> io::Result<Restored> {
     let text = fs::read_to_string(path)?;
-    serde_json::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    restore_from_text(&text, current).map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))
+}
+
+/// Deletes the backup file at `path`; only a file in the backup folder.
+///
+/// # Errors
+///
+/// When the file is not in the backup folder or cannot be deleted.
+pub fn delete_backup(path: &Path) -> io::Result<()> {
+    let dir = backups_dir()?;
+    if path.parent() != Some(dir.as_path()) || !path.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file in the backup folder"));
+    }
+    fs::remove_file(path)
 }
 
 /// The switches of the 0-DTE conversion and the market close time (PM or not).
@@ -725,11 +865,88 @@ mod tests {
     }
 
     #[test]
+    fn pruning_the_logs_removes_the_lines_before_the_day_and_keeps_lines_without_a_date() {
+        let folder = crate::test_support::TempDir::new("prune-log");
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("app.log");
+        fs::write(&path, "01-03-2026 10:00:00  old\n  continued\n15-03-2026 09:00:00  kept\n20-03-2026 08:00:00  newer\n").unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        assert_eq!(prune_logs(&path, day).unwrap(), (1, 0));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "  continued\n15-03-2026 09:00:00  kept\n20-03-2026 08:00:00  newer\n");
+        assert_eq!(prune_logs(&path, day).unwrap(), (0, 0), "nothing is left to remove");
+        let tomorrow = chrono::Local::now().date_naive().succ_opt().unwrap();
+        fs::write(folder.join("app-old.log"), "x").unwrap();
+        assert_eq!(prune_logs(&path, tomorrow).unwrap().1, 1, "another file changed before the day goes");
+        assert!(!folder.join("app-old.log").exists());
+        assert!(path.exists(), "the log file itself stays, even when empty");
+    }
+
+    #[test]
+    fn a_backup_file_name_carries_the_computer_name_made_safe_for_a_file_name() {
+        assert_eq!(backup_file_name("", "20260315-100000"), "backup-20260315-100000.json");
+        assert_eq!(backup_file_name(" Office PC ", "20260315-100000"), "backup-Office_PC-20260315-100000.json");
+        assert_eq!(backup_file_name("../..", "t"), "backup-t.json", "nothing but separators is no name");
+    }
+
+    #[test]
     fn settings_round_trip_through_disk_matches_what_was_written() {
         let folder = crate::test_support::TempDir::new("settings");
         fs::create_dir_all(&folder).unwrap();
         let path = folder.join("settings.json");
-        let settings = PersistedSettings {
+        let settings = sample_settings();
+        write_settings(&path, &settings).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let reloaded: PersistedSettings = serde_json::from_str(&text).unwrap();
+        assert!(reloaded == settings);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_backup_of_this_version_is_restored_exactly() {
+        let settings = sample_settings();
+        let text = serde_json::to_string(&settings).unwrap();
+        let restored = restore_from_text(&text, &PersistedSettings { tws_port: "1".into(), ..settings.clone() }).unwrap();
+        assert!(restored.exact());
+        assert!(restored.settings == settings, "every value comes from the backup");
+    }
+
+    #[test]
+    fn an_older_backup_without_a_setting_is_restored_and_the_setting_keeps_its_current_value() {
+        let current = PersistedSettings { view_flags: ViewFlags { settings_logging_debug: true, settings_clean_logs: true }, ..sample_settings() };
+        let mut old = serde_json::to_value(PersistedSettings { tws_port: "4002".into(), ..sample_settings() }).unwrap();
+        let object = old.as_object_mut().unwrap();
+        object.remove("settings_logging_debug");
+        object.insert("a_switch_of_an_old_version".into(), serde_json::Value::Bool(true));
+        object.insert("settings_grid_font".into(), serde_json::json!([1, 2]));
+        let restored = restore_from_text(&old.to_string(), &current).unwrap();
+        assert_eq!(restored.missing, ["settings_logging_debug"]);
+        assert_eq!(restored.unknown, ["a_switch_of_an_old_version"]);
+        assert_eq!(restored.unusable, ["settings_grid_font"], "a value of another type");
+        assert!(restored.settings.view_flags.settings_logging_debug, "the missing setting keeps its current value");
+        assert_eq!(restored.settings.settings_grid_font, current.settings_grid_font);
+        assert_eq!(restored.settings.tws_port, "4002", "the rest comes from the backup");
+        assert!(!restored.exact());
+    }
+
+    #[test]
+    fn a_file_that_is_no_settings_backup_is_refused_with_the_reason() {
+        assert!(restore_from_text("not json", &sample_settings()).err().unwrap().contains("no settings backup"));
+        assert!(restore_from_text("[1, 2]", &sample_settings()).err().unwrap().contains("no JSON object"));
+    }
+
+    #[test]
+    fn only_a_file_in_the_backup_folder_can_be_deleted() {
+        let folder = crate::test_support::TempDir::new("not-backups");
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("backup-x.json");
+        fs::write(&path, "{}").unwrap();
+        assert!(delete_backup(&path).is_err());
+        assert!(path.exists(), "a file elsewhere is never deleted");
+    }
+
+    /// Settings with a value of their own in every field.
+    fn sample_settings() -> PersistedSettings {
+        PersistedSettings {
             tws_host: "127.0.0.1".to_string(),
             tws_port: "7497".to_string(),
             settings_client_id: "9".to_string(),
@@ -785,12 +1002,7 @@ mod tests {
             high_slippage_pct: "100".to_string(),
             backup_machine_name: "TESTHOST".to_string(),
             lang: Lang::De,
-        };
-        write_settings(&path, &settings).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        let reloaded: PersistedSettings = serde_json::from_str(&text).unwrap();
-        assert!(reloaded == settings);
-        fs::remove_file(path).unwrap();
+        }
     }
 
     /// A folder of its own (not made yet) and the guard that removes it when the test is over.

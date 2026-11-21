@@ -2,7 +2,9 @@ TradePilot - Quick Guide
 ========================
 
 TradePilot manages options trades through Interactive Brokers' Trader Workstation (TWS) or IB Gateway.
-Orders are only sent to paper trading accounts (account number starts with "DU").
+Orders are only sent when the account matches the mode chosen at the top right: a paper trading
+account (number starts with "DU") in Paper Trading, a live account in Live. In Live every order
+is limited to 1 contract.
 
 1. Requirements
    - Windows 10 or 11, 64-bit. Nothing else needs to be installed.

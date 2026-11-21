@@ -333,6 +333,12 @@ impl StoredTrade {
         self.state() == Some(crate::trade_summary::TradeStatus::Open)
     }
 
+    /// The trade was split into one trade per side (`TradeStatus::Split`): hidden, its sides count instead.
+    #[must_use]
+    pub fn is_split(&self) -> bool {
+        self.state() == Some(crate::trade_summary::TradeStatus::Split)
+    }
+
     /// Whether `other` is the same trade, in another state: the same day, opening order, type and strikes.
     #[must_use]
     pub fn is_same_trade(&self, other: &StoredTrade) -> bool {

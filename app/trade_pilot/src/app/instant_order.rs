@@ -47,7 +47,7 @@ impl App {
                         ui.end_row();
                         ui.label(self.tr("Account", "Konto"));
                         let selected = if self.instant.account.is_empty() {
-                            self.tr("(connect to TWS)", "(mit TWS verbinden)").to_string()
+                            self.tr("(connect to TWS)", "(mit der TWS verbinden)").to_string()
                         } else {
                             format!("IB:{}", self.instant.account)
                         };
@@ -67,8 +67,8 @@ impl App {
                     let test_label =
                         self.tr("Test Trade? (prices the order so that it does not fill)", "Test Trade? (Preis so, dass die Order nicht ausgeführt wird)");
                     crate::widgets::metal_checkbox(ui, &mut self.template_order_flags.instant_template_test, test_label);
-                    let transmit_label =
-                        self.tr("Transmit immediately (off: the order waits in TWS for review)", "Sofort übertragen (aus: Order wartet in TWS auf Prüfung)");
+                    let transmit_label = self
+                        .tr("Transmit immediately (off: the order waits in TWS for review)", "Sofort übertragen (aus: Order wartet in der TWS auf Prüfung)");
                     crate::widgets::metal_checkbox(ui, &mut self.template_order_flags.instant_template_transmit, transmit_label);
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -204,7 +204,7 @@ impl App {
                     let can_fetch = self.tws_cmd_sender.is_some() && !self.instant.symbol.trim().is_empty();
                     // Until expiries/strikes are loaded the Expiry/Strike lists are empty, so the
                     // button that fills them stands out (filled accent) while it can be used.
-                    let fetch_label = self.tr("Fetch from TWS", "Von TWS laden");
+                    let fetch_label = self.tr("Fetch from TWS", "Von der TWS laden");
                     let fetching = self.instant.contract_details_req_id.is_some() || self.instant.option_params_req_id.is_some();
                     let needs_fetch = can_fetch && self.instant.option_expirations.is_empty() && !fetching;
                     let fetch_button = if needs_fetch {
@@ -300,7 +300,7 @@ impl App {
             }
             ui.label(self.tr("Account", "Konto"));
             let selected = if self.instant.account.is_empty() {
-                self.tr("(connect to TWS)", "(mit TWS verbinden)").to_string()
+                self.tr("(connect to TWS)", "(mit der TWS verbinden)").to_string()
             } else {
                 format!("IB:{}", self.instant.account)
             };
@@ -335,7 +335,7 @@ impl App {
     fn instant_order_buttons(&mut self, ui: &mut egui::Ui) {
         let transmit_label = self.tr(
             "Transmit immediately (unchecked: order reaches TWS but stays un-transmitted for manual review there)",
-            "Sofort übermitteln (deaktiviert: Order erreicht TWS, bleibt dort aber unübermittelt zur manuellen Prüfung)",
+            "Sofort übermitteln (deaktiviert: die Order erreicht die TWS, bleibt dort aber zur manuellen Prüfung liegen)",
         );
         crate::widgets::metal_checkbox(ui, &mut self.instant_flags.instant_transmit, transmit_label);
         ui.add_space(8.0);
@@ -438,7 +438,7 @@ impl App {
         self.instant.option_strikes.clear();
         self.instant.expiry.clear();
         self.instant.strike.clear();
-        self.instant.option_params_status = self.tr("Resolving underlying contract with TWS...", "Löse Basiswert-Kontrakt mit TWS auf...").to_string();
+        self.instant.option_params_status = self.tr("Resolving underlying contract with TWS...", "Löse Basiswert-Kontrakt mit der TWS auf...").to_string();
         let contract = IbContract {
             symbol: symbol.clone(),
             sec_type: self.instant.underlying_sec_type.clone(),
@@ -467,7 +467,7 @@ impl App {
         let symbol = self.instant.symbol.trim().to_string();
         let req_id = self.next_request_id();
         self.instant.option_params_req_id = Some(req_id);
-        self.instant.option_params_status = self.tr("Fetching expiries/strikes from TWS...", "Lade Verfalltermine/Strikes von TWS...").to_string();
+        self.instant.option_params_status = self.tr("Fetching expiries/strikes from TWS...", "Lade Verfalltermine/Strikes von der TWS...").to_string();
         self.log(&format!("Resolved {symbol} to conId {con_id}; requesting option expiries/strikes"));
         send_counted(
             &sender,
@@ -622,7 +622,7 @@ impl App {
         let Some(price) = self.chains.price(&symbol).and_then(dec) else {
             return format!(
                 "{symbol}: {}",
-                self.tr("no price from TWS yet - please wait and preview again.", "noch kein Kurs von TWS - bitte warten und erneut Preview.")
+                self.tr("no price from TWS yet - please wait and preview again.", "noch kein Kurs von der TWS - bitte warten und erneut Preview.")
             );
         };
         // The expiration of the template's DTE.
@@ -747,7 +747,7 @@ impl App {
         let Some(price) = self.chains.price(symbol).and_then(dec) else {
             return format!(
                 "{symbol}: {}",
-                self.tr("no price from TWS yet - please wait and preview again.", "noch kein Kurs von TWS - bitte warten und erneut Preview.")
+                self.tr("no price from TWS yet - please wait and preview again.", "noch kein Kurs von der TWS - bitte warten und erneut Preview.")
             );
         };
         let today = self.clock.local().date_naive();
@@ -964,7 +964,7 @@ impl App {
             (true, false) => {
                 format!("{} attempts, {} s apart, {} per step; cancelled if it does not fill", fill_attempts(t), fill_wait(t).as_secs(), t.fill_adjustment)
             }
-            (false, true) => "aus - die Order wartet in TWS und wird nicht verändert".to_string(),
+            (false, true) => "aus - die Order wartet in der TWS und wird nicht verändert".to_string(),
             (false, false) => "off - the order waits in TWS and is not changed".to_string(),
         };
         rows.push((if de { "Nachpreisen" } else { "Fill attempts" }, fill_note));

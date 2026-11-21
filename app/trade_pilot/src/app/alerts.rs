@@ -5,13 +5,17 @@
 
 use super::{live_legs, mask_account, profit_summary, App, Decimal, Duration, Instant, RunStatus, StoredTrade};
 use crate::trade_mail;
-use crate::watch::{beyond_stop, profit_target_total};
+use crate::watch::{beyond_stop, beyond_stop_percent, far_beyond_stop, profit_target_total};
 
 /// How often the watchers look.
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 /// A stop must be passed this long before it is reported, and the report is repeated after the pause.
 const BEYOND_STOP_HOLD: Duration = Duration::from_secs(60);
 const REPEAT_PAUSE: Duration = Duration::from_mins(15);
+/// The TWS error code of an order it rejected.
+const ORDER_REJECTED: i32 = 201;
+/// A trade closed beyond its stop is not closed again before this pause (its close order may still be on its way).
+const CLOSE_REPEAT_PAUSE: Duration = Duration::from_mins(5);
 /// Quotes must be missing this long, and the session must be this old, before it is reported.
 const QUOTES_HOLD: Duration = Duration::from_secs(120);
 /// Underlyings that settle in cash: their short options carry no assignment risk.
@@ -91,6 +95,66 @@ impl App {
         if !problems.is_empty() {
             self.log(&format!("WARNING: Trade Beyond Stop: {}", problems.join("; ")));
             self.notify_trade_mail(&trade_mail::beyond_stop(&problems), true, true);
+        }
+        self.close_beyond_stop(&trades, now);
+    }
+
+    /// Settings > Safety > "Close trade beyond stop price": an open credit trade whose cost to close has stayed at least the percent
+    /// above its stop for the wait is closed with a market order, or a limit order at the current cost to close. A trade that has a
+    /// close order working already is left alone; the close goes through the same checks as every order.
+    fn close_beyond_stop(&mut self, trades: &[StoredTrade], now: Instant) {
+        if !self.settings.stop_flags.close_beyond_stop_enabled {
+            return;
+        }
+        let Some(percent) = beyond_stop_percent(&self.settings.close_beyond_stop_pct) else { return };
+        let wait = Duration::from_secs(self.settings.close_beyond_stop_wait_seconds.trim().parse().unwrap_or(60));
+        let market = self.settings.stop_flags.close_beyond_stop_market_order;
+        for trade in trades {
+            let cost = live_legs(trade, &self.chains).and_then(|legs| legs.current_bid(&trade.trade_type)).filter(|bid| *bid > Decimal::ZERO);
+            let far = trade.stop_now().zip(cost).is_some_and(|(stop, cost)| far_beyond_stop(stop, cost, percent));
+            let key = format!("beyond-close:{}", trade.order_id);
+            if !self.watch.sustained.fire(&key, far && trade.close_order_id.is_none(), now, wait, CLOSE_REPEAT_PAUSE) {
+                continue;
+            }
+            let Some(index) = self.trades_stored.iter().position(|t| t.is_open() && t.order_id == trade.order_id && t.label() == trade.label()) else {
+                continue;
+            };
+            let limit = if market { None } else { self.closing_price(trade) };
+            if !market && limit.is_none() {
+                self.log(&format!("WARNING: {}: beyond its stop, but there is no price to close it at - NOT closed", trade.label()));
+                continue;
+            }
+            self.log(&format!(
+                "{}: the cost to close {} has been {percent} % or more above the stop {} for {} s - closing the trade with a {} order",
+                trade.label(),
+                cost.map_or_else(|| "-".to_string(), |c| c.normalize().to_string()),
+                trade.stop_now().map_or_else(|| "-".to_string(), |s| s.normalize().to_string()),
+                wait.as_secs(),
+                if market { "market" } else { "limit" }
+            ));
+            if let Err(reason) = self.place_close_order(index, limit) {
+                self.log(&format!("WARNING: {}: the close beyond the stop was NOT sent: {reason}", trade.label()));
+            }
+        }
+    }
+
+    /// Settings > Safety > "Close trade on stop margin rejection": TWS refused the stop of an open trade for margin, so the trade is
+    /// closed with a market order instead of being left without a stop.
+    fn close_on_stop_margin_rejection(&mut self, order_id: i32) {
+        if !self.settings.stop_flags.close_on_stop_margin_rejection {
+            return;
+        }
+        let Some(index) = self
+            .trades_stored
+            .iter()
+            .position(|t| t.is_open() && (t.stop_order_id == Some(order_id) || t.stop_limit_order_id == Some(order_id)) && t.close_order_id.is_none())
+        else {
+            return;
+        };
+        let label = self.trades_stored.get(index).map(StoredTrade::label).unwrap_or_default();
+        self.log(&format!("{label}: TWS refused the stop {order_id} for margin - closing the trade at market"));
+        if let Err(reason) = self.place_close_order(index, None) {
+            self.log(&format!("WARNING: {label}: the close after the margin rejection of the stop was NOT sent: {reason} - the trade may have NO stop"));
         }
     }
 
@@ -198,6 +262,11 @@ impl App {
             let entry = sent.and_then(|(_, run)| run).map(|run| format!("Schedule run {run}"));
             self.log(&format!("WARNING: margin rejection of order {order_id}: {text}"));
             self.notify_trade_mail(&trade_mail::margin_issue(entry.as_deref(), &mask_account(&account), &text), true, true);
+            // Only a rejection ends the order; a margin warning leaves it working, and acting on it would send a second order.
+            if code == ORDER_REJECTED {
+                self.close_on_stop_margin_rejection(order_id);
+                self.plan_margin_retry(order_id);
+            }
         } else if let Some((_, label)) = exit {
             if is_order_failure(code) {
                 let line = format!("{label}: order {order_id} - {text}");

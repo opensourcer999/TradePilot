@@ -20,5 +20,6 @@ pub mod trade_entry;
 pub mod trade_exit;
 pub mod trade_live;
 pub mod trade_rebuild;
+pub mod trade_split;
 pub mod trade_summary;
 pub mod trade_type;

@@ -18,11 +18,13 @@ pub enum TradeStatus {
     Expired,
     /// 5 - closed otherwise (counted like 3).
     ClosedOther,
+    /// Split into one trade per side (the full stop split): the sides carry on, this one is hidden and counts for nothing.
+    Split,
 }
 
 impl TradeStatus {
     /// Every status.
-    pub const ALL: [Self; 5] = [Self::Open, Self::Stopped, Self::Closed, Self::Expired, Self::ClosedOther];
+    pub const ALL: [Self; 6] = [Self::Open, Self::Stopped, Self::Closed, Self::Expired, Self::ClosedOther, Self::Split];
 
     /// The name a stored trade keeps (`StoredTrade::status`).
     #[must_use]
@@ -33,6 +35,7 @@ impl TradeStatus {
             Self::Closed => "Closed",
             Self::Expired => "Expired",
             Self::ClosedOther => "ClosedOther",
+            Self::Split => "Split",
         }
     }
 
@@ -171,7 +174,8 @@ pub struct CreditSummary {
 /// only. `None` only on arithmetic overflow.
 #[must_use]
 pub fn credit_summary(trades: &[TradeRecord]) -> Option<CreditSummary> {
-    let trades: Vec<&TradeRecord> = trades.iter().filter(|t| !t.is_debit()).collect();
+    // A split trade lives on in its two sides: counting it too would count its premium twice.
+    let trades: Vec<&TradeRecord> = trades.iter().filter(|t| !t.is_debit() && t.status != TradeStatus::Split).collect();
     let mut summary = CreditSummary { trade_count: trades.len(), ..CreditSummary::default() };
     if trades.is_empty() {
         return Some(summary);
@@ -202,7 +206,7 @@ pub fn credit_summary(trades: &[TradeRecord]) -> Option<CreditSummary> {
         let counts = match t.status {
             TradeStatus::Closed | TradeStatus::Stopped | TradeStatus::ClosedOther => t.price_close.is_some(),
             TradeStatus::Expired => t.price_close.is_some_and(|p| p != Decimal::ZERO),
-            TradeStatus::Open => false,
+            TradeStatus::Open | TradeStatus::Split => false,
         };
         if let (true, Some(close)) = (counts, t.price_close) {
             let contracts = Decimal::from(t.qty).checked_mul(Decimal::from(t.multiplier))?;
@@ -308,7 +312,7 @@ mod tests {
         for status in TradeStatus::ALL {
             assert_eq!(TradeStatus::parse(status.as_str()), Some(status));
         }
-        assert_eq!(TradeStatus::ALL.map(TradeStatus::as_str), ["Open", "Stopped", "Closed", "Expired", "ClosedOther"]);
+        assert_eq!(TradeStatus::ALL.map(TradeStatus::as_str), ["Open", "Stopped", "Closed", "Expired", "ClosedOther", "Split"]);
         assert_eq!(TradeStatus::parse("open"), None, "the stored names are exact");
         // A stored trade with a status that is no known one is not open (and not finished either).
         let mut trade: crate::records::StoredTrade = serde_json::from_str(

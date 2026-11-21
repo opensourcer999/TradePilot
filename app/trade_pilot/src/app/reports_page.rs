@@ -15,7 +15,8 @@ impl App {
         self.trade_log
             .iter()
             .filter(|t| {
-                t.day >= start
+                !t.is_split()
+                    && t.day >= start
                     && t.day <= end
                     && self.reports.account.as_deref().is_none_or(|a| t.account == a)
                     && self.reports.strategy.as_deref().is_none_or(|s| t.strategy == s)

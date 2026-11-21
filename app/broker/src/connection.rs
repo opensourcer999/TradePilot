@@ -20,10 +20,11 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Runs a TWS session on its own thread: events go to `sender`, `commands` are sent to TWS, `stop` ends it. The end of the session is reported as `TwsEvent::Disconnected` or `TwsEvent::Failed`.
-pub fn connect_to_tws(sender: mpsc::Sender<TwsEvent>, commands: mpsc::Receiver<TwsCommand>, stop: Arc<AtomicBool>, host: String, port: u16) {
+/// Runs a TWS session under `client_id` on its own thread: events go to `sender`, `commands` are sent to TWS, `stop` ends it. The end of the
+/// session is reported as `TwsEvent::Disconnected` or `TwsEvent::Failed`.
+pub fn connect_to_tws(sender: mpsc::Sender<TwsEvent>, commands: mpsc::Receiver<TwsCommand>, stop: Arc<AtomicBool>, host: String, port: u16, client_id: i32) {
     thread::spawn(move || {
-        let outcome = tws_session_at(&host, port, IB_CLIENT_ID, &sender, &commands, &stop);
+        let outcome = tws_session_at(&host, port, client_id, &sender, &commands, &stop);
         if let Err(message) = outcome {
             let _ = sender.send(if stop.load(Ordering::Relaxed) { TwsEvent::Disconnected("Disconnected by user".into()) } else { TwsEvent::Failed(message) });
         }
@@ -42,6 +43,20 @@ pub fn parse_tws_endpoint(host: &str, port: &str) -> Result<(String, u16), Strin
     }
     let port = port.trim().parse::<u16>().ok().filter(|port| *port != 0).ok_or_else(|| "Enter a valid port from 1 to 65535".to_string())?;
     Ok((host.to_string(), port))
+}
+
+/// The client id of the settings, checked: empty means `IB_CLIENT_ID`, anything else must be a whole number from 0 up. TWS lets one
+/// session per client id connect and reports the open orders of that client id only.
+///
+/// # Errors
+///
+/// The reason as text when the text is no whole number from 0 up.
+pub fn parse_client_id(text: &str) -> Result<i32, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(IB_CLIENT_ID);
+    }
+    text.parse::<i32>().ok().filter(|id| *id >= 0).ok_or_else(|| "Enter a client id: a whole number from 0 up".to_string())
 }
 
 /// Connects to TWS and does the API handshake; the stream and TWS's server version.
