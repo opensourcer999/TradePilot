@@ -1,0 +1,14 @@
+[package]
+name = "winui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license.workspace = true
+
+[dependencies]
+
+# Deliberately does NOT inherit [workspace.lints]: the workspace sets `unsafe_code = "forbid"`,
+# and `forbid` cannot be locally overridden (that is what distinguishes it from `deny`) - so this
+# one crate, the documented exception from coding_guideline.md section 6, instead opts out of
+# that inheritance entirely and sets its own `#![allow(unsafe_code)]` in src/lib.rs. Every other
+# crate in this workspace keeps `[lints] workspace = true` and the forbid applies there.

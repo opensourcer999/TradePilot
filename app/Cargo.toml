@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["core", "risk", "broker", "strategy", "winui", "trade_pilot"]
+
+# `strategy` holds the pure trading logic (rebuilding trades, fees, pricing, reports, templates, calendar)
+# without any I/O or UI; `backtest` is deliberately omitted because the app has no backtesting feature.
+
+[workspace.package]
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+# coding_guideline.md section 15: pedantic is on, with no lint switched off for the workspace.
+pedantic = { level = "warn", priority = -1 }
+
+# coding_guideline.md section 15: an integer overflow stops the program in release builds too,
+# instead of wrapping silently (money itself is `Decimal` with `checked_*` arithmetic).
+[profile.release]
+overflow-checks = true

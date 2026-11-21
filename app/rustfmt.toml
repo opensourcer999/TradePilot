@@ -1,0 +1,5 @@
+# coding_guideline.md section 1: formatting is rustfmt's, without discussion. The width matches
+# the style the code was written in (wide lines, short constructs kept on one line); with these
+# two settings `cargo fmt --all --check` is the CI check of section 16.
+max_width = 160
+use_small_heuristics = "Max"

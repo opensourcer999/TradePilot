@@ -1,0 +1,119 @@
+# Builds the release packages for Windows, macOS and Linux. Pushing a tag "v<version>" (the version of
+# app/trade_pilot/Cargo.toml, e.g. v0.262.0) also publishes them as the GitHub release of that tag; a manual run
+# (workflow_dispatch) only builds them, downloadable from the run.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows package
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: app
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show active-toolchain
+      - name: Inno Setup
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      # package.ps1 builds the release exe (C runtime linked in) and creates the portable ZIP and the setup program.
+      - name: Package
+        run: ./package.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TradePilot-windows
+          if-no-files-found: error
+          path: |
+            app/dist/TradePilot-*-portable.zip
+            app/dist/TradePilot-*-Setup.exe
+
+  macos:
+    name: macOS package
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show active-toolchain
+      - name: Package
+        run: bash ./package.sh universal
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TradePilot-macos
+          if-no-files-found: error
+          path: |
+            app/dist/*.dmg
+            app/dist/*.zip
+
+  linux:
+    name: Linux package
+    # The oldest supported runner: the binary then also runs on distributions with an older glibc.
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev libgl1-mesa-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+      - name: Toolchain
+        run: rustup show active-toolchain
+      - name: Package
+        run: bash ./package-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TradePilot-linux
+          if-no-files-found: error
+          path: app/dist/*.tar.gz
+
+  publish:
+    name: GitHub release
+    needs: [windows, macos, linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that the tag matches the version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' app/trade_pilot/Cargo.toml | head -1)"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the version in Cargo.toml (v$version)."
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l packages
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" packages/* --clobber
+          else
+            gh release create "$TAG" packages/* --target "$GITHUB_SHA" --title "TradePilot $TAG" \
+              --notes "Windows: Setup.exe or portable ZIP. macOS: DMG or ZIP (Universal). Linux: tar.gz (x86_64)."
+          fi

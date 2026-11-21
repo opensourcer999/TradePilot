@@ -1,0 +1,40 @@
+[package]
+name = "trade_pilot"
+# The single source of truth for the app's displayed "V{major}.{minor}.{patch}" version (see
+# `APP_VERSION` in src/app.rs, which derives from this at compile time) and for the Windows
+# FileVersion/ProductVersion resource embedded by build.rs. Per the project's version-bump rule,
+# bump the last number by 1 with every real code change (0.5.0 -> 0.5.1 -> ...); after 9 it rolls over into the
+# middle number (0.5.9 -> 0.6.0, 0.9.9 -> 1.0.0). The built .exe is named
+# TradePilot-V{major}.{minor}.{patch}.exe by build.ps1.
+version = "0.5.3"
+edition = "2021"
+publish = false
+license.workspace = true
+
+[build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+core_types = { path = "../core", package = "core" }
+risk = { path = "../risk" }
+strategy = { path = "../strategy" }
+broker = { path = "../broker" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+chrono-tz = { version = "0.10", default-features = false }
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+rust_decimal = { version = "1", default-features = false, features = ["std", "serde"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+egui_extras = { version = "0.29", default-features = false, features = ["datepicker"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+ureq = { version = "2", default-features = false, features = ["tls"] }
+raw-window-handle = "0.6"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+
+[target.'cfg(windows)'.dependencies]
+winui = { path = "../winui" }
+
+[lints]
+workspace = true

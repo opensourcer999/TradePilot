@@ -1,0 +1,438 @@
+//! Decoders: what a message from TWS says, as events and values.
+
+use crate::{
+    ContractData, ExecutionRow, Position, TwsEvent, IB_ACCOUNT_SUMMARY_REQUEST_ID, IN_MARKET_DATA_TYPE, IN_TICK_GENERIC, IN_TICK_REQ_PARAMS, IN_TICK_STRING,
+};
+
+/// IB's documented convention for paper-trading account identifiers (e.g. "DU1234567"), used only
+/// as a safety heuristic before any order is sent. This is IB's own account-numbering convention,
+/// not something TWS itself checks.
+/// It is combined with a mandatory manual confirmation in the UI; neither check
+/// alone is trusted.
+#[must_use]
+pub fn looks_like_paper_account(account_id: &str) -> bool {
+    account_id.trim().to_ascii_uppercase().starts_with("DU")
+}
+
+/// `IBApi.EDecoder.HistoricalDataUpdateEvent`: reqId, bar count, then date, open, close, high, low, wap, volume of the
+/// bar still forming. Yields its close as a bar of the request.
+#[must_use]
+pub fn parse_historical_update(fields: &[String]) -> Option<TwsEvent> {
+    let req_id: i32 = fields.get(1)?.parse().ok()?;
+    let date = fields.get(3)?.clone();
+    let close: f64 = fields.get(5)?.parse().ok()?;
+    let high: f64 = fields.get(6).and_then(|text| text.parse().ok()).unwrap_or(close);
+    let low: f64 = fields.get(7).and_then(|text| text.parse().ok()).unwrap_or(close);
+    Some(TwsEvent::HistoricalBar { req_id, date, high, low, close })
+}
+
+/// `IBApi.EDecoder.HistoricalDataEvent` (server version 196+, no leading version, no start/end
+/// strings): reqId, bar count, then per bar time, open, high, low, close, volume, wap, count.
+/// Yields the date and close of every bar; the last one is the latest.
+#[must_use]
+pub fn parse_historical_bars(fields: &[String]) -> Option<Vec<TwsEvent>> {
+    let req_id: i32 = fields.get(1)?.parse().ok()?;
+    let count: usize = fields.get(2)?.parse().ok()?;
+    let mut events = Vec::new();
+    for i in 0..count {
+        let base = 3usize.checked_add(i.checked_mul(8)?)?;
+        let date = fields.get(base)?.clone();
+        let close: f64 = fields.get(base.checked_add(4)?)?.parse().ok()?;
+        let high: f64 = fields.get(base.checked_add(2)?).and_then(|text| text.parse().ok()).unwrap_or(close);
+        let low: f64 = fields.get(base.checked_add(3)?).and_then(|text| text.parse().ok()).unwrap_or(close);
+        events.push(TwsEvent::HistoricalBar { req_id, date, high, low, close });
+    }
+    Some(events)
+}
+
+/// The order id of an `openOrder` message (`IBApi.EDecoder.OpenOrderEvent`): below server version
+/// 145 (`ORDER_CONTAINER`) a version field comes first, from 145 on the order id directly. The
+/// rest of the message (contract, order and state, several hundred version-dependent fields) is
+/// not needed: the app only asks which of its orders are still working.
+#[must_use]
+pub fn parse_open_order_id(fields: &[String], server_version: i32) -> Option<i32> {
+    let index = if server_version < 145 { 2 } else { 1 };
+    fields.get(index)?.parse().ok()
+}
+
+/// `IBApi.EDecoder.TickPriceEvent`'s real field order: version, tickerId, tickType, price,
+/// [v>=2: size], [v>=3: attribute bitmask]. This app only uses the price; the bundled size
+/// (relevant to bid/ask/last) is not yet surfaced - a documented scope limit, not a guess.
+#[must_use]
+pub fn parse_tick_price(fields: &[String]) -> Option<TwsEvent> {
+    let ticker_id: i32 = fields.get(2)?.parse().ok()?;
+    let tick_type: i32 = fields.get(3)?.parse().ok()?;
+    let price: f64 = fields.get(4)?.parse().ok()?;
+    Some(TwsEvent::TickPrice { ticker_id, tick_type, price })
+}
+
+/// The commission of a `commissionReport` message (`59|version|execId|commission|currency|...`): `None` when the
+/// execution id is missing or TWS sends no amount (its "unset" value is the largest double).
+#[must_use]
+pub fn parse_commission_report(fields: &[String]) -> Option<TwsEvent> {
+    let exec_id = fields.get(2).map(|id| id.trim()).filter(|id| !id.is_empty())?;
+    let commission: f64 = fields.get(3)?.trim().parse().ok().filter(|c: &f64| c.is_finite() && c.abs() < 1.0e300)?;
+    let currency = fields.get(4).map_or_else(String::new, |c| c.trim().to_string());
+    Some(TwsEvent::Commission { exec_id: exec_id.to_string(), commission, currency })
+}
+
+/// The accounts of a `managedAccounts` message (empty for none).
+#[must_use]
+pub fn parse_managed_accounts(fields: &[String]) -> Vec<String> {
+    fields.get(2).map(|list| list.split(',').map(str::trim).filter(|a| !a.is_empty()).map(str::to_string).collect()).unwrap_or_default()
+}
+
+/// The ticker id of a price-less reqMktData reply (tickReqParams / marketDataType / tickString /
+/// tickGeneric), i.e. proof that TWS accepted that subscription. `None` for any other message.
+#[must_use]
+pub fn parse_market_data_ack(fields: &[String]) -> Option<i32> {
+    let message_type: i32 = fields.first()?.parse().ok()?;
+    let ticker_index = match message_type {
+        IN_TICK_REQ_PARAMS => 1,
+        IN_TICK_GENERIC | IN_TICK_STRING | IN_MARKET_DATA_TYPE => 2,
+        _ => return None,
+    };
+    fields.get(ticker_index)?.parse().ok()
+}
+
+/// `IBApi.EDecoder.TickSizeEvent`'s real field order: version, tickerId, field, size.
+#[must_use]
+pub fn parse_tick_size(fields: &[String]) -> Option<TwsEvent> {
+    let ticker_id: i32 = fields.get(2)?.parse().ok()?;
+    let field: i32 = fields.get(3)?.parse().ok()?;
+    let size: f64 = fields.get(4)?.parse().ok()?;
+    Some(TwsEvent::TickSize { ticker_id, field, size })
+}
+
+/// `IBApi.EDecoder.OrderStatusEvent`'s real field order (server version >= 131 has no leading
+/// version field at all; this app only negotiates versions in that range).
+#[must_use]
+pub fn parse_order_status(fields: &[String], server_version: i32) -> Option<TwsEvent> {
+    let has_version_field = server_version < 131;
+    let mut idx = 1usize;
+    if has_version_field {
+        idx += 1;
+    }
+    let order_id: i32 = fields.get(idx)?.parse().ok()?;
+    idx += 1;
+    let status = fields.get(idx)?.clone();
+    idx += 1;
+    let filled: f64 = fields.get(idx)?.parse().ok()?;
+    idx += 1;
+    let remaining: f64 = fields.get(idx)?.parse().ok()?;
+    idx += 1;
+    // `avgFillPrice` (ReadDouble): 0 until something filled; missing only in a truncated message.
+    let avg_fill_price: f64 = fields.get(idx).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    Some(TwsEvent::OrderStatus { order_id, status, filled, remaining, avg_fill_price })
+}
+
+/// `IBApi.EDecoder.ContractDataEvent`'s real field order, up to `Contract.ConId`; later fields are
+/// not needed by this app.
+#[must_use]
+pub fn parse_contract_data(fields: &[String], server_version: i32) -> Option<ContractData> {
+    fn take<'a>(fields: &'a [String], i: &mut usize) -> Option<&'a str> {
+        let value = fields.get(*i).map(String::as_str);
+        *i += 1;
+        value
+    }
+    let mut i = 1usize; // fields[0] is the message id ("10")
+    let num = if server_version < 164 { take(fields, &mut i)?.parse::<i32>().ok()? } else { 8 };
+    if num < 3 {
+        return None; // reqId isn't present in this message shape; not expected from this app
+    }
+    let req_id: i32 = take(fields, &mut i)?.parse().ok()?;
+    let symbol = take(fields, &mut i)?.to_string();
+    let sec_type = take(fields, &mut i)?.to_string();
+    let last_trade = take(fields, &mut i)?; // lastTradeDateOrContractMonth ("yyyyMMdd[ hh:mm...]")
+    let expiry = last_trade.get(..8).unwrap_or(last_trade).to_string();
+    if server_version >= 182 {
+        take(fields, &mut i)?; // lastTradeDate (separate field only from server_version 182)
+    }
+    let strike: f64 = take(fields, &mut i)?.parse().unwrap_or(0.0);
+    let right = take(fields, &mut i)?.to_string();
+    let exchange = take(fields, &mut i)?.to_string();
+    let currency = take(fields, &mut i)?.to_string();
+    let local_symbol = take(fields, &mut i)?.to_string();
+    take(fields, &mut i)?; // marketName
+    let trading_class = take(fields, &mut i)?.to_string();
+    let con_id: i32 = take(fields, &mut i)?.parse().ok()?;
+    Some(ContractData { req_id, con_id, symbol, sec_type, expiry, strike, right, exchange, currency, local_symbol, trading_class })
+}
+
+/// `IBApi.EDecoder.TickOptionComputationEvent`: ticker id, tick type and the option's delta.
+/// The leading version field is gone from server version 156 on, where a `tickAttrib` follows
+/// the tick type instead. TWS sends -2 for "delta not computed", reported here as `None`.
+#[must_use]
+pub fn parse_option_delta(fields: &[String], server_version: i32) -> Option<(i32, i32, Option<f64>)> {
+    let (ticker_index, delta_index) = if server_version >= 156 { (1, 5) } else { (2, 5) };
+    let ticker_id: i32 = fields.get(ticker_index)?.parse().ok()?;
+    let tick_type: i32 = fields.get(ticker_index + 1)?.parse().ok()?;
+    let delta = fields.get(delta_index)?.parse::<f64>().ok().filter(|d| d.total_cmp(&-2.0).is_ne() && d.is_finite());
+    Some((ticker_id, tick_type, delta))
+}
+
+/// `IBApi.EDecoder.SecurityDefinitionOptionParameterEvent`'s real field order: reqId, exchange,
+/// underlyingConId, tradingClass,
+/// multiplier, expirationCount, expirations[expirationCount], strikeCount, strikes[strikeCount].
+/// No leading "version" field, consistent with the outgoing request it answers.
+#[must_use]
+pub fn parse_security_definition_option_parameter(fields: &[String]) -> Option<TwsEvent> {
+    let mut i = 1usize; // fields[0] is the message id ("75")
+    let req_id: i32 = fields.get(i)?.parse().ok()?;
+    i += 1;
+    let exchange = fields.get(i)?.clone();
+    i += 1;
+    let underlying_con_id: i32 = fields.get(i)?.parse().ok()?;
+    i += 1;
+    let trading_class = fields.get(i)?.clone();
+    i += 1;
+    let multiplier = fields.get(i)?.clone();
+    i += 1;
+    let expiration_count: usize = fields.get(i)?.parse().ok()?;
+    i += 1;
+    let mut expirations = Vec::with_capacity(expiration_count);
+    for _ in 0..expiration_count {
+        expirations.push(fields.get(i)?.clone());
+        i += 1;
+    }
+    let strike_count: usize = fields.get(i)?.parse().ok()?;
+    i += 1;
+    let mut strikes = Vec::with_capacity(strike_count);
+    for _ in 0..strike_count {
+        strikes.push(fields.get(i)?.parse().ok()?);
+        i += 1;
+    }
+    Some(TwsEvent::OptionParams { req_id, exchange, underlying_con_id, trading_class, multiplier, expirations, strikes })
+}
+
+/// Account, tag, value and currency of an `accountSummary` message for `TradePilot`'s own request (`None` for another request); an error for a message that stops short.
+///
+/// # Errors
+///
+/// The reason as text when the message stops short or a field is invalid.
+pub fn parse_account_summary(fields: &[String]) -> Result<Option<(String, String, String, String)>, String> {
+    if fields.get(2).and_then(|id| id.parse::<i32>().ok()) != Some(IB_ACCOUNT_SUMMARY_REQUEST_ID) {
+        return Ok(None);
+    }
+    match fields.get(3..7) {
+        Some([account, tag, value, currency]) => Ok(Some((account.clone(), tag.clone(), value.clone(), currency.clone()))),
+        _ => Err("Malformed TWS account summary message".into()),
+    }
+}
+
+/// A `position` message; an error for a missing field or a quantity or cost that is no finite number.
+///
+/// # Errors
+///
+/// The reason as text for a missing field or a quantity or cost that is no finite number.
+pub fn parse_position(fields: &[String]) -> Result<Option<Position>, String> {
+    let version = fields.get(1).and_then(|v| v.parse::<u32>().ok()).filter(|v| *v >= 1).ok_or_else(|| "Invalid version in TWS position message".to_string())?;
+    let quantity_index = if version >= 2 { 14 } else { 13 };
+    let number = |index: usize, name: &str| -> Result<f64, String> {
+        fields
+            .get(index)
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| format!("Invalid {name} in TWS position message"))
+    };
+    let quantity = number(quantity_index, "quantity")?;
+    let average_cost = if version >= 3 { Some(number(quantity_index + 1, "average cost")?) } else { None };
+    let Some([account, contract_id, symbol, security_type]) = fields.get(2..6) else {
+        return Err("Malformed TWS position message".to_string());
+    };
+    Ok(Some(Position {
+        account: account.clone(),
+        contract_id: contract_id.clone(),
+        symbol: symbol.clone(),
+        security_type: security_type.clone(),
+        quantity,
+        average_cost,
+    }))
+}
+
+/// `IBApi.EDecoder.ErrorEvent`'s real field order: [v<194: version], id, errorCode, errorMsg,
+/// [v>=166: advancedOrderRejectJson], [v>=194: errorTime]. The leading version field disappears
+/// entirely at server version 194+ (this app negotiates 200), so it must not be assumed present.
+/// `id` is TWS's own `reqId` echo (e.g. the `reqMktData` ticker id this error is about, or -1 for
+/// a connection-wide notice), kept so callers can tell which in-flight request an error belongs
+/// to instead of only logging the code/text.
+///
+/// # Errors
+///
+/// The reason as text when the message stops short or a field is invalid.
+pub fn tws_error_message(fields: &[String], server_version: i32) -> Result<(i32, i32, String), String> {
+    let id_index = if server_version < 194 { 2 } else { 1 };
+    let code_index = id_index + 1;
+    let text_index = code_index + 1;
+    let id = fields.get(id_index).and_then(|s| s.parse().ok()).ok_or_else(|| "Malformed TWS error message: missing request id".to_string())?;
+    let code = fields.get(code_index).and_then(|s| s.parse().ok()).ok_or_else(|| "Malformed TWS error message: missing error code".to_string())?;
+    let text = fields.get(text_index).filter(|s| !s.is_empty()).ok_or_else(|| format!("Malformed TWS error message {code}: missing description"))?;
+    Ok((id, code, english_tws_message(code, &decode_unicode_escapes(text))))
+}
+
+/// The English text of a TWS message: TWS sends its texts in the language of the TWS installation
+/// (e.g. "Verbindung zum Marktdatenzentrum ist OK:usfarm"), but the log is English. For the codes
+/// below the text is IB's English one; what TWS puts after the last ':' (a farm name, a ticker id,
+/// an order's reason) is kept as sent. Any other code keeps TWS's own text: its English wording is
+/// not known here, and a guessed one would be worse than the original.
+#[must_use]
+pub fn english_tws_message(code: i32, text: &str) -> String {
+    let with_tail = |english: &str| match text.rsplit_once(':') {
+        Some((_, tail)) => format!("{english}:{}", tail.trim()),
+        None => english.to_string(),
+    };
+    match code {
+        2103 => with_tail("Market data farm connection is broken"),
+        2104 => with_tail("Market data farm connection is OK"),
+        2105 => with_tail("HMDS data farm connection is broken"),
+        2106 => with_tail("HMDS data farm connection is OK"),
+        2107 => with_tail("HMDS data farm connection is inactive but should be available upon demand"),
+        2108 => with_tail("Market data farm connection is inactive but should be available upon demand"),
+        2119 => with_tail("Market data farm is connecting"),
+        2157 => with_tail("Sec-def data farm connection is broken"),
+        2158 => with_tail("Sec-def data farm connection is OK"),
+        300 => with_tail("Can't find EId with tickerId"),
+        201 => with_tail("Order rejected - reason"),
+        202 => with_tail("Order cancelled - reason"),
+        1100 => "Connectivity between IB and Trader Workstation has been lost.".to_string(),
+        1101 => "Connectivity between IB and Trader Workstation has been restored - data lost.".to_string(),
+        1102 => "Connectivity between IB and Trader Workstation has been restored - data maintained.".to_string(),
+        1300 => "TWS socket port has been reset and this connection is being dropped. Please reconnect on the new port.".to_string(),
+        2100 => "API client has been unsubscribed from account data.".to_string(),
+        2110 => "Connectivity between Trader Workstation and server is broken. It will be restored automatically.".to_string(),
+        2151 => "Position information is not available yet.".to_string(),
+        200 => "No security definition has been found for the request.".to_string(),
+        326 => "Unable to connect as the client id is already in use. Retry with a unique client id.".to_string(),
+        354 => "Requested market data is not subscribed.".to_string(),
+        502 => "Couldn't connect to TWS. Confirm that the API is enabled in TWS (Configure > API).".to_string(),
+        504 => "Not connected.".to_string(),
+        10090 => "Part of requested market data is not subscribed.".to_string(),
+        10167 => "Requested market data is not subscribed. Displaying delayed market data.".to_string(),
+        10197 => "No market data during competing live session.".to_string(),
+        _ => text.to_string(),
+    }
+}
+
+/// TWS's live-price farm notices: 2103 "Market data farm connection is broken:usfarm" and 2104
+/// "... is OK:usfarm" (the farm name follows the last ':'; the text itself is localized).
+/// Historical (2105/2106) and other notices are not about live prices -> `None`.
+#[must_use]
+pub fn market_data_farm_status(code: i32, message: &str) -> Option<(String, bool)> {
+    let ok = match code {
+        2103 => false,
+        2104 => true,
+        _ => return None,
+    };
+    let farm = message.rsplit(':').next()?.trim();
+    (!farm.is_empty()).then(|| (farm.to_string(), ok))
+}
+
+/// TWS writes non-ASCII characters of its (localized) messages as Java `\uXXXX` escapes, e.g.
+/// "während" for "während"; this turns them back into the characters.
+pub fn decode_unicode_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("\\u") {
+        out.push_str(rest.get(..pos).unwrap_or_default());
+        let after = rest.get(pos + 2..).unwrap_or_default();
+        let decoded = after.get(..4).and_then(|hex| u32::from_str_radix(hex, 16).ok()).and_then(char::from_u32);
+        if let Some(c) = decoded {
+            out.push(c);
+            rest = after.get(4..).unwrap_or_default();
+        } else {
+            out.push_str("\\u");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `IBApi.EDecoder.ExecutionDataEvent`'s real field order. At server version >= 136 the leading
+/// "version" field disappears from the wire entirely and every `num >= X` gate below effectively
+/// becomes `server_version >= X` - below 136 it's still an explicit int read off the wire, exactly
+/// like `tws_error_message`'s version field vanishing at >=194. Every field is walked in order
+/// (even ones this app doesn't keep) since later fields' positions depend on it.
+///
+/// # Errors
+///
+/// The reason as text when the message stops short or a field is invalid.
+pub fn parse_execution_data(fields: &[String], server_version: i32) -> Result<ExecutionRow, String> {
+    fn take<'a>(fields: &'a [String], i: &mut usize) -> Result<&'a str, String> {
+        let v = fields.get(*i).map(String::as_str).ok_or_else(|| "Malformed TWS execution message: missing field".to_string())?;
+        *i += 1;
+        Ok(v)
+    }
+    fn take_f64(fields: &[String], i: &mut usize) -> Result<f64, String> {
+        take(fields, i)?.parse().map_err(|_| "Malformed TWS execution message: expected a number".to_string())
+    }
+    fn take_i32(fields: &[String], i: &mut usize) -> Result<i32, String> {
+        take(fields, i)?.parse().map_err(|_| "Malformed TWS execution message: expected an integer".to_string())
+    }
+
+    let mut i = 1usize; // fields[0] is the message id ("11")
+    let num = if server_version < 136 { take_i32(fields, &mut i)? } else { server_version };
+    if num >= 7 {
+        take(fields, &mut i)?; // reqId - this app has only one standing reqExecutions subscription
+    }
+    let order_id: i32 = take(fields, &mut i)?.parse().unwrap_or(0);
+    let mut con_id = 0;
+    if num >= 5 {
+        con_id = take(fields, &mut i)?.parse().unwrap_or(0);
+    }
+    let symbol = take(fields, &mut i)?.to_string();
+    let sec_type = take(fields, &mut i)?.to_string();
+    let expiry = take(fields, &mut i)?.to_string();
+    let strike = take_f64(fields, &mut i)?;
+    let right = take(fields, &mut i)?.to_string();
+    if num >= 9 {
+        take(fields, &mut i)?; // multiplier
+    }
+    take(fields, &mut i)?; // contract exchange
+    take(fields, &mut i)?; // currency
+    take(fields, &mut i)?; // local symbol
+    if num >= 10 {
+        take(fields, &mut i)?; // trading class
+    }
+    let exec_id = take(fields, &mut i)?.to_string();
+    let time = take(fields, &mut i)?.to_string();
+    let account = take(fields, &mut i)?.to_string();
+    take(fields, &mut i)?; // execution's own exchange
+    let side = take(fields, &mut i)?.to_string();
+    let quantity = take_f64(fields, &mut i)?;
+    let price = take_f64(fields, &mut i)?;
+    if num >= 2 {
+        take(fields, &mut i)?; // permId
+    }
+    if num >= 3 {
+        take(fields, &mut i)?; // clientId
+    }
+    if num >= 4 {
+        take(fields, &mut i)?; // liquidation
+    }
+    if num >= 6 {
+        take(fields, &mut i)?; // cumQty
+        take(fields, &mut i)?; // avgPrice
+    }
+    let mut order_ref = String::new();
+    if num >= 8 {
+        order_ref = take(fields, &mut i)?.to_string();
+    }
+    if num >= 9 {
+        take(fields, &mut i)?; // evRule
+        take(fields, &mut i)?; // evMultiplier
+    }
+    if server_version >= 103 {
+        take(fields, &mut i)?; // modelCode
+    }
+    if server_version >= 136 {
+        take(fields, &mut i)?; // lastLiquidity
+    }
+    if server_version >= 178 {
+        take(fields, &mut i)?; // pendingPriceRevision
+    }
+    if server_version >= 198 {
+        take(fields, &mut i)?; // submitter
+    }
+    Ok(ExecutionRow { account, symbol, con_id, time, exec_id, order_id, order_ref, expiry, sec_type, right, strike, side, quantity, price })
+}

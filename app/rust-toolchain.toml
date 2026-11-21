@@ -1,0 +1,5 @@
+# coding_guideline.md section 1: the toolchain version is fixed here and changed on purpose, in a
+# commit of its own.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
