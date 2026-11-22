@@ -7,7 +7,7 @@
 //!
 //! Only the values the app has live are offered: the quotes of SPX, VIX and `VIX9D`, the time of the
 //! session and, for the early exit of a trade, the values of that open trade (`Trade_*`). Averages, RSI, VIX rank and percentile
-//! are worked out of bars (`bars`); the values of the reference are all there (`ES` is never known: the future is not subscribed).
+//! are worked out of bars (`bars`); every input of the list is worked out (`ES` stays unknown: the future is not subscribed).
 
 use crate::bars::{self, Bar};
 use chrono::{NaiveDateTime, NaiveTime, Timelike};
@@ -889,7 +889,7 @@ mod tests {
             (market.value(Input::UnderlyingPrice), market.value(Input::Spy), market.value(Input::Qqq), market.value(Input::Es)),
             (Some(d("6705")), Some(d("670.5")), None, None)
         );
-        // No open trade: 0; trades that add up to 0: not known (the reference's quirk).
+        // No open trade: 0; trades that add up to 0: not known (a sum of 0 cannot be told from a missing delta).
         assert_eq!(snapshot().value(Input::DeltaTotal), Some(Decimal::ZERO));
         let flat = Snapshot { open_deltas: vec![open("DU1", "SPX", "10"), open("DU1", "SPX", "-10")], ..snapshot() };
         assert_eq!(flat.value(Input::DeltaTotal), None);

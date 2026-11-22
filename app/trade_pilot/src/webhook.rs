@@ -1,5 +1,5 @@
 //! The receiver of webhook signals: a small HTTP server on the loopback address of this computer only (127.0.0.1) that
-//! takes `POST /signal` with the JSON body of the reference (`Token`, `Instance`, `TriggerID`, `CloseTriggerID`, `Timestamp`),
+//! takes `POST /signal` with a JSON body of the fields `Token`, `Instance`, `TriggerID`, `CloseTriggerID` and `Timestamp`,
 //! checks it and hands the signal to the app. Nothing outside this computer can reach it unless the person forwards a port
 //! or a tunnel to it; the token (and the instance name) in the body is what a request must know, and a request whose
 //! timestamp is more than ten minutes off is refused, so a recorded one cannot be sent again later.

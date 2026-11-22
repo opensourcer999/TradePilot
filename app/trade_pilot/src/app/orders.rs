@@ -113,7 +113,7 @@ impl App {
                 id if trade.close_order_id == Some(id) => "close order",
                 _ => "exit order",
             };
-            return format!("{kind} of {} {} {}", trade.symbol, trade.trade_type, trade.strikes);
+            return format!("{kind} of {}", trade.label());
         }
         if self.instant.last_order_id == Some(order_id) {
             return "Instant Order".to_string();
@@ -134,6 +134,10 @@ impl App {
             self.block_template_order("not connected to TWS");
             return;
         };
+        if let Err(reason) = self.check_entry_risk(&pending.entry.symbol, pending.entry.qty) {
+            self.block_template_order(&format!("risk limit - {reason}"));
+            return;
+        }
         let PendingTemplateOrder { source, entry, contract, mut order, run_id, .. } = pending;
         // The id is used up even if the order cannot be sent: an id is never given twice.
         self.next_order_id = Some(order_id + 1);
@@ -147,6 +151,7 @@ impl App {
             attempt: 1,
             next_tick: None,
             finished: false,
+            partly_filled: false,
         });
         for line in &entry.log {
             self.log(&format!("Template trade: {line}"));
@@ -155,6 +160,7 @@ impl App {
             self.block_template_order(&reason.to_string());
             return;
         }
+        self.count_entry_sent();
         self.log(&format!(
             "Open {} OrderID:{order_id} Price: {} Qty: {} Account: {}",
             entry.trades.first().map_or("", |t| t.trade_type.as_str()),
@@ -206,10 +212,13 @@ impl App {
         let order_id = sent.order_id;
         let legs = sent.entry.legs.len().max(1);
         let symbol = sent.entry.symbol.clone();
+        let scheduled = sent.run_id.is_some();
         let Some(fill) = sent.fill.as_mut() else {
             return;
         };
         let attempts = fill_attempts(&fill.template);
+        // A scheduled entry filled in part already moves the rest on beyond the template's price limits.
+        let step = if scheduled && fill.partly_filled { trade_entry::next_fill_limit_partly_filled } else { trade_entry::next_fill_limit };
         let mut messages = Vec::new();
         let mut status;
         if !allowed {
@@ -220,7 +229,7 @@ impl App {
             messages.push(format!("Fill attempts for order {order_id} stopped: paper-account safety gate not satisfied - order cancelled"));
             status = format!("#{order_id}: cancelled (safety gate)");
         } else if fill.attempt < attempts {
-            let next = trade_entry::next_fill_limit(&fill.template, &symbol, legs, &fill.order.action, fill.limit).unwrap_or(fill.limit);
+            let next = step(&fill.template, &symbol, legs, &fill.order.action, fill.limit).unwrap_or(fill.limit);
             if let Some(wire) = next.to_f64() {
                 fill.limit = next;
                 fill.order.lmt_price = wire;
@@ -259,8 +268,9 @@ impl App {
     }
 
     /// TWS's `orderStatus` for a template order: once fully filled, its trades are recorded
-    /// (today's trades on the Dashboard, `trades.json`). Partial fills wait for the rest.
-    pub(super) fn on_template_order_status(&mut self, order_id: i32, status: &str, remaining: f64, avg_fill_price: f64) {
+    /// (today's trades on the Dashboard, `trades.json`). Partial fills wait for the rest; an order that ends with only part of it
+    /// filled (cancelled after its fill attempts, or in TWS) is recorded for the `filled` contracts, so they get their stop and target.
+    pub(super) fn on_template_order_status(&mut self, order_id: i32, status: &str, filled: f64, remaining: f64, avg_fill_price: f64) {
         let Some(sent) = self.template.orders.iter_mut().find(|o| o.order_id == order_id) else {
             return;
         };
@@ -268,6 +278,7 @@ impl App {
         // An entry refused for margin that is sent again keeps its schedule run working.
         let retrying = sent.retry_due.is_some();
         if let Some(fill) = sent.fill.as_mut() {
+            fill.partly_filled |= filled > 0.0;
             if order_is_final(status) {
                 fill.finished = true;
             } else if fill.next_tick.is_none() && !fill.finished {
@@ -275,7 +286,10 @@ impl App {
                 fill.next_tick = Some(self.clock.instant() + fill_wait(&fill.template));
             }
         }
-        let complete = status == "Filled" && remaining == 0.0 && !sent.recorded;
+        // Ended with part of it filled: what was filled is a position all the same.
+        let partly = order_is_final(status) && status != "Filled" && filled > 0.0 && !sent.recorded;
+        let complete = (status == "Filled" && remaining == 0.0 && !sent.recorded) || partly;
+        let filled_qty = if partly { filled_contracts(filled, sent.entry.qty) } else { Some(sent.entry.qty) };
         let avg = dec(avg_fill_price);
         if complete && avg.is_some() {
             sent.recorded = true;
@@ -288,11 +302,27 @@ impl App {
         if !complete {
             return;
         }
-        let Some(avg) = avg else {
-            self.log(&format!("Template order {order_id} filled, but the fill price {avg_fill_price} is unusable - trade not recorded"));
+        let (Some(avg), Some(filled_qty)) = (avg, filled_qty) else {
+            self.log(&format!(
+                "WARNING: Template order {order_id} filled {filled}, but the fill price {avg_fill_price} or the quantity is unusable - trade NOT recorded, it has NO stop: check the position in TWS"
+            ));
             return;
         };
         self.schedule_order_filled(run_id);
+        let Some(entry_qty) = self.template.orders.iter().find(|o| o.order_id == order_id).map(|o| o.entry.qty) else {
+            return;
+        };
+        if partly {
+            self.log(&format!(
+                "WARNING: Template order {order_id} ended {status} with {filled_qty} of {entry_qty} filled - the trade is recorded for the filled contracts and gets its stop and target"
+            ));
+        }
+        self.record_entry(order_id, run_id, avg, filled_qty, entry_qty);
+    }
+
+    /// Records the trades of the template order `order_id` filled at `avg` for `filled_qty` of its `entry_qty` contracts (all of them, or
+    /// what was filled when it ended), places their exit orders and reports them.
+    fn record_entry(&mut self, order_id: i32, run_id: Option<u32>, avg: Decimal, filled_qty: u32, entry_qty: u32) {
         let Some(sent) = self.template.orders.iter().find(|o| o.order_id == order_id) else {
             return;
         };
@@ -310,7 +340,7 @@ impl App {
                 trade_type: planned.trade_type.clone(),
                 strikes: planned.strikes.clone(),
                 order_id,
-                qty: planned.qty,
+                qty: share_of_qty(planned.qty, filled_qty, entry_qty),
                 multiplier: 100,
                 price_open: price.normalize(),
                 delta: planned.delta,
@@ -341,18 +371,10 @@ impl App {
             });
         }
         let template = sent.template.clone();
-        let path = trades_path(self.link.trading_live);
         let mut opened = Vec::new();
         for trade in stored {
-            self.log(&format!(
-                "Trade opened: {} {} {} x{} @ {} (order {order_id})",
-                trade.symbol, trade.trade_type, trade.strikes, trade.qty, trade.price_open
-            ));
-            if !cfg!(test) {
-                if let Err(error) = path.as_ref().map_err(std::string::ToString::to_string).and_then(|p| append_trade(p, &trade).map_err(|e| e.to_string())) {
-                    self.log(&format!("Could not save the trade: {error}"));
-                }
-            }
+            self.log(&format!("Trade opened: {} x{} @ {} (order {order_id})", trade.label(), trade.qty, trade.price_open));
+            self.store_new_trade(&trade);
             self.trades_stored.push(trade);
             self.pending.trade_log_dirty = true;
             opened.push(self.trades_stored.len() - 1);
@@ -378,7 +400,7 @@ impl App {
             .partition(|index| self.trades_stored.get(*index).is_some_and(|t| matches!(t.trade_type.as_str(), "LongCall" | "LongPut" | "LongStrangle")));
         for index in reused {
             if let Some(trade) = self.trades_stored.get(index) {
-                self.log(&format!("Long Reuse Only - marked trade closed: {} {} {}", trade.symbol, trade.trade_type, trade.strikes));
+                self.log(&format!("Long Reuse Only - marked trade closed: {}", trade.label()));
             }
             self.finish_trade(index, TradeStatus::ClosedOther, Decimal::ZERO, "Long Reuse Only");
         }
@@ -407,7 +429,8 @@ impl App {
         let mail = match status {
             TradeStatus::Stopped => trade_mail::trade_stopped(trade, &today, &mask_account),
             TradeStatus::Closed => trade_mail::trade_closed(trade, &today, &mask_account),
-            _ => return,
+            // Marked closed by hand, expired, split or still open: nothing to report.
+            TradeStatus::Open | TradeStatus::Expired | TradeStatus::ClosedOther | TradeStatus::Split => return,
         };
         self.notify_trade_mail(&mail, self.settings.notify_flags.notify_trade_stopped_email, self.settings.mail_flags.notify_trade_stopped_webhook);
         if status == TradeStatus::Stopped {
@@ -421,7 +444,7 @@ impl App {
         let Some(trade) = self.trades_stored.get(index) else {
             return;
         };
-        let limit: Decimal = self.settings.high_slippage_pct.trim().replace(',', ".").parse().unwrap_or(Decimal::ZERO);
+        let limit: Decimal = crate::pricing::parse_decimal(&self.settings.high_slippage_pct).unwrap_or(Decimal::ZERO);
         let Some(slippage) = trade_mail::slippage_percent(trade) else {
             return;
         };
@@ -601,7 +624,7 @@ impl App {
             let Some(trade) = self.trades_stored.get(index).cloned() else { continue };
             let Some(adjustments) = trade.adjustments.clone() else { continue };
             let Some(item) = adjustments.items.get(usize::from(adjustments.level)).cloned() else { continue };
-            if !trade.is_open() || trade.close_order_id.is_some() || adjustments.replace_pending || self.split_started(trade.order_id) {
+            if !trade.is_open() || trade.close_order_id.is_some() || adjustments.replace_pending || self.split_started(&trade) {
                 continue;
             }
             let price_open = trade.price_open;
@@ -839,8 +862,9 @@ impl App {
     /// TWS refused the stop-limit order of a trade whose stop is a plain `Limit stop` (error 201, usually because the limit lies too far
     /// from the market): the stop is placed again with a limit offset 0.05 smaller, until TWS takes it or the offset is 0. A
     /// `Limit stop with OCO` keeps its market backstop and is not touched here.
-    pub(super) fn retry_rejected_stop_limit(&mut self, order_id: i32, code: i32) {
-        if code != 201 {
+    pub(super) fn retry_rejected_stop_limit(&mut self, order_id: i32, message: &str) {
+        // Only a limit too far through the stop price is a matter of the offset; any other refusal (margin, say) is not.
+        if !message.to_lowercase().contains("too far through the stop price") {
             return;
         }
         // A trade that is being closed (after a margin rejection of this stop, say) gets no new stop.
@@ -854,13 +878,7 @@ impl App {
         let Some(trade) = self.trades_stored.get(index).cloned() else { return };
         let label = trade.label();
         let template = self.template_of(&trade).cloned();
-        let step = 0.05_f64;
         let current = trade.adjustments.as_ref().and_then(|a| a.limit_offset).or_else(|| template.as_ref().and_then(|t| t.stop_limit_offset)).unwrap_or(0.10);
-        if current <= 0.0 {
-            self.log(&format!("WARNING: TWS refused the stop-limit order {order_id} of {label} even with a limit offset of 0 - the trade has no stop"));
-            return;
-        }
-        let lowered = (current - step).max(0.0);
         let mut adjustments = trade.adjustments.clone().unwrap_or_else(|| StopAdjustments {
             order_type: "Limit stop".to_string(),
             stop: trade.stop_price.map(|price| price.normalize().to_string()),
@@ -870,8 +888,21 @@ impl App {
             outside_rth: template.as_ref().is_some_and(|t| t.order_flags.extended_hour_stop),
             ..StopAdjustments::default()
         });
-        adjustments.limit_offset = Some(lowered);
-        self.log(&format!("TWS refused the stop-limit order {order_id} of {label}: placing it again with a limit offset of {lowered:.2} (was {current:.2})"));
+        let stop = trade.stop_now().unwrap_or(Decimal::ZERO);
+        match after_refused_stop_limit(stop, current, &trade.symbol, adjustments.legs.len().max(1)) {
+            RefusedStopLimit::SmallerOffset(smaller) => {
+                adjustments.limit_offset = Some(smaller);
+                self.log(&format!(
+                    "TWS refused the stop-limit order {order_id} of {label} (limit too far through the stop {stop}): placing it again with a limit offset of {smaller:.2} (was {current:.2})"
+                ));
+            }
+            RefusedStopLimit::MarketStop => {
+                adjustments.order_type = "Market stop".to_string();
+                self.log(&format!(
+                    "TWS refused the stop-limit order {order_id} of {label} (limit too far through the stop {stop}): placing a market stop at {stop} instead"
+                ));
+            }
+        }
         let mut updated = trade;
         updated.adjustments = Some(adjustments);
         self.save_trade(index, updated);
@@ -933,6 +964,17 @@ impl App {
         self.save_trade(index, updated);
     }
 
+    /// Writes a new trade to the database of the mode (never in tests: they must not touch the files of the computer); a failure is
+    /// logged, the trade is kept for this session all the same.
+    pub(super) fn store_new_trade(&mut self, trade: &StoredTrade) {
+        if cfg!(test) {
+            return;
+        }
+        if let Err(error) = trades_path(self.link.trading_live).and_then(|path| append_trade(&path, trade)) {
+            self.log(&format!("Could not save the trade: {error}"));
+        }
+    }
+
     /// Replaces the stored trade at `index` and writes it to `trades.json`.
     pub(super) fn save_trade(&mut self, index: usize, trade: StoredTrade) {
         self.pending.trade_log_dirty = true;
@@ -951,14 +993,15 @@ impl App {
     /// ends the trade; an order that dies unfilled
     /// leaves the trade without it, which is logged and shown.
     pub(super) fn on_exit_order_status(&mut self, order_id: i32, status: &str, remaining: f64, avg_fill_price: f64) {
-        let Some(open_trade) = self.trades_stored.iter().find(|t| t.is_open() && t.exit_order_ids().contains(&order_id)).map(|t| t.order_id) else {
+        let Some(open_trade) = self.trades_stored.iter().find(|t| t.is_open() && t.exit_order_ids().contains(&order_id)).map(StoredTrade::key) else {
             // An exit order of a trade that is closed already: filling now is an over fill.
             self.check_over_fill(order_id, status, remaining);
             return;
         };
         self.apply_exit_order_status(order_id, status, remaining, avg_fill_price);
-        // The order that ended the trade is remembered, to tell a second fill from the first.
-        let closed = self.trades_stored.iter().any(|t| t.order_id == open_trade && !t.is_open());
+        // The order that ended the trade is remembered, to tell a second fill from the first. Another trade of the same opening
+        // order (the other side of an IronCondor) is a trade of its own.
+        let closed = self.trades_stored.iter().any(|t| t.key() == open_trade && !t.is_open());
         if closed && status == "Filled" && remaining == 0.0 {
             self.watch.closed_by.insert(open_trade, order_id);
         }
@@ -1063,7 +1106,7 @@ impl App {
             updated.adjustments = None;
         }
         if updated != *trade {
-            self.log(&format!("{} {} {}: order {order_id} is no longer part of the trade", trade.symbol, trade.trade_type, trade.strikes));
+            self.log(&format!("{}: order {order_id} is no longer part of the trade", trade.label()));
             self.save_trade(index, updated);
         }
     }
@@ -1195,7 +1238,7 @@ impl App {
             }
             return;
         }
-        self.debug(&format!("cancelling the exit orders {:?} of {} {} {}", trade.exit_order_ids(), trade.symbol, trade.trade_type, trade.strikes));
+        self.debug(&format!("cancelling the exit orders {:?} of {}", trade.exit_order_ids(), trade.label()));
         for order_id in trade.exit_order_ids() {
             self.log(&format!("Cancel {order_id}"));
             if self.submit_cancel(order_id).is_err() {
@@ -1203,6 +1246,45 @@ impl App {
             }
         }
     }
+}
+
+/// What follows when TWS refuses a stop-limit because its limit lies too far through the stop price.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RefusedStopLimit {
+    /// Placed again with this smaller limit offset.
+    SmallerOffset(f64),
+    /// Placed again as a market stop at the same stop price.
+    MarketStop,
+}
+
+/// The answer to a stop-limit TWS refused as too far through its `stop` price, with the limit `offset` beyond it: a limit more than
+/// 15 % beyond the stop gets an offset 10 % smaller (on the price grid of `legs` legs); a limit closer to the stop, or an offset the
+/// grid cannot make smaller, gives way to a market stop, so that the trade is never left without a stop. Worked out in decimal.
+fn after_refused_stop_limit(stop: Decimal, offset: f64, symbol: &str, legs: usize) -> RefusedStopLimit {
+    let smaller = || -> Option<f64> {
+        let offset = dec(offset)?;
+        let limit = stop.checked_add(offset)?;
+        let far = stop > Decimal::ZERO && limit.checked_div(stop)? > Decimal::new(115, 2);
+        let smaller = crate::pricing::fix_price(offset.checked_mul(Decimal::new(9, 1))?, symbol, legs)?;
+        (far && smaller > Decimal::ZERO && smaller < offset).then_some(smaller)?.to_f64()
+    };
+    smaller().map_or(RefusedStopLimit::MarketStop, RefusedStopLimit::SmallerOffset)
+}
+
+/// The contracts an entry order of `ordered` filled before it ended, from TWS's `filled`: a whole number from 1 to `ordered`, else
+/// `None` (a fill that cannot be booked).
+fn filled_contracts(filled: f64, ordered: u32) -> Option<u32> {
+    let whole = filled.round().to_u32()?;
+    (whole >= 1 && whole <= ordered && (filled - filled.round()).abs() < 1e-9).then_some(whole)
+}
+
+/// The contracts of one trade of an entry when `filled` of the `ordered` combos filled: its planned contracts (`planned`, the combos times
+/// its ratio) in the same share.
+fn share_of_qty(planned: u32, filled: u32, ordered: u32) -> u32 {
+    if filled == ordered || ordered == 0 {
+        return planned;
+    }
+    planned.checked_mul(filled).map_or(planned, |product| product / ordered)
 }
 
 /// The part of the fill price that belongs to one trade of an entry (a strangle is two trades).
@@ -1404,6 +1486,18 @@ pub(super) fn closes_an_open_short(trades: &[StoredTrade], contract: &IbContract
     })
 }
 
+/// Whether selling `contract` closes an option that a stored, still open trade of the same account is long in (same expiration, right
+/// and strike).
+pub(super) fn closes_an_open_long(trades: &[StoredTrade], contract: &IbContract, account: &str) -> bool {
+    let Some(strike) = dec(contract.strike).map(|s| s.normalize().to_string()) else {
+        return false;
+    };
+    trades.iter().filter(|t| t.is_open() && t.account == account && t.expiry == contract.last_trade_date_or_contract_month).any(|t| {
+        let long = if contract.right == "P" { &t.long_put } else { &t.long_call };
+        long.as_ref().is_some_and(|leg| leg.strike == strike)
+    })
+}
+
 impl App {
     /// TWS's `orderStatus` for the Instant Order of a single option: once it is completely filled it is recorded
     /// as a trade, so it shows on the Dashboard (today's trades, `trades.json`) and is valued like a template
@@ -1438,16 +1532,8 @@ impl App {
         let Some(trade) = instant_option_trade(&contract, &order, order_id, avg, con_id, self.clock.local()) else {
             return;
         };
-        self.log(&format!(
-            "Trade opened: {} {} {} x{} @ {} (instant order {order_id})",
-            trade.symbol, trade.trade_type, trade.strikes, trade.qty, trade.price_open
-        ));
-        if !cfg!(test) {
-            let saved = trades_path(self.link.trading_live).map_err(|e| e.to_string()).and_then(|p| append_trade(&p, &trade).map_err(|e| e.to_string()));
-            if let Err(error) = saved {
-                self.log(&format!("Could not save the trade: {error}"));
-            }
-        }
+        self.log(&format!("Trade opened: {} x{} @ {} (instant order {order_id})", trade.label(), trade.qty, trade.price_open));
+        self.store_new_trade(&trade);
         self.trades_stored.push(trade);
         self.pending.trade_log_dirty = true;
         self.refresh_trades(self.clock.instant(), true);
@@ -1502,5 +1588,38 @@ fn price_or_dash(price: f64) -> String {
         "-".to_string()
     } else {
         price.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{after_refused_stop_limit, filled_contracts, share_of_qty, RefusedStopLimit};
+    use rust_decimal::Decimal;
+
+    #[test]
+    fn a_refused_stop_limit_far_beyond_its_stop_gets_a_smaller_offset_else_a_market_stop() {
+        let stop = Decimal::new(200, 2);
+        assert_eq!(after_refused_stop_limit(stop, 1.00, "SPX", 1), RefusedStopLimit::SmallerOffset(0.9), "3.00 is 50 % beyond 2.00: 10 % smaller");
+        assert_eq!(after_refused_stop_limit(stop, 0.20, "SPX", 1), RefusedStopLimit::MarketStop, "2.20 is only 10 % beyond 2.00");
+        assert_eq!(after_refused_stop_limit(Decimal::new(20, 2), 0.05, "SPX", 1), RefusedStopLimit::MarketStop, "0.045 is no price on the grid");
+        assert_eq!(after_refused_stop_limit(Decimal::ZERO, 1.00, "SPX", 1), RefusedStopLimit::MarketStop, "no stop price");
+        assert_eq!(after_refused_stop_limit(stop, f64::NAN, "SPX", 1), RefusedStopLimit::MarketStop);
+    }
+
+    #[test]
+    fn the_filled_contracts_are_a_whole_number_from_one_to_the_ordered_ones() {
+        assert_eq!(filled_contracts(2.0, 3), Some(2));
+        assert_eq!(filled_contracts(3.0, 3), Some(3));
+        assert_eq!(filled_contracts(0.0, 3), None);
+        assert_eq!(filled_contracts(4.0, 3), None, "more than ordered");
+        assert_eq!(filled_contracts(1.5, 3), None, "half a combo");
+        assert_eq!(filled_contracts(f64::NAN, 3), None);
+    }
+
+    #[test]
+    fn each_trade_of_an_entry_gets_its_share_of_the_filled_contracts() {
+        assert_eq!(share_of_qty(3, 2, 3), 2);
+        assert_eq!(share_of_qty(6, 2, 3), 4, "a ratio of 2 keeps its ratio");
+        assert_eq!(share_of_qty(3, 3, 3), 3, "all filled");
     }
 }

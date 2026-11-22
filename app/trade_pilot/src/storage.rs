@@ -643,6 +643,15 @@ pub struct PersistedSettings {
     /// After the market close, the trades of the day are written to a CSV file in the `exports` folder (see `daily_csv_tick`).
     #[serde(default)]
     pub daily_csv_export: bool,
+    /// The most contracts (or combos) of one symbol open at the same time before a new position is refused; empty or 0 = no limit.
+    #[serde(default)]
+    pub risk_max_contracts_per_symbol: String,
+    /// The loss of today in dollars from which on no new position is opened today; empty or 0 = no limit.
+    #[serde(default)]
+    pub risk_max_daily_loss: String,
+    /// The most new opening orders within one minute; empty or 0 = no limit.
+    #[serde(default)]
+    pub risk_max_orders_per_minute: String,
     // Market Data
     pub market_data_provider: String,
     pub symbol_configs: Vec<SymbolConfig>,
@@ -983,6 +992,9 @@ mod tests {
             translation_contact_email: String::new(),
             light_mode: false,
             daily_csv_export: false,
+            risk_max_contracts_per_symbol: "15".to_string(),
+            risk_max_daily_loss: "750".to_string(),
+            risk_max_orders_per_minute: "6".to_string(),
             market_data_provider: "TWS".to_string(),
             symbol_configs: vec![SymbolConfig {
                 symbol: "SPX".to_string(),

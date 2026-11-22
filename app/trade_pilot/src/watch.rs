@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-/// Today's profit when it has reached the daily target, else `None`. Like the target of the reference: there is an
+/// Today's profit when it has reached the daily target, else `None`. The target counts only while there is an
 /// open trade (`open` is known and not 0 - an unquoted open trade makes it unknown) and open + closed lies above it.
 #[must_use]
 pub fn profit_target_total(target: Decimal, open: Option<Decimal>, closed: Decimal) -> Option<Decimal> {
@@ -79,9 +79,9 @@ impl Sustained {
 pub struct WatchState {
     pub profit_target: ProfitTargetWatch,
     pub sustained: Sustained,
-    /// The order that closed each finished trade (by the trade's opening order id): a different exit order filling
+    /// The order that closed each finished trade (by `StoredTrade::key`): a different exit order of the same trade filling
     /// afterwards is an over fill.
-    pub closed_by: HashMap<i32, i32>,
+    pub closed_by: HashMap<String, i32>,
     /// Over fills reported (the exit order ids).
     pub over_fills: HashSet<i32>,
     /// Open short ETF/stock options reported (contract ids) on `short_day`.
@@ -89,14 +89,14 @@ pub struct WatchState {
     pub short_day: String,
     /// When the watchers last looked.
     pub checked: Option<Instant>,
-    /// Trades (by their opening order id) whose timed exit uses a market order: the limit order did not fill in time.
-    pub timed_market: HashSet<i32>,
-    /// When a timed exit last tried to place its order, by trade.
-    pub timed_tried: HashMap<i32, Instant>,
+    /// Trades (by `StoredTrade::key`) whose timed exit uses a market order: the limit order did not fill in time.
+    pub timed_market: HashSet<String>,
+    /// When a timed exit last tried to place its order, by trade (`StoredTrade::key`).
+    pub timed_tried: HashMap<String, Instant>,
     /// When the limit order of a timed exit was sent, by its order id.
     pub timed_limit_sent: HashMap<i32, Instant>,
-    /// The limit close of a timed exit that is moved towards the market step by step, by trade (its opening order id).
-    pub progressive_close: HashMap<i32, ProgressiveClose>,
+    /// The limit close of a timed exit that is moved towards the market step by step, by trade (`StoredTrade::key`).
+    pub progressive_close: HashMap<String, ProgressiveClose>,
     /// When the early-exit conditions were last looked at.
     pub exit_checked: Option<Instant>,
     /// Exit orders the person (or a template time) asked to cancel: their end is expected, not a warning.
@@ -106,13 +106,17 @@ pub struct WatchState {
     /// Stops and profit targets sent again with a new price, by order id: the new price goes on the trade only once TWS
     /// confirms the change, so a modify of an order that has ended meanwhile never shows a stop that does not exist.
     pub exit_changes: HashMap<i32, Decimal>,
-    /// When a stop conversion was last started, by trade (its opening order id).
-    pub conversion_tried: HashMap<i32, Instant>,
-    /// Trades (by their opening order id) whose full stop split has started, as they were then: their stop and target prices are
+    /// When a stop conversion was last started, by trade (`StoredTrade::key`).
+    pub conversion_tried: HashMap<String, Instant>,
+    /// Trades (by `StoredTrade::key`) whose full stop split has started, as they were then: their stop and target prices are
     /// gone from the trade once the orders are cancelled, the sides take them from here.
-    pub split_pending: HashMap<i32, crate::storage::StoredTrade>,
-    /// When a cancel of the split was last sent, by trade and step (`<order id>:<step>`).
+    pub split_pending: HashMap<String, crate::storage::StoredTrade>,
+    /// When a cancel of the split was last sent, by trade and step (`<trade key>/<step>`).
     pub split_tried: HashMap<String, Instant>,
+    /// When the opening orders of the last minute were sent (for the limit of new orders per minute).
+    pub entries_sent: Vec<Instant>,
+    /// The New York day (yyyyMMdd) on which today's loss reached its limit: no new position is opened on it any more.
+    pub loss_stop_day: Option<String>,
 }
 
 /// Where a progressive limit close stands: the limit it was sent or last moved to (the price as typed: what the close pays, or for a
@@ -133,7 +137,7 @@ pub fn beyond_stop(stop: Decimal, close_cost: Decimal) -> bool {
 /// The percent beyond the stop typed in the settings: a number from 0 up (a comma taken as the decimal point), else `None`.
 #[must_use]
 pub fn beyond_stop_percent(text: &str) -> Option<Decimal> {
-    text.trim().replace(',', ".").parse::<Decimal>().ok().filter(|pct| *pct >= Decimal::ZERO)
+    crate::pricing::parse_decimal(text).filter(|pct| *pct >= Decimal::ZERO)
 }
 
 /// Whether a credit trade is far enough past its stop to be closed: what it costs to close is at least `percent` above the stop

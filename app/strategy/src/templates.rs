@@ -343,7 +343,7 @@ pub struct ConfigExport {
 pub struct ImportReport {
     /// Templates that came in.
     pub imported: usize,
-    /// Templates whose "Early Exit Condition" was dropped: conditions are not implemented here yet.
+    /// Templates whose "Early Exit Condition" was dropped: the condition ids of the exporting installation mean other conditions here.
     pub dropped_exit_conditions: usize,
     /// Templates left out because an identical one (same name and settings) already exists.
     pub skipped_duplicates: usize,

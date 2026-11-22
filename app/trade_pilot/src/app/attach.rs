@@ -81,7 +81,7 @@ pub(super) fn target_mode(trade: &StoredTrade) -> ExitMode {
 
 /// A typed price: a decimal comma is accepted; `None` for empty, unreadable or not above 0.
 fn typed_price(text: &str) -> Option<Decimal> {
-    text.trim().replace(',', ".").parse::<Decimal>().ok().filter(|price| *price > Decimal::ZERO)
+    crate::pricing::parse_decimal(text).filter(|price| *price > Decimal::ZERO)
 }
 
 impl App {

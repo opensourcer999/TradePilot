@@ -45,7 +45,7 @@ impl App {
     /// ones) stays above the target for the delay, the entries that are still waiting are cancelled and the target is
     /// reported. The open trades are not closed by this: they keep their stops and targets.
     fn check_daily_profit_target(&mut self, now: Instant) {
-        let target: Decimal = self.settings.daily_profit_target.trim().replace(',', ".").parse().unwrap_or(Decimal::ZERO);
+        let target: Decimal = crate::pricing::parse_decimal(&self.settings.daily_profit_target).unwrap_or(Decimal::ZERO);
         if target <= Decimal::ZERO {
             return;
         }
@@ -80,12 +80,10 @@ impl App {
             let bid = live_legs(trade, &self.chains).and_then(|legs| legs.current_bid(&trade.trade_type)).filter(|bid| *bid > Decimal::ZERO);
             let stop = trade.stop_now();
             let passed = stop.zip(bid).is_some_and(|(stop, bid)| beyond_stop(stop, bid));
-            if self.watch.sustained.fire(&format!("beyond:{}", trade.order_id), passed, now, BEYOND_STOP_HOLD, REPEAT_PAUSE) {
+            if self.watch.sustained.fire(&format!("beyond:{}", trade.key()), passed, now, BEYOND_STOP_HOLD, REPEAT_PAUSE) {
                 problems.push(format!(
-                    "{} {} {} ({}): stop {}, current bid {}",
-                    trade.symbol,
-                    trade.trade_type,
-                    trade.strikes,
+                    "{} ({}): stop {}, current bid {}",
+                    trade.label(),
                     mask_account(&trade.account),
                     stop.map_or_else(|| "-".to_string(), |s| s.normalize().to_string()),
                     bid.map_or_else(|| "-".to_string(), |b| b.normalize().to_string())
@@ -112,11 +110,11 @@ impl App {
         for trade in trades {
             let cost = live_legs(trade, &self.chains).and_then(|legs| legs.current_bid(&trade.trade_type)).filter(|bid| *bid > Decimal::ZERO);
             let far = trade.stop_now().zip(cost).is_some_and(|(stop, cost)| far_beyond_stop(stop, cost, percent));
-            let key = format!("beyond-close:{}", trade.order_id);
+            let key = format!("beyond-close:{}", trade.key());
             if !self.watch.sustained.fire(&key, far && trade.close_order_id.is_none(), now, wait, CLOSE_REPEAT_PAUSE) {
                 continue;
             }
-            let Some(index) = self.trades_stored.iter().position(|t| t.is_open() && t.order_id == trade.order_id && t.label() == trade.label()) else {
+            let Some(index) = self.trades_stored.iter().position(|t| t.is_open() && t.key() == trade.key()) else {
                 continue;
             };
             let limit = if market { None } else { self.closing_price(trade) };
@@ -166,7 +164,7 @@ impl App {
             .iter()
             .filter(|t| t.is_open() && !t.entry_unknown)
             .filter(|t| live_legs(t, &self.chains).and_then(|legs| legs.current_bid(&t.trade_type)).is_none())
-            .map(|t| format!("{} {} {} ({}): no current quote", t.symbol, t.trade_type, t.strikes, mask_account(&t.account)))
+            .map(|t| format!("{} ({}): no current quote", t.label(), mask_account(&t.account)))
             .collect();
         let active = session_old && !unpriced.is_empty();
         if self.watch.sustained.fire("quotes", active, now, QUOTES_HOLD, REPEAT_PAUSE) {
@@ -228,15 +226,13 @@ impl App {
             return;
         }
         let Some(trade) = self.trades_stored.iter().find(|t| !t.is_open() && t.exit_order_ids().contains(&order_id)).cloned() else { return };
-        let Some(closer) = self.watch.closed_by.get(&trade.order_id).copied().filter(|closer| *closer != order_id) else { return };
+        let Some(closer) = self.watch.closed_by.get(&trade.key()).copied().filter(|closer| *closer != order_id) else { return };
         if !self.watch.over_fills.insert(order_id) {
             return;
         }
         let line = format!(
-            "{} {} {} ({}), opened {}: order {order_id} filled after order {closer} had closed the trade (qty {})",
-            trade.symbol,
-            trade.trade_type,
-            trade.strikes,
+            "{} ({}), opened {}: order {order_id} filled after order {closer} had closed the trade (qty {})",
+            trade.label(),
             mask_account(&trade.account),
             trade.opened,
             trade.qty
@@ -258,7 +254,7 @@ impl App {
             return;
         };
         let text = format!("TWS {code}: {message}");
-        if message.to_lowercase().contains("margin") {
+        if is_margin_message(message) {
             let entry = sent.and_then(|(_, run)| run).map(|run| format!("Schedule run {run}"));
             self.log(&format!("WARNING: margin rejection of order {order_id}: {text}"));
             self.notify_trade_mail(&trade_mail::margin_issue(entry.as_deref(), &mask_account(&account), &text), true, true);
@@ -275,6 +271,11 @@ impl App {
             }
         }
     }
+}
+
+/// Whether TWS speaks of margin in the message of an order error: a rejection (code 201) or a warning (2xxx) for lack of margin.
+pub(super) fn is_margin_message(message: &str) -> bool {
+    message.to_lowercase().contains("margin")
 }
 
 /// Whether a TWS error code about an order means it failed. Not failures: the cancel confirmations (202, 161) and the

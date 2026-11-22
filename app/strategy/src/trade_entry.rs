@@ -1,7 +1,7 @@
 //! Trade entry from a template - the strike selection for Instant Order's PREVIEW. It covers
 //! every trade type routed there: IronCondor(-Full), `IronFly`, Put/CallSpread,
 //! Put/CallDebitSpread, LongIronCondor-Full, Long/ShortPut, Long/ShortCall, Long/ShortStrangle.
-//! Calendars (`select_calendar`) have their own selection; Custom is not implemented yet.
+//! Calendars (`select_calendar`) and custom trades (`custom`) have their own selection.
 //!
 //! Pure trade logic (`coding_guideline.md` section 2): no I/O, no clock - quote age comes in as
 //! flags. Prices and strikes are `Decimal` with checked arithmetic (section 3); deltas are greeks,
@@ -2112,6 +2112,19 @@ pub fn build_entry_order(template: &TradeTemplate, outcome: &EntryOutcome, qty: 
 /// is never turned into a free or debit order. `None` only on arithmetic overflow.
 #[must_use]
 pub fn next_fill_limit(template: &TradeTemplate, symbol: &str, legs: usize, action: &str, limit: Decimal) -> Option<Decimal> {
+    fill_limit_step(template, symbol, legs, action, limit, true)
+}
+
+/// `next_fill_limit` for a scheduled entry that has filled in part already: the rest is moved on beyond the template's limits
+/// (target premium, Min/Max Entry Price), as the contracts filled so far are a position already and the rest belongs to it; the
+/// limit still never reaches 0 or changes sign.
+#[must_use]
+pub fn next_fill_limit_partly_filled(template: &TradeTemplate, symbol: &str, legs: usize, action: &str, limit: Decimal) -> Option<Decimal> {
+    fill_limit_step(template, symbol, legs, action, limit, false)
+}
+
+/// The step of `next_fill_limit`; `bounded` keeps it within the template's limits.
+fn fill_limit_step(template: &TradeTemplate, symbol: &str, legs: usize, action: &str, limit: Decimal, bounded: bool) -> Option<Decimal> {
     let n = numbers(template)?;
     let mut adjustment = dec(template.fill_adjustment)?.abs();
     // A positive limit that is SOLD (a single short option) is lowered to get filled.
@@ -2154,7 +2167,8 @@ pub fn next_fill_limit(template: &TradeTemplate, symbol: &str, legs: usize, acti
         other => !is_debit(other) && price < n.min_entry,
     };
     let crosses_zero = next.is_zero() || (next < Decimal::ZERO) != (limit < Decimal::ZERO);
-    Some(if outside_target || below_min_entry || beyond_max_entry || crosses_zero { limit } else { next })
+    let beyond_limits = bounded && (outside_target || below_min_entry || beyond_max_entry);
+    Some(if beyond_limits || crosses_zero { limit } else { next })
 }
 
 #[cfg(test)]
@@ -2556,6 +2570,12 @@ mod tests {
         // Short premium must stay at or above the template's minimum premium of 1.00.
         let t = TradeTemplate { target_min: 1.0, target_max: 1.5, ..fill_template("PutSpread", "Premium") };
         assert_eq!(next_fill_limit(&t, "SPX", 2, "BUY", d("-1.00")), Some(d("-1.00")), "0.95 would be below 1.00: kept");
+        assert_eq!(
+            next_fill_limit_partly_filled(&t, "SPX", 2, "BUY", d("-1.00")),
+            Some(d("-0.95")),
+            "filled in part already: the rest moves on beyond the Min Entry Price"
+        );
+        assert_eq!(next_fill_limit_partly_filled(&t, "SPX", 2, "BUY", d("-0.05")), Some(d("-0.05")), "but never to 0");
         assert_eq!(next_fill_limit(&t, "SPX", 2, "BUY", d("-1.20")), Some(d("-1.15")));
         // Min Entry Price holds for every type.
         let t = TradeTemplate { min_entry_price: 1.18, ..fill_template("PutSpread", "Delta") };

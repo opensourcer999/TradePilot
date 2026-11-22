@@ -33,7 +33,7 @@ impl CustomEntry {
 
     /// What the position needs as buying power per contract of the trade: the worst loss at the expiration, in dollars (the premium counts:
     /// a credit lowers it, a debit is the loss). `None` when the risk is not defined or not worked out: more sold calls than bought ones
-    /// (the loss grows without limit), more sold puts than bought ones (the reference refuses these too), legs of different expirations
+    /// (the loss grows without limit), more sold puts than bought ones (refused as well: the loss is large), legs of different expirations
     /// other than a debit trade whose sold legs expire first, or no loss at all.
     #[must_use]
     pub fn buying_power(&self) -> Option<Decimal> {
@@ -292,7 +292,7 @@ fn describe(custom: &CustomEntry, entry: Decimal) -> String {
 }
 
 /// The entry price and the short/long ratio against the limits of the template; each miss is logged. A limit given as a negative
-/// number is the other side of the same price, as the reference compares them.
+/// number is a debit: a negative minimum is the most the debit may cost, a negative maximum the least, and the log names them so.
 fn within_limits(entry: Decimal, custom: &CustomEntry, limits: (Decimal, Decimal, Decimal, Decimal), log: &mut Vec<String>) -> bool {
     let (min_entry, max_entry, min_ratio, max_ratio) = limits;
     let mut found = true;

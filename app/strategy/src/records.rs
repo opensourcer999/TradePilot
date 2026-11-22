@@ -333,6 +333,14 @@ impl StoredTrade {
         self.state() == Some(crate::trade_summary::TradeStatus::Open)
     }
 
+    /// What tells this trade apart from every other one, also from another trade of the same opening order (the two sides of an
+    /// `IronCondor`, the sides of a split trade): the opening order, the type and the strikes. For state kept per trade while the app
+    /// runs.
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!("{}:{}:{}", self.order_id, self.trade_type, self.strikes)
+    }
+
     /// The trade was split into one trade per side (`TradeStatus::Split`): hidden, its sides count instead.
     #[must_use]
     pub fn is_split(&self) -> bool {

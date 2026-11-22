@@ -185,7 +185,9 @@ impl App {
                     ui.label(RichText::new(title).strong().color(text_primary()));
                     ui.label(RichText::new(newest).color(muted_text()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        dismiss = ui.small_button("\u{2715}").on_hover_text(self.tr("Dismiss", "Ausblenden")).clicked();
+                        // "×" is in every font; the heavier cross signs are not and showed as an empty box.
+                        let cross = egui::Button::new(RichText::new("\u{d7}").size(18.0).color(text_primary())).frame(false);
+                        dismiss = ui.add(cross).on_hover_text(self.tr("Dismiss", "Ausblenden")).clicked();
                         show = ui.add(crate::widgets::MetalButton::new(self.tr("Show news", "Nachrichten anzeigen"))).clicked();
                     });
                 });

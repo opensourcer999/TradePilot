@@ -8,7 +8,7 @@
 
 use super::attach::working_target_ids;
 use super::stop_conversion::conversion_price;
-use super::{append_trade, chain_quote, fix_price, live_legs, trade_exit, trades_path, App, Decimal, Instant, StopAdjustments, StoredTrade, TradeStatus};
+use super::{chain_quote, fix_price, live_legs, trade_exit, App, Decimal, Instant, StopAdjustments, StoredTrade, TradeStatus};
 use std::time::Duration;
 use strategy::trade_split::{split_due, split_sides, splittable, ShortQuote};
 
@@ -50,10 +50,10 @@ pub(super) fn split_step(trade: &StoredTrade) -> SplitStep {
 }
 
 impl App {
-    /// Whether the full stop split of the trade with the opening order `order_id` has started (its exit orders are left alone by the
+    /// Whether the full stop split of `trade` has started (its exit orders are left alone by the
     /// stop adjustments and conversions meanwhile).
-    pub(super) fn split_started(&self, order_id: i32) -> bool {
-        self.watch.split_pending.contains_key(&order_id)
+    pub(super) fn split_started(&self, trade: &StoredTrade) -> bool {
+        self.watch.split_pending.contains_key(&trade.key())
     }
 
     /// One look at every open trade the split applies to (see the module).
@@ -64,13 +64,13 @@ impl App {
         let Some(price) = conversion_price(&self.settings.iron_fly_stop_split_price) else { return };
         for index in 0..self.trades_stored.len() {
             let Some(trade) = self.trades_stored.get(index).cloned() else { continue };
-            let started = self.split_started(trade.order_id);
+            let started = self.split_started(&trade);
             if started && !trade.is_open() {
                 // Closed meanwhile (its profit target filled before it was cancelled, say): nothing is left to split.
                 if !trade.is_split() {
                     self.log(&format!("Full stop split of {}: the trade ended meanwhile - not split", trade.label()));
                 }
-                self.watch.split_pending.remove(&trade.order_id);
+                self.watch.split_pending.remove(&trade.key());
                 continue;
             }
             if !started && !self.split_wanted(&trade, price) {
@@ -78,7 +78,7 @@ impl App {
             }
             if !started {
                 self.log(&format!("Full stop split of {}: a short is at a bid of {price} or below - cancelling the stop", trade.label()));
-                self.watch.split_pending.insert(trade.order_id, trade.clone());
+                self.watch.split_pending.insert(trade.key(), trade.clone());
             }
             self.split_tick(index, &trade, instant);
         }
@@ -102,7 +102,7 @@ impl App {
     /// The next step of a split that has started.
     fn split_tick(&mut self, index: usize, trade: &StoredTrade, instant: Instant) {
         let step = split_step(trade);
-        let prefix = format!("{}:", trade.order_id);
+        let prefix = format!("{}/", trade.key());
         if step == SplitStep::Split {
             self.watch.split_tried.retain(|key, _| !key.starts_with(&prefix));
             self.split_trade(index, trade);
@@ -128,7 +128,7 @@ impl App {
     /// Splits the trade at `index`, whose exit orders are all gone, into its two sides, and places the exits of each side.
     fn split_trade(&mut self, index: usize, trade: &StoredTrade) {
         let label = trade.label();
-        let snapshot = self.watch.split_pending.remove(&trade.order_id);
+        let snapshot = self.watch.split_pending.remove(&trade.key());
         // The prices of the cancelled stop and target are taken from the trade as it was when the split started.
         let mut basis = trade.clone();
         if let Some(before) = snapshot {
@@ -155,16 +155,11 @@ impl App {
         let names: Vec<String> = sides.iter().map(|side| format!("{} at {}", side.label(), side.price_open)).collect();
         self.log(&format!("Trade split: {label} into {}", names.join(" and ")));
         let template = self.template_of(trade).cloned();
-        let path = trades_path(self.link.trading_live);
         for mut side in sides {
             if side.adjustments.is_none() {
                 side.adjustments = template.as_ref().map(|template| fresh_stop_record(template, &side));
             }
-            if !cfg!(test) {
-                if let Err(error) = path.as_ref().map_err(ToString::to_string).and_then(|p| append_trade(p, &side).map_err(|e| e.to_string())) {
-                    self.log(&format!("Could not save the trade: {error}"));
-                }
-            }
+            self.store_new_trade(&side);
             self.trades_stored.push(side);
             self.pending.trade_log_dirty = true;
             self.place_side_exits(self.trades_stored.len() - 1);

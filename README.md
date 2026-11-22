@@ -65,6 +65,11 @@ use it at your own risk.
   the hand-over to the connection. An
   order that is refused or cannot be handed over is logged as `WARNING: order N NOT sent`
   and never recorded on a trade.
+- **Risk limits** (Settings > Safety Features) hold up every order that opens a position:
+  at most a set number of contracts open per symbol (default 20), no new position for the
+  rest of the day once today's loss has reached a set amount (default $1,000), and at most a
+  set number of new orders per minute (default 10). Orders that close or protect a position
+  are never held up.
 - Immediate transmission is off by default; a confirmation window shows account, legs,
   limit and quantity before anything is sent. An order held in TWS for review is never
   changed or cancelled by TradePilot.
@@ -112,9 +117,8 @@ Tools are build-time requirements, not needed to run the finished `.exe`.
 
 ### Installing the requirements on a Mac
 
-The macOS package is normally built by GitHub Actions, started from the Windows PC
-(see `documentation/macos-readme.md`); a Mac itself is only needed to build locally
-or to test the result. To build locally on a Mac:
+The macOS package is normally built by GitHub Actions (workflow `release.yml`, started by a
+version tag); a Mac itself is only needed to build locally or to test the result. To build locally on a Mac:
 
 1. Install the Xcode Command Line Tools (the Mac's C/C++ toolchain, the equivalent of
    the Windows MSVC Build Tools):
@@ -130,9 +134,10 @@ or to test the result. To build locally on a Mac:
 3. Open a new terminal (so the updated `PATH` takes effect) and change into `app/`.
    As on Windows, `rustup` reads `rust-toolchain.toml` there and installs the pinned
    channel with the `rustfmt` and `clippy` components automatically on first use.
-4. From `app/`, run `./package.sh` to build (`chmod +x package.sh` first if needed; see
-   "Lokal auf dem Mac bauen" in `documentation/macos-readme.md` for details and the
-   universal-binary option). `package.sh` is only for producing a release package
+4. From `app/`, run `./package.sh` to build (`chmod +x package.sh` first if needed).
+   `./package.sh universal` builds one binary for Apple Silicon and Intel, `./package.sh --no-build`
+   packs the release binary that exists already. The package is not signed: on the first
+   start, right-click TradePilot.app > Open. `package.sh` is only for producing a release package
    (`.app`/DMG/ZIP); for day-to-day development use plain Cargo instead, the same way
    as on Windows (see "Build and run" and "Tests and checks" below, from `app/`):
    `cargo build`, `cargo run --bin trade_pilot`, `cargo test --workspace`,

@@ -7,8 +7,9 @@
 //!
 //! Covered: every trade type template entry opens (Put/CallSpread, Short/Long Put/Call, the debit
 //! spreads, the strangles, `IronFly`, IronCondor-Full, LongIronCondor-Full, and the calendars
-//! `PutCalendar`, `CallCalendar`, `DoubleCalendar`). Not implemented: Straddle and Custom (not entered by
-//! this app yet) and commissions. Contracts closed by profit-target levels are left to the caller:
+//! `PutCalendar`, `CallCalendar`, `DoubleCalendar`), and custom trades by their own legs (`custom_closing_value`). Not covered:
+//! Straddle (not entered by this app). Commissions are not part of these values; the caller adds them (`fees`).
+//! Contracts closed by profit-target levels are left to the caller:
 //! it values only the contracts still open (`StoredTrade::remaining_qty`) and adds what the levels
 //! made (`StoredTrade::realized_profit`).
 

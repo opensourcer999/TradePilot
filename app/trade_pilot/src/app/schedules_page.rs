@@ -206,7 +206,7 @@ impl App {
     /// The net liquidation value TWS reported for `account`; the override of the settings counts if it is
     /// above 0. `None` if neither is known.
     fn net_liquidation_of(&self, account: &str) -> Option<Decimal> {
-        let overridden = self.settings.net_liquidity_override.trim().replace(',', ".").parse::<Decimal>().ok().filter(|value| *value > Decimal::ZERO);
+        let overridden = crate::pricing::parse_decimal(&self.settings.net_liquidity_override).filter(|value| *value > Decimal::ZERO);
         overridden.or_else(|| {
             self.account_summary
                 .iter()

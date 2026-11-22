@@ -1074,6 +1074,14 @@ pub fn closes_by_selling(trade: &StoredTrade) -> bool {
     legs.iter().filter(|leg| leg.is_some()).count() == 1 && (trade.long_put.is_some() || trade.long_call.is_some())
 }
 
+/// Whether closing `trade` brings money instead of costing it: a single bought option is sold, and a combo bought as a debit is closed by
+/// buying its legs the other way round for a credit (a negative limit). Its close limit is then the price it brings, and a limit that is
+/// moved towards the market goes down (towards the bid), not up.
+#[must_use]
+pub fn close_receives(trade: &StoredTrade) -> bool {
+    closes_by_selling(trade) || (trade.price_open < Decimal::ZERO && close_legs(trade).len() > 1)
+}
+
 /// The profit-target order of a later level (2-4): the same closing legs and contract as the
 /// first one, joined to the OCA `group` of the trade's other exit orders.
 /// `None` when the contract or the price cannot be put on the wire.

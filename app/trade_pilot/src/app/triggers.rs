@@ -484,7 +484,7 @@ impl App {
             let Some(trade) = self.trades_stored.get(index).filter(|t| t.is_open() && t.close_order_id.is_none()).cloned() else { continue };
             let Some(origin) = trade.origin.clone().filter(|o| ids.contains(&o.trigger) && o.trigger != 0) else { continue };
             let limit = self.template(origin.template_id).is_some_and(|t| t.exit_flags.exit_order_limit);
-            self.log(&format!("Trigger {} - close {} {} {}", origin.trigger, trade.symbol, trade.trade_type, trade.strikes));
+            self.log(&format!("Trigger {} - close {}", origin.trigger, trade.label()));
             let mut updated: StoredTrade = trade;
             updated.timed_exit = Some(TimedExit { at: now.format("%Y-%m-%d %H:%M").to_string(), limit });
             self.save_trade(index, updated);

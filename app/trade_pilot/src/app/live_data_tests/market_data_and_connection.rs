@@ -360,3 +360,20 @@ fn account_dropdown_preselects_the_only_account() {
     app.apply_managed_accounts(accounts(&["DU1234567"]));
     assert_eq!(app.instant.account, "DU1234567");
 }
+
+#[test]
+fn quotes_of_the_estimate_refused_by_tws_switch_the_estimate_off_without_a_market_data_warning() {
+    let (mut app, commands) = connected_app();
+    app.settings.misc_flags.estimate_spx_extended_hours = true;
+    app.link.live_data_requested = true;
+    app.request_estimate_quote();
+    let req_id = app.quotes.iter().find(|q| q.label == "SPY").map(|q| q.req_id).expect("SPY is asked for");
+    drain(&commands);
+    app.tws_sender.send(TwsEvent::RequestError { req_id, code: 354, message: "Requested market data is not subscribed".into() }).unwrap();
+    app.poll_tws();
+    assert!(app.quotes.iter().all(|q| q.label != "SPY"), "the row is gone");
+    assert_eq!(app.session.market_data_error, None, "the other prices are fine: no warning");
+    assert!(app.log_lines.iter().any(|line| line.contains("estimate is off for this session")));
+    app.request_estimate_quote();
+    assert!(drain(&commands).is_empty(), "not asked for again in this session");
+}

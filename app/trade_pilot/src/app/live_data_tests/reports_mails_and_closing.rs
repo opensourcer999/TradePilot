@@ -419,3 +419,16 @@ fn mark_closed_records_the_trade_and_cancels_its_orders_even_with_the_kill_switc
     assert_eq!(app.trades_stored.first().map(|t| t.status.as_str()), Some("Open"));
     assert_eq!(cancelled_orders(&drain(&commands)), [] as [i32; 0]);
 }
+
+#[test]
+fn the_fees_follow_a_new_execution_although_they_are_taken_from_an_index() {
+    let (mut app, _commands) = connected_app();
+    let trade = StoredTrade { short_put: Some(StoredLeg { con_id: 11, strike: "6650".into() }), ..stored_put_spread() };
+    assert_eq!(app.fees_of(&trade).open, None, "no fill yet");
+    let mut execution = opening_execution(11, "SLD", 1.0);
+    execution.order_id = trade.order_id;
+    execution.exec_id = "fee-1".into();
+    app.exec_history.push(execution);
+    app.commissions.insert("fee-1".into(), Decimal::new(65, 2));
+    assert_eq!(app.fees_of(&trade).open, Some(Decimal::new(65, 2)), "the index is built again for the new execution");
+}

@@ -975,6 +975,27 @@ impl App {
                 },
             );
         });
+        ui.add_space(14.0);
+        white_card(ui, |ui| {
+            section_header(ui, self.tr("Risk Limits", "Risikogrenzen"));
+            ui.label(
+                RichText::new(self.tr(
+                    "Checked for every order that opens a position; orders that close or protect one are never held up. 0 or empty = no limit.",
+                    "Geprüft bei jeder Order, die eine Position eröffnet; Orders, die schließen oder absichern, werden nie aufgehalten. 0 oder leer = keine Grenze.",
+                ))
+                .small()
+                .color(muted_text()),
+            );
+            setting_row(ui, self.tr("Max. open contracts per symbol", "Max. offene Kontrakte je Symbol"), "", |ui| {
+                crate::widgets::metal_field(ui, egui::TextEdit::singleline(&mut self.settings.risk_max_contracts_per_symbol).desired_width(80.0));
+            });
+            setting_row(ui, self.tr("Daily loss limit ($)", "Tagesverlust-Grenze ($)"), "", |ui| {
+                crate::widgets::metal_field(ui, egui::TextEdit::singleline(&mut self.settings.risk_max_daily_loss).desired_width(100.0));
+            });
+            setting_row(ui, self.tr("Max. new orders per minute", "Max. neue Orders pro Minute"), "", |ui| {
+                crate::widgets::metal_field(ui, egui::TextEdit::singleline(&mut self.settings.risk_max_orders_per_minute).desired_width(80.0));
+            });
+        });
     }
 
     /// Settings > Database Backup: the daily backup and the CSV export, "Backup Now", and the backups in the backups folder with

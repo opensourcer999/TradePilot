@@ -1116,6 +1116,15 @@ impl App {
             return;
         };
         let PendingInstantOrder { contract, order, .. } = pending;
+        // An order that opens a position goes through the risk limits; one that closes a position never does.
+        let opens = !self.instant_order_closes(&contract, &order.action, &order.account);
+        if opens {
+            let contracts = order.total_quantity.round().to_u32().unwrap_or(u32::MAX);
+            if let Err(reason) = self.check_entry_risk(&contract.symbol, contracts) {
+                self.block_instant_order(&format!("risk limit - {reason}"));
+                return;
+            }
+        }
         let sent = (contract.clone(), order.clone());
         self.next_order_id = Some(order_id + 1);
         self.log(&format!(
@@ -1135,6 +1144,9 @@ impl App {
         if let Err(reason) = self.submit_order(order_id, contract, order) {
             self.block_instant_order(&reason.to_string());
             return;
+        }
+        if opens {
+            self.count_entry_sent();
         }
         self.instant.last_order_id = Some(order_id);
         self.instant.last_order_status = Some("Sent to TWS".to_string());

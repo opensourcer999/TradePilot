@@ -9,6 +9,15 @@
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
+/// A decimal number as a person types it: "0.05" and the German "0,05" alike; with both a point and a comma the comma separates the
+/// thousands ("1,000.5"). `None` for anything else.
+#[must_use]
+pub fn parse_decimal(text: &str) -> Option<Decimal> {
+    let text = text.trim();
+    let normalized = if text.contains('.') { text.replace(',', "") } else { text.replace(',', ".") };
+    Decimal::from_str(&normalized).ok()
+}
+
 /// A price from TWS or a stored template value (`f64` on the wire / in the template JSON) as an
 /// exact decimal: the shortest representation that round-trips (`0.1` stays `0.1`, not
 /// `0.1000000000000000055...`). `None` for NaN/infinite values.
@@ -103,6 +112,17 @@ pub fn fix_price(price: Decimal, symbol: &str, legs: usize) -> Option<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_typed_decimal_takes_a_point_or_a_comma() {
+        let d = |text: &str| Decimal::from_str(text).unwrap();
+        assert_eq!(parse_decimal(" 0.05 "), Some(d("0.05")));
+        assert_eq!(parse_decimal("0,05"), Some(d("0.05")));
+        assert_eq!(parse_decimal("1,000.5"), Some(d("1000.5")), "with a point, the comma separates the thousands");
+        assert_eq!(parse_decimal("-2,5"), Some(d("-2.5")));
+        assert_eq!(parse_decimal(""), None);
+        assert_eq!(parse_decimal("abc"), None);
+    }
 
     fn d(s: &str) -> Decimal {
         Decimal::from_str(s).unwrap()

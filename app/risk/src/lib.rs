@@ -2,16 +2,18 @@
 //! runs through a risk check before being sent, and there is a kill switch that stops new orders
 //! independent of any other logic.
 //!
-//! This is a first, minimal real check (order quantity against a configured limit) rather than a
-//! stub - the full set from the guideline (max position, max loss, price bands, order rate) is a
-//! separate, larger follow-up stage once this app tracks the position/P&L state those checks
-//! would need. No network, file or time access here (section 2) - the caller supplies everything.
+//! Every order is checked for its quantity (`check_order_quantity`); an order that opens a new position is also checked for the
+//! contracts open in its symbol, today's loss and the rate of new orders (`entry`). Price bands are not checked.
+//! No network, file or time access here (section 2) - the caller supplies everything.
 #![forbid(unsafe_code)]
 // coding_guideline.md section 15: no floating-point arithmetic in a crate with money logic.
 #![deny(clippy::float_arithmetic)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
 
 use core_types::Quantity;
+
+pub mod entry;
+pub use entry::{check_entry, daily_loss_reached, EntryLimits, EntryRejection, EntryState};
 
 /// Configured limits a proposed order is checked against before it may be sent.
 #[derive(Debug, Clone, Copy)]

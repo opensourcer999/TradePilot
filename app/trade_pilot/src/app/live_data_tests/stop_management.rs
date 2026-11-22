@@ -562,3 +562,98 @@ fn an_entry_refused_for_margin_is_not_sent_again_when_switched_off() {
     app.margin_retry_tick(app.clock.instant());
     assert!(sent_orders(&drain(&commands)).is_empty());
 }
+
+#[test]
+fn the_stops_of_both_sides_of_one_order_are_converted_in_the_same_look() {
+    let (mut app, commands) = put_spread_with_a_vertical_stop();
+    with_a_second_side(&mut app);
+    if let Some(adjustments) = app.trades_stored[1].adjustments.as_mut() {
+        adjustments.legs = vec![(102, 1, false), (103, 1, true)];
+    }
+    app.settings.convert_flags.convert_vertical_to_short_enabled = true;
+    app.settings.convert_vertical_to_short_price = "0.05".into();
+    let put_stop = app.trades_stored[0].stop_order_id.unwrap();
+    quote_leg(&mut app, 101, 0.05, 0.10);
+    quote_leg(&mut app, 103, 0.05, 0.10);
+    look(&mut app);
+    assert_eq!(cancelled_orders(&drain(&commands)), [put_stop, 21], "one side's conversion does not hold up the other's");
+}
+
+/// The test app with its chain and template, ready to enter the template trade #4 (SPX), with the risk limits `limits`
+/// (contracts per symbol, daily loss, orders per minute).
+fn app_ready_to_enter(limits: (&str, &str, &str)) -> (App, mpsc::Receiver<TwsCommand>) {
+    let (dte, expiry) = next_expiry();
+    let (mut app, commands) = app_with_a_chain_and_a_template(&expiry, dte);
+    app.settings.risk_max_contracts_per_symbol = limits.0.into();
+    app.settings.risk_max_daily_loss = limits.1.into();
+    app.settings.risk_max_orders_per_minute = limits.2.into();
+    app.instant.template_id = Some(4);
+    app.instant.template_qty = "1".into();
+    app.template_order_flags.instant_template_transmit = true;
+    app.instant.account = "DU1234567".into();
+    (app, commands)
+}
+
+/// Enters the template trade; whether an opening order went out.
+fn enter(app: &mut App) -> bool {
+    let before = app.template.orders.len();
+    app.enter_template_trade();
+    app.confirm_template_order();
+    app.template.orders.len() > before
+}
+
+#[test]
+fn a_new_position_beyond_the_contracts_of_its_symbol_is_refused() {
+    let (mut app, _commands) = app_ready_to_enter(("2", "0", "0"));
+    app.trades_stored.push(StoredTrade { symbol: "SPX".into(), qty: 2, ..stored_put_spread() });
+    assert!(!enter(&mut app), "2 open + 1 new is more than 2");
+    assert!(app.log_lines.iter().any(|line| line.contains("risk check: SPX x1 refused") && line.contains("limit of 2")), "{:?}", app.log_lines);
+    let (mut app, _commands) = app_ready_to_enter(("3", "0", "0"));
+    app.trades_stored.push(StoredTrade { symbol: "SPX".into(), qty: 2, ..stored_put_spread() });
+    assert!(enter(&mut app), "2 open + 1 new is within 3");
+}
+
+#[test]
+fn after_the_daily_loss_limit_no_new_position_is_opened_for_the_rest_of_the_day() {
+    let (mut app, _commands) = app_ready_to_enter(("0", "1000", "0"));
+    app.trades_stored.push(StoredTrade { day: "2026-11-16".into(), status: "Closed".into(), price_close: Some(Decimal::new(-700, 2)), ..stored_put_spread() });
+    app.refresh_trades(app.clock.instant(), true);
+    assert!(!enter(&mut app), "a loss of 1,200 (2 contracts: 1.00 in, 7.00 out) reaches the limit of 1,000");
+    // The loss is made good again: the day stays closed for new positions.
+    app.trades_stored.clear();
+    app.refresh_trades(app.clock.instant(), true);
+    assert!(!enter(&mut app), "no new position for the rest of the day");
+    assert_eq!(app.watch.loss_stop_day.as_deref(), Some(app.clock.new_york_today().as_str()));
+}
+
+#[test]
+fn more_new_orders_in_a_minute_than_the_limit_are_refused_and_counted_again_a_minute_later() {
+    let (mut app, _commands) = app_ready_to_enter(("0", "0", "2"));
+    assert!(enter(&mut app));
+    assert!(enter(&mut app));
+    assert!(!enter(&mut app), "the third within a minute");
+    assert!(app.log_lines.iter().any(|line| line.contains("2 opening order(s) within the last minute")));
+    seconds_later(&mut app, 61);
+    // The quotes of the chain go on ticking meanwhile.
+    let now = app.clock.instant();
+    for contract in &mut app.chains.contracts {
+        contract.updated_at = Some(now);
+    }
+    if let Some(underlying) = app.chains.underlyings.first_mut() {
+        underlying.price_at = Some(now);
+    }
+    assert!(enter(&mut app), "a minute later the count starts afresh: {:?}", app.log_lines.iter().rev().take(3).collect::<Vec<_>>());
+}
+
+#[test]
+fn an_instant_order_that_closes_a_trade_is_never_held_up_by_the_risk_limits() {
+    let (mut app, _commands) = app_ready_to_enter(("1", "0", "0"));
+    let trade = StoredTrade { symbol: "SPX".into(), qty: 5, ..stored_put_spread() };
+    app.trades_stored.push(trade.clone());
+    let mut contract = IbContract { symbol: "SPX".into(), sec_type: "OPT".into(), right: "P".into(), strike: 6650.0, ..IbContract::default() };
+    contract.last_trade_date_or_contract_month = trade.expiry.clone();
+    assert!(app.instant_order_closes(&contract, "BUY", "DU1234567"), "buying back the short of the trade");
+    contract.strike = 6640.0;
+    assert!(app.instant_order_closes(&contract, "SELL", "DU1234567"), "selling its long");
+    assert!(!app.instant_order_closes(&contract, "BUY", "DU1234567"), "buying more of the long opens");
+}

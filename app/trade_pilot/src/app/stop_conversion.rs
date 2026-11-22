@@ -94,7 +94,7 @@ pub(super) fn before_time_of_day(now: chrono::NaiveTime, at: (i32, i32)) -> bool
 
 /// The price typed for "Convert Vertical to Short": a number from 0 up (a comma taken as the decimal point).
 pub(super) fn conversion_price(text: &str) -> Option<Decimal> {
-    text.trim().replace(',', ".").parse::<Decimal>().ok().filter(|price| *price >= Decimal::ZERO)
+    crate::pricing::parse_decimal(text).filter(|price| *price >= Decimal::ZERO)
 }
 
 impl App {
@@ -138,12 +138,12 @@ impl App {
                 && trade.custom_legs.is_none()
                 && trade.close_order_id.is_none()
                 && !adjustments.replace_pending
-                && !self.split_started(trade.order_id)
+                && !self.split_started(&trade)
                 && adjustments.rel.is_none()
                 && !adjustments.legs.is_empty()
                 && (trade.stop_order_id.is_some() || trade.stop_limit_order_id.is_some())
                 && trade_exit::StopOrderType::parse(&adjustments.order_type).is_some_and(|kind| kind != trade_exit::StopOrderType::None);
-            if !convertible || self.watch.conversion_tried.get(&trade.order_id).is_some_and(|at| instant.saturating_duration_since(*at) < CONVERSION_RETRY) {
+            if !convertible || self.watch.conversion_tried.get(&trade.key()).is_some_and(|at| instant.saturating_duration_since(*at) < CONVERSION_RETRY) {
                 continue;
             }
             let rules = self.conversion_rules(&trade.expiry, now);
@@ -154,7 +154,7 @@ impl App {
                 chain_quote(chains, con_id).filter(|q| q.ask.is_some() || q.bid >= Decimal::ZERO).map(|q| Some(q.bid).filter(|bid| *bid >= Decimal::ZERO))
             };
             let Some((legs, reason)) = converted_legs(&adjustments.legs, &wanted, &quote, rules) else { continue };
-            self.watch.conversion_tried.insert(trade.order_id, instant);
+            self.watch.conversion_tried.insert(trade.key(), instant);
             self.start_stop_conversion(index, &trade, legs, reason);
         }
     }

@@ -69,6 +69,11 @@ impl App {
             self.schedule_order_ended(run_id, "Cancelled");
             return;
         };
+        if let Err(reason) = self.check_entry_risk(&entry.symbol, entry.qty) {
+            self.log(&format!("Entry {old_id} NOT sent again after the margin rejection: risk limit - {reason}"));
+            self.schedule_order_ended(run_id, "Cancelled");
+            return;
+        }
         self.next_order_id = Some(order_id + 1);
         order.lmt_price = wire;
         order.order_ref = crate::trade_rebuild::order_ref(order_id, "");
@@ -81,7 +86,8 @@ impl App {
             self.schedule_order_ended(run_id, "Cancelled");
             return;
         }
-        let fill = FillAttempts { template: source, contract, order, limit, attempt: 1, next_tick: None, finished: false };
+        self.count_entry_sent();
+        let fill = FillAttempts { template: source, contract, order, limit, attempt: 1, next_tick: None, finished: false, partly_filled: false };
         self.template.orders.push(SentTemplateOrder {
             order_id,
             account,

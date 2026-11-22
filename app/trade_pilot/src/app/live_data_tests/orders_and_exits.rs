@@ -584,37 +584,59 @@ fn an_adjustment_to_none_removes_the_stop_and_keeps_the_target() {
 }
 
 #[test]
-fn a_refused_stop_limit_is_placed_again_with_a_smaller_limit_offset_until_tws_takes_it() {
+fn a_refused_stop_limit_far_beyond_its_stop_is_placed_again_with_an_offset_ten_percent_smaller() {
+    let (mut app, commands, limit_id, stop) = filled_trade_with_a_limit_stop(0.50);
+    // The limit 1.40 lies 56 % beyond the stop 0.90: the offset becomes 0.45.
+    app.tws_sender.send(TwsEvent::RequestError { req_id: limit_id, code: 201, message: TOO_FAR.into() }).unwrap();
+    app.poll_tws();
+    let again = placed_orders(&drain(&commands));
+    let (new_id, retry) = again.iter().find(|(_, order)| order.order_type == "STP LMT").cloned().expect("it is placed again");
+    assert_ne!(new_id, limit_id);
+    assert!((retry.lmt_price - (stop + 0.45)).abs() < 1e-9, "{} after {stop}", retry.lmt_price);
+    assert_eq!(app.trades_stored.first().unwrap().stop_limit_order_id, Some(new_id), "the trade follows the new order");
+    // Another refusal of a different order, another kind of error or a refusal for margin does nothing.
+    app.tws_sender.send(TwsEvent::RequestError { req_id: 999, code: 201, message: TOO_FAR.into() }).unwrap();
+    app.tws_sender.send(TwsEvent::RequestError { req_id: new_id, code: 2104, message: "farm connection is OK".into() }).unwrap();
+    app.tws_sender.send(TwsEvent::RequestError { req_id: new_id, code: 201, message: "Order rejected - reason: insufficient margin".into() }).unwrap();
+    app.poll_tws();
+    assert!(placed_orders(&drain(&commands)).iter().all(|(_, order)| order.order_type != "STP LMT"), "no new stop-limit");
+}
+
+#[test]
+fn a_refused_stop_limit_close_to_its_stop_becomes_a_market_stop_so_the_trade_keeps_a_stop() {
+    let (mut app, commands, limit_id, stop) = filled_trade_with_a_limit_stop(0.10);
+    // The limit 1.00 lies only 11 % beyond the stop 0.90.
+    app.tws_sender.send(TwsEvent::RequestError { req_id: limit_id, code: 201, message: TOO_FAR.into() }).unwrap();
+    app.poll_tws();
+    let placed = placed_orders(&drain(&commands));
+    let (market_id, market) = placed.iter().find(|(_, order)| order.order_type == "STP").cloned().expect("a market stop is placed");
+    assert_eq!(market.aux_price, stop, "at the same stop price");
+    let trade = app.trades_stored.first().unwrap();
+    assert_eq!((trade.stop_order_id, trade.stop_limit_order_id), (Some(market_id), None));
+    assert!(app.log_lines.iter().any(|line| line.contains("placing a market stop")));
+}
+
+/// The message of TWS for a stop-limit whose limit lies too far through its stop price.
+const TOO_FAR: &str = "Order rejected - reason:The limit price is too far through the Stop Price";
+
+/// Order #10 filled at a 0.30 credit with a `Limit stop` at 0.90 and the limit `offset` beyond it; the stop-limit, its id and the stop.
+fn filled_trade_with_a_limit_stop(offset: f64) -> (App, mpsc::Receiver<TwsCommand>, i32, f64) {
     let (mut app, commands) = app_with_a_sent_template_order(true);
     {
         let template = &mut app.template.orders.first_mut().unwrap().template;
         template.stop_type = "Short".into();
         template.stop_multiple = 2.0;
         template.stop_order_type = "Limit stop".into();
-        template.stop_limit_offset = Some(0.20);
+        template.stop_limit_offset = Some(offset);
     }
-    app.templates.first_mut().unwrap().stop_limit_offset = Some(0.20);
+    app.templates.first_mut().unwrap().stop_limit_offset = Some(offset);
     drain(&commands);
     app.tws_sender.send(TwsEvent::OrderStatus { order_id: 10, status: "Filled".into(), filled: 1.0, remaining: 0.0, avg_fill_price: -0.3 }).unwrap();
     app.poll_tws();
     let first = placed_orders(&drain(&commands));
     let (limit_id, limit) = first.iter().find(|(_, order)| order.order_type == "STP LMT").cloned().expect("the stop-limit is placed");
-    let stop = limit.aux_price;
-    assert!((limit.lmt_price - (stop + 0.20)).abs() < 1e-9, "{} after {stop}", limit.lmt_price);
-    assert_eq!(app.trades_stored.first().unwrap().stop_limit_order_id, Some(limit_id));
-    // TWS refuses it: it goes out again 0.05 closer, as a new order.
-    app.tws_sender.send(TwsEvent::RequestError { req_id: limit_id, code: 201, message: "Order rejected - limit too far from the market".into() }).unwrap();
-    app.poll_tws();
-    let again = placed_orders(&drain(&commands));
-    let (new_id, retry) = again.iter().find(|(_, order)| order.order_type == "STP LMT").cloned().expect("it is placed again");
-    assert_ne!(new_id, limit_id);
-    assert!((retry.lmt_price - (stop + 0.15)).abs() < 1e-9, "{} after {stop}", retry.lmt_price);
-    assert_eq!(app.trades_stored.first().unwrap().stop_limit_order_id, Some(new_id), "the trade follows the new order");
-    // Another refusal of a different order, or another kind of error, does nothing.
-    app.tws_sender.send(TwsEvent::RequestError { req_id: 999, code: 201, message: "rejected".into() }).unwrap();
-    app.tws_sender.send(TwsEvent::RequestError { req_id: new_id, code: 2104, message: "farm connection is OK".into() }).unwrap();
-    app.poll_tws();
-    assert!(placed_orders(&drain(&commands)).is_empty());
+    assert!((limit.lmt_price - (limit.aux_price + offset)).abs() < 1e-9, "{} after {}", limit.lmt_price, limit.aux_price);
+    (app, commands, limit_id, limit.aux_price)
 }
 
 #[test]
@@ -1072,4 +1094,146 @@ fn a_filled_stop_ends_the_trade_as_stopped_at_the_fill_price() {
     assert_eq!((record.status, record.current_profit), (TradeStatus::Stopped, Decimal::from(-60)));
     assert!(app.log_lines.iter().any(|l| l.contains("Trade stopped")));
     assert!(!app.log_lines.iter().any(|l| l.contains("WARNING")), "the sibling's cancel is expected");
+}
+
+#[test]
+fn an_entry_that_ends_partly_filled_is_recorded_for_the_filled_contracts_with_its_stop() {
+    let (mut app, commands) = app_with_a_sent_template_order_of(true, "3");
+    {
+        let template = &mut app.template.orders.first_mut().unwrap().template;
+        template.stop_type = "Short".into();
+        template.stop_multiple = 2.0;
+        template.stop_order_type = "Market stop".into();
+    }
+    drain(&commands);
+    // 2 of the 3 combos filled, then the fill attempts (or the person in TWS) cancelled the rest.
+    app.tws_sender.send(TwsEvent::OrderStatus { order_id: 10, status: "Cancelled".into(), filled: 2.0, remaining: 1.0, avg_fill_price: -0.3 }).unwrap();
+    app.poll_tws();
+    let trade = app.trades_stored.last().expect("the filled contracts are a trade");
+    assert_eq!((trade.order_id, trade.qty, trade.price_open), (10, 2, Decimal::new(3, 1)));
+    let stop = trade.stop_order_id.expect("it gets its stop");
+    let placed = placed_orders(&drain(&commands));
+    let (_, stop_order) = placed.iter().find(|(id, _)| *id == stop).expect("the stop was sent");
+    assert_eq!(stop_order.total_quantity, 2.0, "the stop covers the filled contracts");
+    assert!(app.log_lines.iter().any(|line| line.contains("with 2 of 3 filled")), "{:?}", app.log_lines);
+}
+
+#[test]
+fn an_entry_that_ends_without_any_fill_records_nothing() {
+    let (mut app, commands) = app_with_a_sent_template_order_of(true, "3");
+    drain(&commands);
+    app.tws_sender.send(TwsEvent::OrderStatus { order_id: 10, status: "Cancelled".into(), filled: 0.0, remaining: 3.0, avg_fill_price: 0.0 }).unwrap();
+    app.poll_tws();
+    assert_eq!(app.trades_stored.len(), 0);
+    assert!(placed_orders(&drain(&commands)).is_empty());
+}
+
+/// An open `PutDebitSpread` (6690 bought, 6680 sold, entered for 1.00) on the chain of the test app: closing it brings 0.20 at the bid
+/// and 0.40 at the ask.
+fn app_with_a_debit_spread(timed_exit: Option<crate::storage::TimedExit>) -> (App, mpsc::Receiver<TwsCommand>) {
+    let (dte, expiry) = next_expiry();
+    let (mut app, commands) = app_with_a_chain_and_a_template(&expiry, dte);
+    app.trades_stored = vec![StoredTrade {
+        day: "2026-11-16".into(),
+        trade_type: "PutDebitSpread".into(),
+        strikes: "6690/6680 P".into(),
+        order_id: 40,
+        qty: 1,
+        price_open: Decimal::new(-100, 2),
+        long_put: Some(StoredLeg { con_id: 100, strike: "6690".into() }),
+        short_put: Some(StoredLeg { con_id: 101, strike: "6680".into() }),
+        expiry,
+        timed_exit,
+        ..stored_put_spread()
+    }];
+    drain(&commands);
+    (app, commands)
+}
+
+#[test]
+fn a_debit_combo_is_closed_by_buying_its_legs_the_other_way_round_for_what_it_brings() {
+    let (mut app, commands) = app_with_a_debit_spread(None);
+    assert_eq!(app.closing_price(&app.trades_stored[0].clone()), Some(Decimal::new(20, 2)), "what closing brings: the bid");
+    let id = app.place_close_order(0, Some(Decimal::new(20, 2))).expect("a debit combo can be closed");
+    let sent = drain(&commands);
+    let (contract, order) = sent
+        .iter()
+        .find_map(|c| {
+            if let TwsCommand::PlaceOrder { order_id, contract, order } = c {
+                (*order_id == id).then_some((contract.clone(), (**order).clone()))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!((order.action.as_str(), order.order_type.as_str(), order.lmt_price), ("BUY", "LMT", -0.2), "a credit of 0.20");
+    let legs: Vec<(i32, String)> = contract.combo_legs.iter().map(|leg| (leg.con_id, leg.action.clone())).collect();
+    assert_eq!(legs, [(100, "SELL".to_string()), (101, "BUY".to_string())], "the long is sold, the short bought back");
+    // TWS reports the fill of a credit combo with its sign: -0.20 brought 0.20.
+    fill(&mut app, id, 1.0, -0.2);
+    let trade = &app.trades_stored[0];
+    assert_eq!((trade.status.as_str(), trade.price_close), ("Closed", Some(Decimal::new(2, 1))));
+    let market = app_with_a_debit_spread(None);
+    let (mut app, commands) = market;
+    app.place_close_order(0, None).expect("at market too");
+    assert!(drain(&commands).iter().any(|c| matches!(c, TwsCommand::PlaceOrder { order, .. } if order.order_type == "MKT" && order.action == "BUY")));
+}
+
+#[test]
+fn the_timed_limit_exit_of_a_debit_combo_starts_in_the_middle_and_moves_down_towards_the_bid() {
+    let exit = crate::storage::TimedExit { at: "2026-11-16 11:30".into(), limit: true };
+    let (mut app, commands) = app_with_a_debit_spread(Some(exit));
+    at_new_york(&mut app, 11, 31, 0);
+    app.check_timed_exits(app.clock.new_york());
+    let sent = orders_sent_now(&commands);
+    assert_eq!(sent.iter().map(|(_, order)| order.lmt_price).collect::<Vec<_>>(), [-0.3], "the middle of 0.20 and 0.40, as a credit");
+    let key = app.trades_stored[0].key();
+    let state = app.watch.progressive_close.get_mut(&key).unwrap();
+    state.moved = state.moved.checked_sub(Duration::from_secs(4)).unwrap();
+    app.check_timed_exits(app.clock.new_york());
+    assert_eq!(orders_sent_now(&commands).iter().map(|(_, order)| order.lmt_price).collect::<Vec<_>>(), [-0.25], "one step towards the bid: less");
+}
+
+/// Order #10 for 2 contracts, sent by a schedule run (`scheduled`) or by hand, whose template's Min Entry Price is its own limit: the
+/// next fill step would go below it. Returns the limit as sent.
+fn entry_at_its_min_entry_price(scheduled: bool) -> (App, mpsc::Receiver<TwsCommand>, f64) {
+    let (mut app, commands) = app_with_a_sent_template_order_of(true, "2");
+    let sent = app.template.orders.first_mut().unwrap();
+    if scheduled {
+        sent.run_id = Some(1);
+    }
+    let fill = sent.fill.as_mut().unwrap();
+    let limit = fill.order.lmt_price;
+    fill.template.min_entry_price = limit.abs();
+    drain(&commands);
+    app.tws_sender.send(order_status(10, "Submitted", 0.0, 2.0)).unwrap();
+    app.poll_tws();
+    (app, commands, limit)
+}
+
+fn next_fill_tick(app: &mut App) {
+    let later = app.clock.instant() + Duration::from_secs(60);
+    app.fill_tick(0, later);
+}
+
+#[test]
+fn a_scheduled_entry_filled_in_part_moves_its_rest_on_beyond_the_min_entry_price() {
+    let (mut app, commands, limit) = entry_at_its_min_entry_price(true);
+    next_fill_tick(&mut app);
+    assert_eq!(placed_limits(&drain(&commands)), [limit], "nothing filled yet: the limit stays at the Min Entry Price");
+    app.tws_sender.send(order_status(10, "Submitted", 1.0, 1.0)).unwrap();
+    app.poll_tws();
+    next_fill_tick(&mut app);
+    let moved = placed_limits(&drain(&commands));
+    assert_eq!(moved.len(), 1);
+    assert!(moved[0].abs() < limit.abs(), "one contract filled: the rest moves on ({} after {limit})", moved[0]);
+}
+
+#[test]
+fn an_entry_by_hand_filled_in_part_keeps_to_the_min_entry_price() {
+    let (mut app, commands, limit) = entry_at_its_min_entry_price(false);
+    app.tws_sender.send(order_status(10, "Submitted", 1.0, 1.0)).unwrap();
+    app.poll_tws();
+    next_fill_tick(&mut app);
+    assert_eq!(placed_limits(&drain(&commands)), [limit], "not a scheduled entry: the limit stays");
 }

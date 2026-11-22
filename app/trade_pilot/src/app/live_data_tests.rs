@@ -11,6 +11,7 @@ mod market_data_and_connection;
 mod orders_and_exits;
 mod reports_mails_and_closing;
 mod schedules;
+mod sibling_trades;
 mod stop_management;
 mod template_entry_and_valuation;
 mod timed_exits_and_conditions;
@@ -820,5 +821,46 @@ fn stored_put_spread() -> StoredTrade {
         profit_cancel: None,
         origin: None,
         custom_legs: None,
+    }
+}
+
+/// Adds the call side of the same opening order to the filled put spread of the app (as the second trade of an `IronCondor`):
+/// `CallSpread 6710/6720 C`, stop #21, target #22, with live quotes (closing it costs 0.60 at the ask, brings 0.40 at the bid).
+fn with_a_second_side(app: &mut App) {
+    let first = app.trades_stored.first().unwrap().clone();
+    app.chains.contracts.push(spx_call_quote(102, 6710.0, &first.expiry, 0.90, 1.00));
+    app.chains.contracts.push(spx_call_quote(103, 6720.0, &first.expiry, 0.40, 0.50));
+    let mut call = first;
+    call.trade_type = "CallSpread".into();
+    call.strikes = "6710/6720 C".into();
+    call.short_put = None;
+    call.long_put = None;
+    call.short_call = Some(StoredLeg { con_id: 102, strike: "6710".into() });
+    call.long_call = Some(StoredLeg { con_id: 103, strike: "6720".into() });
+    call.stop_order_id = Some(21);
+    call.profit_order_id = Some(22);
+    call.stop_limit_order_id = None;
+    call.oca_group = Some("TradePilot-21".into());
+    call.stop_price = Some(Decimal::new(250, 2));
+    call.profit_price = Some(Decimal::new(10, 2));
+    call.adjustments = call.adjustments.map(|a| StopAdjustments { stop: Some("2.5".into()), legs: vec![(102, 1, false)], ..a });
+    app.trades_stored.push(call);
+    app.next_order_id = Some(app.next_order_id.unwrap_or(30).max(30));
+}
+
+fn spx_call_quote(con_id: i32, strike: f64, expiry: &str, bid: f64, ask: f64) -> crate::option_chain::OptionContract {
+    crate::option_chain::OptionContract {
+        con_id,
+        symbol: "SPX".into(),
+        right: "C".into(),
+        strike,
+        expiry: expiry.to_string(),
+        local_symbol: String::new(),
+        req_id: Some(500 + con_id),
+        bid: Some(bid),
+        ask: Some(ask),
+        delta: Some(0.15),
+        updated: None,
+        updated_at: Some(Instant::now()),
     }
 }

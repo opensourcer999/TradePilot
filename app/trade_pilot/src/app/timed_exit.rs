@@ -69,24 +69,21 @@ impl App {
         let now = self.clock.instant();
         if let Some(close_id) = trade.close_order_id {
             let waited_too_long = self.watch.timed_limit_sent.get(&close_id).is_some_and(|sent| now.saturating_duration_since(*sent) >= LIMIT_WAIT);
-            if waited_too_long && !self.watch.timed_market.contains(&trade.order_id) {
-                self.log(&format!(
-                    "Timed exit of {} {} {}: the limit order {close_id} did not fill - cancelling it, a market order follows",
-                    trade.symbol, trade.trade_type, trade.strikes
-                ));
-                self.watch.timed_market.insert(trade.order_id);
+            if waited_too_long && !self.watch.timed_market.contains(&trade.key()) {
+                self.log(&format!("Timed exit of {}: the limit order {close_id} did not fill - cancelling it, a market order follows", trade.label()));
+                self.watch.timed_market.insert(trade.key());
                 let _logged = self.submit_cancel(close_id);
             } else if !waited_too_long {
                 self.step_progressive_close(index, trade, close_id);
             }
             return;
         }
-        if self.watch.timed_tried.get(&trade.order_id).is_some_and(|at| now.saturating_duration_since(*at) < RETRY) {
+        if self.watch.timed_tried.get(&trade.key()).is_some_and(|at| now.saturating_duration_since(*at) < RETRY) {
             return;
         }
-        self.watch.timed_tried.insert(trade.order_id, now);
+        self.watch.timed_tried.insert(trade.key(), now);
         let (ask, bid) = self.closing_quotes(trade);
-        let market = !exit.limit || self.watch.timed_market.contains(&trade.order_id) || (ask.is_none() && late >= NO_QUOTE_WAIT);
+        let market = !exit.limit || self.watch.timed_market.contains(&trade.key()) || (ask.is_none() && late >= NO_QUOTE_WAIT);
         if !market && ask.is_none() {
             return; // a limit close waits for a quote
         }
@@ -94,14 +91,14 @@ impl App {
         let limit = if market { None } else { ask.map(|ask| mid_price(ask, bid)) };
         match self.place_close_order(index, limit) {
             Ok(order_id) => {
-                self.log(&format!("Timed exit of {} {} {}: close order {order_id} sent", trade.symbol, trade.trade_type, trade.strikes));
+                self.log(&format!("Timed exit of {}: close order {order_id} sent", trade.label()));
                 if let Some(price) = limit {
                     self.watch.timed_limit_sent.insert(order_id, now);
                     let fixed = crate::pricing::fix_price(price, &trade.symbol, crate::trade_exit::close_legs(trade).len()).unwrap_or(price);
-                    self.watch.progressive_close.insert(trade.order_id, ProgressiveClose { price: fixed, step: 0, moved: now });
+                    self.watch.progressive_close.insert(trade.key(), ProgressiveClose { price: fixed, step: 0, moved: now });
                 }
             }
-            Err(reason) => self.log(&format!("Timed exit of {} {} {} not placed yet: {reason}", trade.symbol, trade.trade_type, trade.strikes)),
+            Err(reason) => self.log(&format!("Timed exit of {} not placed yet: {reason}", trade.label())),
         }
     }
 
@@ -109,12 +106,12 @@ impl App {
     /// close that pays goes up towards the ask, a close that sells goes down towards the bid, never beyond it.
     fn step_progressive_close(&mut self, index: usize, trade: &StoredTrade, close_id: i32) {
         let now = self.clock.instant();
-        let Some(state) = self.watch.progressive_close.get(&trade.order_id).cloned() else { return };
+        let Some(state) = self.watch.progressive_close.get(&trade.key()).cloned() else { return };
         if now.saturating_duration_since(state.moved) < STEP_EVERY {
             return;
         }
         let (ask, bid) = self.closing_quotes(trade);
-        let sells = crate::trade_exit::closes_by_selling(trade);
+        let sells = crate::trade_exit::close_receives(trade);
         let far = if sells { bid } else { ask };
         let Some(far) = far else { return };
         let step = state.step.saturating_add(1);
@@ -122,11 +119,11 @@ impl App {
         let next = crate::pricing::fix_price(wanted, &trade.symbol, crate::trade_exit::close_legs(trade).len()).unwrap_or(wanted);
         if next != state.price {
             if let Err(reason) = self.move_close_limit(index, close_id, next) {
-                self.log(&format!("Timed exit of {} {} {}: the close price could not be moved: {reason}", trade.symbol, trade.trade_type, trade.strikes));
+                self.log(&format!("Timed exit of {}: the close price could not be moved: {reason}", trade.label()));
                 return;
             }
         }
-        self.watch.progressive_close.insert(trade.order_id, ProgressiveClose { price: next, step, moved: now });
+        self.watch.progressive_close.insert(trade.key(), ProgressiveClose { price: next, step, moved: now });
     }
 }
 
@@ -180,7 +177,7 @@ impl App {
                 }
                 continue;
             }
-            self.log(&format!("Cancel expired profit target of {} {} {}: orders {ids:?}", trade.symbol, trade.trade_type, trade.strikes));
+            self.log(&format!("Cancel expired profit target of {}: orders {ids:?}", trade.label()));
             for id in ids {
                 if self.submit_cancel(id).is_ok() {
                     self.watch.user_cancelled.insert(id);

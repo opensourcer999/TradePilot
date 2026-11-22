@@ -73,7 +73,7 @@ impl App {
         let Some(trade) = self.trades_stored.get(pending.index).filter(|t| t.is_open()).cloned() else {
             return;
         };
-        let price = pending.price.trim().replace(',', ".").parse::<Decimal>().ok().filter(|p| *p >= Decimal::ZERO);
+        let price = crate::pricing::parse_decimal(&pending.price).filter(|p| *p >= Decimal::ZERO);
         if pending.kind == CloseKind::Mark {
             self.mark_closed(pending.index, &trade, price);
             return;
@@ -102,17 +102,14 @@ impl App {
     /// joins the OCA group of the trade's exit orders. An error says why it cannot be built.
     fn close_order_parts(trade: &StoredTrade, order_id: i32, limit: Option<Decimal>) -> Result<(IbContract, IbOrder, f64), String> {
         let legs = trade_exit::close_legs(trade);
-        if trade.price_open <= Decimal::ZERO && legs.len() > 1 && trade.custom_legs.is_none() {
-            return Err("closing a debit combo is not supported yet - close it in TWS and use Mark Closed".to_string());
-        }
         let contract = trade_exit::exit_contract(trade, &legs)
             .ok_or_else(|| "the closing order cannot be built (legs missing - a trade from before V0.97?)".to_string())?;
         let limit_price = match limit {
             Some(raw) => {
                 let fixed = fix_price(raw, &trade.symbol, legs.len()).ok_or_else(|| "the limit price cannot be computed".to_string())?;
-                // A custom combo bought as a debit is closed by buying its legs the other way round for a credit: the typed price is what it
-                // brings, so the limit of the BUY combo is negative. Any other close pays the typed price.
-                let receives = trade.custom_legs.is_some() && trade.price_open < Decimal::ZERO && legs.len() > 1;
+                // A combo bought as a debit is closed by buying its legs the other way round for a credit: the typed price is what it
+                // brings, so the limit of the BUY combo is negative. Any other close pays the typed price (a single long is sold at it).
+                let receives = trade.price_open < Decimal::ZERO && legs.len() > 1;
                 let sent = if receives { -fixed } else { fixed };
                 sent.to_f64().ok_or_else(|| "the limit price cannot be sent".to_string())?
             }
@@ -143,7 +140,7 @@ impl App {
     pub(super) fn move_close_limit(&mut self, index: usize, order_id: i32, limit: Decimal) -> Result<(), String> {
         let trade = self.trades_stored.get(index).filter(|t| t.is_open()).cloned().ok_or_else(|| "the trade is not open".to_string())?;
         let (contract, order, limit_price) = Self::close_order_parts(&trade, order_id, Some(limit))?;
-        self.log(&format!("Adjust {order_id} close price to {limit_price} ({} {} {})", trade.symbol, trade.trade_type, trade.strikes));
+        self.log(&format!("Adjust {order_id} close price to {limit_price} ({})", trade.label()));
         self.submit_order(order_id, contract, order).map_err(|reason| reason.to_string())
     }
 
@@ -313,10 +310,7 @@ impl App {
         let what = if stop { self.tr("the stop", "den Stop") } else { self.tr("the profit target", "das Profit Target") };
         let warning = if stop { self.tr("The trade then has no stop.", "Der Trade hat dann keinen Stop.") } else { "" };
         ui.horizontal(|ui| {
-            ui.colored_label(
-                RED,
-                format!("{} {what} {} {} {} {}? {warning}", self.tr("Delete", "Löschen:"), self.tr("of", "von"), trade.symbol, trade.trade_type, trade.strikes),
-            );
+            ui.colored_label(RED, format!("{} {what} {} {}? {warning}", self.tr("Delete", "Löschen:"), self.tr("of", "von"), trade.label()));
             if ui.add(crate::widgets::MetalButton::new(self.tr("Yes, delete", "Ja, löschen"))).clicked() {
                 self.watch.delete_asked = None;
                 self.delete_exit_orders(index, stop);

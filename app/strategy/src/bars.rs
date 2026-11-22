@@ -2,7 +2,7 @@
 //! averages, the RSI, and the rank and percentile of the VIX. Plain logic on values, no connection.
 //!
 //! The one-minute bars of a symbol and the daily bars of the SPX are streamed by TWS (the last bar is the one still
-//! forming). The averages of the one-minute bars leave the forming bar out, as the reference does; the daily
+//! forming). The averages of the one-minute bars leave the forming bar out, so a value does not change within the minute; the daily
 //! values take every bar.
 
 use rust_decimal::prelude::ToPrimitive;

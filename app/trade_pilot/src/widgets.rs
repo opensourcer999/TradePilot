@@ -1451,7 +1451,7 @@ pub fn help_card(ui: &mut egui::Ui, kicker: &str, title: &str, text: &str, close
                 ui.label(RichText::new(title).size(17.0).strong().color(text_primary()));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                if ui.add(egui::Button::new(RichText::new("\u{2715}").size(13.0).color(muted_text())).frame(false)).clicked() {
+                if ui.add(egui::Button::new(RichText::new("\u{d7}").size(18.0).color(muted_text())).frame(false)).clicked() {
                     closed = true;
                 }
             });

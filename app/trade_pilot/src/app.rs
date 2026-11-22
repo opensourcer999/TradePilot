@@ -6,6 +6,7 @@ mod custom_trade;
 mod dashboard;
 mod demo;
 mod early_exit;
+mod entry_risk;
 mod housekeeping;
 mod indicators;
 mod instant_order;
@@ -326,6 +327,8 @@ struct FillAttempts {
     next_tick: Option<Instant>,
     /// Filled, cancelled or given up: nothing more to do.
     finished: bool,
+    /// TWS has reported a part of the order filled.
+    partly_filled: bool,
 }
 
 /// What the app knows of its TWS session: the stop flag of the connection thread, status texts,
@@ -349,6 +352,8 @@ struct TwsSession {
     last_price_tick_at: Option<Instant>,
     /// ... and TWS's last market-data error for one of this app's subscriptions.
     market_data_error: Option<String>,
+    /// TWS refused the quotes of the ETF of the SPX estimate (no permission, say): the estimate is off for this session.
+    estimate_refused: bool,
     /// Live-price farms TWS reported as broken (2103) and not yet OK again (2104).
     broken_data_farms: Vec<String>,
     /// Option lines TWS refused with 101 ("Max number of tickers has been reached"): TWS's own
@@ -374,6 +379,7 @@ impl TwsSession {
             connected_at: None,
             last_price_tick_at: None,
             market_data_error: None,
+            estimate_refused: false,
             broken_data_farms: Vec::new(),
             market_data_lines_refused: 0,
             account_is_paper: None,
@@ -834,6 +840,8 @@ pub struct App {
     /// Every execution seen so far (loaded from disk at start): TWS itself only keeps the
     /// current trading day, the trades are rebuilt from this history (`trade_rebuild`).
     exec_history: Vec<StoredExecution>,
+    /// The executions of `exec_history` by order, for the fees of the trades; built again once the executions have changed.
+    fee_index: std::cell::RefCell<FeeIndex>,
     /// The commission TWS charged per execution (`commissionReport`), by execution id, in dollars.
     commissions: std::collections::HashMap<String, Decimal>,
     /// All stored trades for the Trade Log report (refreshed after an import and on request).
@@ -983,6 +991,33 @@ pub struct QuoteRow {
 }
 
 impl QuoteRow {
+    /// A quote row of `label` just asked for under `req_id` at `now`: nothing known yet.
+    fn new(label: &str, req_id: i32, now: Instant) -> Self {
+        Self {
+            label: label.to_string(),
+            req_id,
+            bid: None,
+            ask: None,
+            last: None,
+            last_move: None,
+            bid_size: None,
+            ask_size: None,
+            last_size: None,
+            close: None,
+            open: None,
+            last_update: None,
+            acknowledged: false,
+            requested_at: now,
+            attempts: 1,
+            history_req_id: None,
+            history: None,
+            prev_close: None,
+            bars_req_id: None,
+            curve_req_id: None,
+            curve: Vec::new(),
+        }
+    }
+
     /// Yesterday's close: the one TWS ticks, else the last daily bar before today.
     fn reference_close(&self) -> Option<f64> {
         self.close.filter(|close| *close > 0.0).or(self.prev_close.filter(|close| *close > 0.0))
@@ -1113,6 +1148,9 @@ fn blank_saved_settings() -> PersistedSettings {
         translation_contact_email: String::new(),
         light_mode: false,
         daily_csv_export: false,
+        risk_max_contracts_per_symbol: String::new(),
+        risk_max_daily_loss: String::new(),
+        risk_max_orders_per_minute: String::new(),
         market_data_provider: String::new(),
         symbol_configs: Vec::new(),
         ticker_price_symbol: String::new(),
@@ -1213,6 +1251,9 @@ fn default_settings() -> PersistedSettings {
         translation_contact_email: String::new(),
         light_mode: false,
         daily_csv_export: false,
+        risk_max_contracts_per_symbol: "20".to_string(),
+        risk_max_daily_loss: "1000".to_string(),
+        risk_max_orders_per_minute: "10".to_string(),
         market_data_provider: "TWS".to_string(),
         symbol_configs: Vec::new(),
         ticker_price_symbol: String::new(),
@@ -1337,22 +1378,21 @@ struct EntrySelection {
 /// UI - a fixed, documented starting value rather than an unlimited one, until a real Settings field for this
 /// is designed.
 fn default_risk_limits() -> OrderRiskLimits {
-    // `expect` here falls under `coding_guideline.md` section 4's documented exception for
-    // main-initialization: this is only called once, from `App::new`, and 1000 is a compile-time-known
-    // positive literal that can never fail `Quantity::new`.
-    #[allow(clippy::expect_used)]
-    let max_quantity =
-        core_types::Quantity::new(rust_decimal::Decimal::from(1000)).expect("1000 is a fixed positive literal, so Quantity::new cannot fail here");
-    OrderRiskLimits { max_quantity }
+    OrderRiskLimits { max_quantity: core_types::Quantity::from_count(PAPER_MAX_ORDER_QUANTITY) }
 }
 
+/// The largest quantity one order may have on a paper account (contracts or combos).
+const PAPER_MAX_ORDER_QUANTITY: std::num::NonZeroU32 = match std::num::NonZeroU32::new(1000) {
+    Some(count) => count,
+    None => std::num::NonZeroU32::MIN,
+};
+
 /// The largest quantity one order may have on a live account (contracts or combos), for now.
-const LIVE_MAX_ORDER_QUANTITY: u32 = 1;
+const LIVE_MAX_ORDER_QUANTITY: std::num::NonZeroU32 = std::num::NonZeroU32::MIN;
 
 /// The limit for orders on a live account: `LIVE_MAX_ORDER_QUANTITY`, but never more than `paper`.
 fn live_risk_limits(paper: OrderRiskLimits) -> OrderRiskLimits {
-    let live = core_types::Quantity::new(rust_decimal::Decimal::from(LIVE_MAX_ORDER_QUANTITY)).unwrap_or(paper.max_quantity);
-    OrderRiskLimits { max_quantity: live.min(paper.max_quantity) }
+    OrderRiskLimits { max_quantity: core_types::Quantity::from_count(LIVE_MAX_ORDER_QUANTITY).min(paper.max_quantity) }
 }
 
 /// Small bits of what the person did on the screens that no page owns.
@@ -1445,6 +1485,15 @@ struct ScheduleState {
     group: u8,
     /// The import card.
     import: ImportCard,
+}
+
+/// The executions by order, and which list of executions it was made from (where it lies, how long it is, its last execution).
+#[derive(Default)]
+struct FeeIndex {
+    list: usize,
+    len: usize,
+    last: String,
+    index: crate::fees::ExecutionIndex,
 }
 
 /// The fields of the quote window of a symbol on the Settings page, as typed.
@@ -1587,6 +1636,7 @@ impl App {
             positions: Vec::new(),
             today_trades: Vec::new(),
             exec_history: if cfg!(test) { Vec::new() } else { executions_path(trading_live).map(|p| load_executions(&p)).unwrap_or_default() },
+            fee_index: std::cell::RefCell::default(),
             commissions: stored_commissions(trading_live),
             trade_log: if cfg!(test) { Vec::new() } else { trades_path(trading_live).map(|p| load_trades(&p)).unwrap_or_default() },
             window: WindowFlags { title_bar_colored: false, sidebar_expanded: true, exit_dialog_open: false },
@@ -2198,6 +2248,7 @@ impl App {
         self.session.last_price_tick_at = None;
         self.session.market_data_error = None;
         self.session.broken_data_farms.clear();
+        self.session.estimate_refused = false;
         self.account_summary.clear();
         self.loaded.account_summary_loaded = false;
         self.positions.clear();
@@ -2303,7 +2354,7 @@ impl App {
     fn on_order_status(&mut self, order_id: i32, status: String, filled: f64, remaining: f64, avg_fill_price: f64) {
         let role = self.order_role(order_id);
         self.debug(&format!("TWS orderStatus {order_id}: {status}, filled {filled}, remaining {remaining}, average price {avg_fill_price} - {role}"));
-        self.on_template_order_status(order_id, &status, remaining, avg_fill_price);
+        self.on_template_order_status(order_id, &status, filled, remaining, avg_fill_price);
         self.on_instant_order_status(order_id, &status, remaining, avg_fill_price);
         self.on_exit_order_status(order_id, &status, remaining, avg_fill_price);
         self.on_exit_change_status(order_id, &status);
@@ -2329,13 +2380,15 @@ impl App {
         }
         self.chains.lookup_finished(req_id);
         self.report_order_error(req_id, code, message);
-        self.retry_rejected_stop_limit(req_id, code);
+        self.retry_rejected_stop_limit(req_id, message);
         self.on_exit_change_error(req_id, code, message);
         // An error about the order just sent (TWS uses the order id as the id).
         if self.instant.last_order_id == Some(req_id) {
             self.instant.last_order_status = Some(format!("TWS {code}: {message}"));
         }
-        if code == TWS_TOO_MANY_TICKERS {
+        if self.on_estimate_quote_error(req_id, code, message) {
+            // Only the SPX estimate is affected; the other prices are fine.
+        } else if code == TWS_TOO_MANY_TICKERS {
             self.on_market_data_line_refused(req_id);
         } else if self.is_market_data_request(req_id) {
             self.session.market_data_error = Some(format!("TWS {code}: {message}"));
@@ -2594,29 +2647,7 @@ impl App {
             requested.push(format!("{symbol}=reqId {req_id}"));
             // The day's curve in the top bar is drawn for SPX only.
             let curve_req_id = (symbol == "SPX").then(|| self.next_request_id());
-            self.quotes.push(QuoteRow {
-                label: symbol.to_string(),
-                req_id,
-                bid: None,
-                ask: None,
-                last: None,
-                last_move: None,
-                bid_size: None,
-                ask_size: None,
-                last_size: None,
-                close: None,
-                open: None,
-                last_update: None,
-                acknowledged: false,
-                requested_at: self.clock.instant(),
-                attempts: 1,
-                history_req_id: None,
-                history: None,
-                prev_close: None,
-                bars_req_id: None,
-                curve_req_id,
-                curve: Vec::new(),
-            });
+            self.quotes.push(QuoteRow { curve_req_id, ..QuoteRow::new(symbol, req_id, self.clock.instant()) });
             send_counted(&sender, TwsCommand::RequestMarketData { req_id, contract: index_contract(symbol) }, &mut unsent);
             if let Some(req_id) = curve_req_id {
                 send_counted(&sender, TwsCommand::RequestLiveBars { req_id, contract: index_contract(symbol) }, &mut unsent);
@@ -2900,8 +2931,8 @@ impl App {
                 if !self.calendar_expiry_warned.contains(&key) {
                     let exits = if trade.exit_order_ids().is_empty() { "" } else { ", and its stop and profit target end with the day" };
                     let message = format!(
-                        "WARNING: calendar {} {} {}: its near leg expired today, the far leg stays open{exits} - it has NO stop now: close it by hand or manage it in TWS",
-                        trade.symbol, trade.trade_type, trade.strikes
+                        "WARNING: calendar {}: its near leg expired today, the far leg stays open{exits} - it has NO stop now: close it by hand or manage it in TWS",
+                        trade.label()
                     );
                     self.calendar_expiry_warned.push(key);
                     self.log(&message);
@@ -2919,10 +2950,8 @@ impl App {
             settled.status = TradeStatus::Expired.as_str().to_string();
             settled.price_close = Some(price_close.normalize());
             self.log(&format!(
-                "Expiring trade: {} {} {} x{} - {} closed at {} -> {} P/L {}",
-                settled.symbol,
-                settled.trade_type,
-                settled.strikes,
+                "Expiring trade: {} x{} - {} closed at {} -> {} P/L {}",
+                settled.label(),
                 settled.qty,
                 settled.symbol,
                 close.normalize(),
@@ -3391,9 +3420,27 @@ impl App {
         }
     }
 
+    /// The fees TWS charged for `trade`, through the index of the executions by order. The index is built again only when the list of
+    /// executions has changed (another list, another length or another last execution), so that the Dashboard and the reports, which
+    /// ask for the fees of every trade on every frame, do not search all executions each time.
+    fn fees_of(&self, trade: &StoredTrade) -> crate::fees::TradeFees {
+        let last = self.exec_history.last().map_or("", |e| e.exec_id.as_str());
+        let mut cache = self.fee_index.borrow_mut();
+        let current = cache.list == self.exec_history.as_ptr().addr() && cache.len == self.exec_history.len() && cache.last == last;
+        if !current {
+            *cache = FeeIndex {
+                list: self.exec_history.as_ptr().addr(),
+                len: self.exec_history.len(),
+                last: last.to_string(),
+                index: crate::fees::executions_by_order(&self.exec_history),
+            };
+        }
+        crate::fees::trade_fees_indexed(trade, &self.exec_history, &cache.index, &self.commissions)
+    }
+
     /// A stored trade as the Dashboard and the reports count it: valued at the chain, with the fees TWS charged.
     fn record_of(&self, trade: &StoredTrade) -> Option<TradeRecord> {
-        let fees = crate::fees::trade_fees(trade, &self.exec_history, &self.commissions);
+        let fees = self.fees_of(trade);
         stored_record(trade, &self.chains).map(|record| record.with_fees(fees.open, fees.close))
     }
 
@@ -3442,23 +3489,14 @@ impl App {
             return;
         }
         for trade in &found.updated {
-            self.log(&format!("Trade expired (from TWS bookings): {} {} {} x{}", trade.symbol, trade.trade_type, trade.strikes, trade.qty));
+            self.log(&format!("Trade expired (from TWS bookings): {} x{}", trade.label(), trade.qty));
             self.replace_trade(trade, &mut known);
         }
         self.apply_grown_trades(&found.grown, &mut known);
         for trade in &found.new {
             let note = if trade.entry_unknown { "entry price unknown" } else { "from its opening order" };
-            self.log(&format!(
-                "Trade recovered from TWS executions ({note}): {} {} {} x{} {}",
-                trade.symbol, trade.trade_type, trade.strikes, trade.qty, trade.status
-            ));
-            if !cfg!(test) {
-                if let Err(error) =
-                    trades_path(self.link.trading_live).map_err(|e| e.to_string()).and_then(|p| append_trade(&p, trade).map_err(|e| e.to_string()))
-                {
-                    self.log(&format!("Could not save the trade: {error}"));
-                }
-            }
+            self.log(&format!("Trade recovered from TWS executions ({note}): {} x{} {}", trade.label(), trade.qty, trade.status));
+            self.store_new_trade(trade);
             known.push(trade.clone());
         }
         self.adopt_trades(known);
@@ -3471,8 +3509,8 @@ impl App {
         for trade in grown {
             let before = known.iter().find(|t| t.is_same_trade(trade)).map_or(0, |t| t.qty);
             self.log(&format!(
-                "WARNING: Trade {} {} {} grew from {before} to {} contracts (late fills of its opening order {}): the stop and profit target placed earlier cover only {before} - check the exit orders",
-                trade.symbol, trade.trade_type, trade.strikes, trade.qty, trade.order_id
+                "WARNING: Trade {} grew from {before} to {} contracts (late fills of its opening order {}): the stop and profit target placed earlier cover only {before} - check the exit orders",
+                trade.label(), trade.qty, trade.order_id
             ));
             self.replace_trade(trade, known);
         }

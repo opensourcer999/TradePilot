@@ -384,6 +384,24 @@ pub static HELP: &[HelpEntry] = &[
         text_en: "An entry TWS refuses for margin is often possible a moment later, once another trade has closed or an order was cancelled. With this switch it is sent again up to 3 times, 20 seconds apart, under a new order id at the limit it started with; its schedule run keeps working meanwhile. Off: the entry is given up at once. An order held in TWS for review is never sent again.",
         text_de: "Ein Einstieg, den die TWS wegen unzureichender Margin ablehnt, klappt oft schon kurz darauf, etwa wenn ein anderer Trade geschlossen oder eine Order storniert wurde. Mit diesem Schalter sendet TradePilot den Einstieg bis zu dreimal im Abstand von 20 Sekunden erneut, jeweils mit neuer Order-ID und dem ursprünglichen Limit. Der zugehörige Zeitplan-Lauf bleibt so lange aktiv. Ist der Schalter aus, wird der Einstieg sofort aufgegeben. Orders, die in der TWS zur Prüfung zurückgehalten werden, sendet TradePilot nie erneut.",
     },
+    HelpEntry {
+        en: "Max. open contracts per symbol",
+        de: "Max. offene Kontrakte je Symbol",
+        text_en: "A new position is refused when the contracts (or combos) of its symbol that are open, together with the new ones, would be more than this. It keeps a mistake, a schedule that runs too often or a trigger that fires again and again from piling up a position far bigger than intended. Positions are counted from the open trades of TradePilot. 0 or empty = no limit.",
+        text_de: "Eine neue Position wird abgelehnt, wenn die offenen Kontrakte (oder Kombis) ihres Symbols zusammen mit den neuen mehr als diese Zahl wären. So kann ein Fehler, ein zu oft laufender Zeitplan oder ein immer wieder auslösender Trigger keine Position aufbauen, die viel größer ist als gewollt. Gezählt werden die offenen Trades von TradePilot. 0 oder leer bedeutet: keine Grenze.",
+    },
+    HelpEntry {
+        en: "Daily loss limit ($)",
+        de: "Tagesverlust-Grenze ($)",
+        text_en: "Once today's result (the closed trades plus the open ones at their current value) has lost this amount, no new position is opened for the rest of the New York day, even if the loss gets smaller again. Open trades are not closed by it: they keep their stops and targets. 0 or empty = no limit.",
+        text_de: "Hat das heutige Ergebnis (geschlossene Trades plus offene zum aktuellen Wert) diesen Betrag verloren, eröffnet TradePilot für den Rest des New Yorker Handelstags keine neue Position mehr, auch wenn sich der Verlust wieder verringert. Offene Trades werden dadurch nicht geschlossen, sie behalten ihre Stops und Ziele. 0 oder leer bedeutet: keine Grenze.",
+    },
+    HelpEntry {
+        en: "Max. new orders per minute",
+        de: "Max. neue Orders pro Minute",
+        text_en: "At most this many orders that open a position go out within one minute; one more is refused and the log says why. A safeguard against a fault that sends orders in a loop. Changing the price of a working order, stops, targets and close orders do not count. 0 or empty = no limit.",
+        text_de: "Höchstens so viele Orders, die eine Position eröffnen, gehen innerhalb einer Minute hinaus; jede weitere wird abgelehnt, und das Log nennt den Grund. Das schützt vor einem Fehler, der Orders in einer Schleife sendet. Preisänderungen einer laufenden Order, Stops, Ziele und Schließorders zählen nicht mit. 0 oder leer bedeutet: keine Grenze.",
+    },
     // Database Backup
     HelpEntry {
         en: "Daily Backups Enabled",

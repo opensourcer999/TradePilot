@@ -203,7 +203,7 @@ fn shift_time(hour: u32, minute: u32, second: u32, minutes: i64) -> Option<(u32,
 
 /// The decimal in `text` (comma or point), or `None` if it is none.
 fn decimal_of(text: &str) -> Option<Decimal> {
-    text.trim().replace(',', ".").parse().ok()
+    crate::pricing::parse_decimal(text)
 }
 
 /// A typed hour (0-23) and minute as the time picker shows them: 12 hours with AM/PM, midnight as 12:00 AM; "--:--" when they are not a time.

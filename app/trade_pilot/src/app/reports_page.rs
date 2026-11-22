@@ -49,11 +49,7 @@ impl App {
         trades.sort_by(|a, b| b.day.cmp(&a.day).then(b.order_id.cmp(&a.order_id)));
         let rows: Vec<reports::CsvTrade<'_>> = trades
             .iter()
-            .map(|t| reports::CsvTrade {
-                trade: t,
-                profit: self.record_of(t).and_then(|r| reports::profit(&r)),
-                fees: crate::fees::trade_fees(t, &self.exec_history, &self.commissions).total(),
-            })
+            .map(|t| reports::CsvTrade { trade: t, profit: self.record_of(t).and_then(|r| reports::profit(&r)), fees: self.fees_of(t).total() })
             .collect();
         reports::trades_csv(&rows, &|account| if account.chars().count() >= 8 { mask_account(&format!("IB:{account}")) } else { account.to_string() })
     }

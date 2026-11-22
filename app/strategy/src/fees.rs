@@ -34,20 +34,51 @@ fn commission_of<S: std::hash::BuildHasher>(fills: &[&StoredExecution], commissi
     fills.iter().try_fold(Decimal::ZERO, |sum, fill| sum.checked_add(*commissions.get(&fill.exec_id)?))
 }
 
+/// The executions by the order they belong to: the positions in the list of executions it was made from.
+pub type ExecutionIndex = HashMap<i32, Vec<usize>>;
+
+/// The index of `executions` by order id, for `trade_fees_indexed`: built once, it spares a search through every execution for every
+/// trade.
+#[must_use]
+pub fn executions_by_order(executions: &[StoredExecution]) -> ExecutionIndex {
+    let mut index = ExecutionIndex::new();
+    for (position, fill) in executions.iter().enumerate() {
+        index.entry(fill.order_id).or_default().push(position);
+    }
+    index
+}
+
 /// The fees of `trade`. A put side and a call side entered with one order share its executions: each trade counts the
 /// fills of its own legs only.
 #[must_use]
 pub fn trade_fees<S: std::hash::BuildHasher>(trade: &StoredTrade, executions: &[StoredExecution], commissions: &HashMap<String, Decimal, S>) -> TradeFees {
+    trade_fees_indexed(trade, executions, &executions_by_order(executions), commissions)
+}
+
+/// `trade_fees` with the index of `executions` made beforehand (`executions_by_order`).
+#[must_use]
+pub fn trade_fees_indexed<S: std::hash::BuildHasher>(
+    trade: &StoredTrade,
+    executions: &[StoredExecution],
+    index: &ExecutionIndex,
+    commissions: &HashMap<String, Decimal, S>,
+) -> TradeFees {
     let legs: Vec<i32> = [&trade.short_put, &trade.long_put, &trade.short_call, &trade.long_call].into_iter().flatten().map(|leg| leg.con_id).collect();
+    // The close order is among the exit orders already: each order counts once.
     let mut exit_orders = trade.exit_order_ids();
     exit_orders.extend(trade.close_order_id);
-    let of_legs = |wanted: &dyn Fn(i32) -> bool| -> Vec<&StoredExecution> {
-        executions.iter().filter(|fill| wanted(fill.order_id) && legs.contains(&fill.con_id)).collect()
+    exit_orders.sort_unstable();
+    exit_orders.dedup();
+    let fills_of = |orders: &[i32]| -> Vec<&StoredExecution> {
+        orders
+            .iter()
+            .filter_map(|order| index.get(order))
+            .flatten()
+            .filter_map(|position| executions.get(*position))
+            .filter(|fill| legs.contains(&fill.con_id))
+            .collect()
     };
-    TradeFees {
-        open: commission_of(&of_legs(&|order| order == trade.order_id), commissions),
-        close: commission_of(&of_legs(&|order| exit_orders.contains(&order)), commissions),
-    }
+    TradeFees { open: commission_of(&fills_of(&[trade.order_id]), commissions), close: commission_of(&fills_of(&exit_orders), commissions) }
 }
 
 #[cfg(test)]
@@ -105,5 +136,18 @@ mod tests {
         let fees = trade_fees(&trade(), &fills, &commissions);
         assert_eq!((fees.open, fees.close, fees.total()), (None, None, None));
         assert_eq!(trade_fees(&trade(), &[], &HashMap::new()), TradeFees::default());
+    }
+
+    #[test]
+    fn a_close_order_counts_once_and_the_index_gives_the_same_fees() {
+        let mut closed = trade();
+        closed.close_order_id = Some(12);
+        let fills = [fill("a", 10, 1), fill("b", 10, 2), fill("c", 12, 1), fill("d", 12, 2)];
+        let commissions: HashMap<String, Decimal> = [("a", "0.65"), ("b", "0.65"), ("c", "0.70"), ("d", "0.70")].map(|(id, c)| (id.to_string(), d(c))).into();
+        let fees = trade_fees(&closed, &fills, &commissions);
+        assert_eq!(fees.close, Some(d("1.40")), "the close order is among the exit orders: its fills count once");
+        let index = executions_by_order(&fills);
+        assert_eq!(trade_fees_indexed(&closed, &fills, &index, &commissions), fees);
+        assert_eq!(index.get(&12), Some(&vec![2, 3]));
     }
 }

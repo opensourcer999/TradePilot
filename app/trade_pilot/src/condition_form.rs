@@ -4,7 +4,6 @@
 //! outline each faulty field. Plain logic, no `App`.
 
 use crate::condition::{Comparison, Condition, Input, Operator, Rule};
-use rust_decimal::Decimal;
 
 /// Which field of the form a fault is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,8 +107,7 @@ impl RuleForm {
             }
             Comparison::Input(self.comparison_input)
         } else {
-            let value: Decimal =
-                self.comparison_value.trim().replace(',', ".").parse().map_err(|_| "The number to compare with is not a number".to_string())?;
+            let value = crate::pricing::parse_decimal(&self.comparison_value).ok_or_else(|| "The number to compare with is not a number".to_string())?;
             Comparison::Value(value)
         };
         Ok(Rule { group, input: self.input, operator: self.operator, comparison, input_length, comparison_length })
@@ -197,6 +195,7 @@ impl ConditionForm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
 
     fn valid() -> ConditionForm {
         let mut form = ConditionForm::new_default();

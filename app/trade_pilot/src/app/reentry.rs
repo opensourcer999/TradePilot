@@ -28,7 +28,7 @@ impl Ending {
             TradeStatus::Stopped => Some(Self::Stop),
             TradeStatus::Closed if how.starts_with("profit target") => Some(Self::ProfitTarget),
             TradeStatus::Closed => Some(Self::Close),
-            _ => None,
+            TradeStatus::Open | TradeStatus::Expired | TradeStatus::ClosedOther | TradeStatus::Split => None,
         }
     }
 

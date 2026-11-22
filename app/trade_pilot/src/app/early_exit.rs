@@ -36,10 +36,14 @@ impl App {
         (legs.as_ref().and_then(|legs| legs.current_ask(&trade.trade_type)), legs.as_ref().and_then(|legs| legs.current_bid(&trade.trade_type)))
     }
 
-    /// What closing the open `trade` costs now, as the close dialog and the stop/target window show it: the ask of its legs; a custom
-    /// trade that receives money when it is closed shows that amount. `None` while a quote is missing.
+    /// What closing the open `trade` costs now, as the close dialog and the stop/target window show it: the ask of its legs; a combo
+    /// bought as a debit, which brings money when it is closed, shows what it brings (the bid). `None` while a quote is missing.
     pub(super) fn closing_price(&self, trade: &StoredTrade) -> Option<Decimal> {
         let (cost, proceeds) = self.closing_quotes(trade);
+        let debit_combo = trade.price_open < Decimal::ZERO && crate::trade_exit::close_legs(trade).len() > 1;
+        if debit_combo && trade.custom_legs.is_none() {
+            return proceeds;
+        }
         cost.or(proceeds.filter(|_| trade.custom_legs.is_some()))
     }
 
@@ -124,15 +128,12 @@ impl App {
             let snapshot = self.with_bars(snapshot, &condition, &trade.symbol);
             let evaluation = evaluate(&condition, &snapshot);
             for line in &evaluation.lines {
-                self.debug(&format!("Early exit {} {} {}: {line}", trade.symbol, trade.trade_type, trade.strikes));
+                self.debug(&format!("Early exit {}: {line}", trade.label()));
             }
             if evaluation.verdict != Verdict::Pass {
                 continue;
             }
-            self.log(&format!(
-                "Early exit of {} {} {}: condition {} is true - closing the trade",
-                trade.symbol, trade.trade_type, trade.strikes, condition.name
-            ));
+            self.log(&format!("Early exit of {}: condition {} is true - closing the trade", trade.label(), condition.name));
             let mut updated = trade;
             updated.timed_exit = Some(TimedExit { at: now.format("%Y-%m-%d %H:%M").to_string(), limit: template.exit_flags.exit_order_limit });
             self.save_trade(index, updated);

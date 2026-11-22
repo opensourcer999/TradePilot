@@ -70,6 +70,12 @@ impl Quantity {
         Self::new(decimal)
     }
 
+    /// A whole number of contracts; it cannot fail, the type already rules out 0.
+    #[must_use]
+    pub fn from_count(count: std::num::NonZeroU32) -> Self {
+        Self(Decimal::from(count.get()))
+    }
+
     /// The quantity as a decimal.
     #[must_use]
     pub fn get(self) -> Decimal {
@@ -145,6 +151,12 @@ impl fmt::Display for OrderId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quantity_from_a_count_is_that_whole_number() {
+        assert_eq!(Quantity::from_count(std::num::NonZeroU32::MIN).get(), Decimal::ONE);
+        assert_eq!(Quantity::from_count(std::num::NonZeroU32::new(1000).unwrap()).get(), Decimal::from(1000));
+    }
 
     #[test]
     fn quantity_rejects_zero_and_negative() {

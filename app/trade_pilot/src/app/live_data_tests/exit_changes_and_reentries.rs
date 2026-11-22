@@ -250,7 +250,7 @@ fn a_limit_exit_starts_in_the_middle_and_moves_towards_the_ask_every_three_secon
     // The spread costs 0.40 to close (ask) and brings 0.20 (bid): the middle is 0.30.
     assert_eq!((sent[0].1.order_type.as_str(), sent[0].1.lmt_price), ("LMT", 0.3));
     let id = sent[0].0;
-    let trade_id = app.trades_stored.first().unwrap().order_id;
+    let trade_id = app.trades_stored.first().unwrap().key();
     // Not three seconds yet: nothing moves.
     app.check_timed_exits(app.clock.new_york());
     assert!(orders_sent_now(&commands).is_empty());

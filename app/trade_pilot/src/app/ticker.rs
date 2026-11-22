@@ -23,6 +23,12 @@ pub(super) fn estimated_spx(etf: Option<f64>, ratio: Option<f64>) -> Option<f64>
     (etf > 0.0 && ratio > 0.0).then_some(etf * ratio).filter(|value| value.is_finite())
 }
 
+/// Whether a TWS error code about a quote subscription refuses it: an error (below 2000, or 10000 and up for the market data
+/// permissions), but not the notice that delayed data is shown instead (10167) and not the farm messages (2xxx).
+pub(super) fn refuses_quotes(code: i32) -> bool {
+    !(2000..10000).contains(&code) && code != 10167
+}
+
 /// What the top bar shows for the chosen price symbol: `None` (or `-`, or SPX) keeps SPX.
 pub(super) fn chosen_price_symbol(setting: &str) -> Option<&str> {
     let symbol = setting.trim();
@@ -32,38 +38,33 @@ pub(super) fn chosen_price_symbol(setting: &str) -> Option<&str> {
 impl App {
     /// Subscribes the ETF of the SPX estimate once the live data of the session is requested and the estimate is switched on.
     pub(super) fn request_estimate_quote(&mut self) {
-        if !self.settings.misc_flags.estimate_spx_extended_hours || !self.link.live_data_requested || self.quotes.iter().any(|q| q.label == ESTIMATE_ETF) {
+        if !self.settings.misc_flags.estimate_spx_extended_hours
+            || !self.link.live_data_requested
+            || self.session.estimate_refused
+            || self.quotes.iter().any(|q| q.label == ESTIMATE_ETF)
+        {
             return;
         }
         let Some(sender) = self.tws_cmd_sender.clone() else { return };
         let req_id = self.next_request_id();
         let mut unsent = 0;
-        self.quotes.push(QuoteRow {
-            label: ESTIMATE_ETF.to_string(),
-            req_id,
-            bid: None,
-            ask: None,
-            last: None,
-            last_move: None,
-            bid_size: None,
-            ask_size: None,
-            last_size: None,
-            close: None,
-            open: None,
-            last_update: None,
-            acknowledged: false,
-            requested_at: self.clock.instant(),
-            attempts: 1,
-            history_req_id: None,
-            history: None,
-            prev_close: None,
-            bars_req_id: None,
-            curve_req_id: None,
-            curve: Vec::new(),
-        });
+        self.quotes.push(QuoteRow::new(ESTIMATE_ETF, req_id, self.clock.instant()));
         send_counted(&sender, TwsCommand::RequestMarketData { req_id, contract: quote_contract(ESTIMATE_ETF) }, &mut unsent);
         self.log(&format!("Requested live market data for {ESTIMATE_ETF} (reqId {req_id}) for the SPX estimate outside the regular hours"));
         self.log_unsent_requests("request estimate quote", unsent);
+    }
+
+    /// An error TWS reports for request `req_id`: if it is about the quotes of the ETF of the estimate and refuses them, the estimate is
+    /// switched off for this session and its quote row removed, so that it is neither asked for again nor taken for missing market
+    /// data. True when the error was about that row (it then concerns nothing else).
+    pub(super) fn on_estimate_quote_error(&mut self, req_id: i32, code: i32, message: &str) -> bool {
+        let Some(index) = self.quotes.iter().position(|q| q.label == ESTIMATE_ETF && q.req_id == req_id) else { return false };
+        if refuses_quotes(code) {
+            self.quotes.remove(index);
+            self.session.estimate_refused = true;
+            self.log(&format!("TWS refused the quotes of {ESTIMATE_ETF} for the SPX estimate (TWS {code}: {message}) - the estimate is off for this session"));
+        }
+        true
     }
 
     /// Keeps the ratio of SPX to the ETF up to date while the market is open and both have a live price.
@@ -122,7 +123,16 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{chosen_price_symbol, estimated_spx, price_ratio};
+    use super::{chosen_price_symbol, estimated_spx, price_ratio, refuses_quotes};
+
+    #[test]
+    fn an_error_refuses_the_quotes_but_the_notice_of_delayed_data_and_the_farm_messages_do_not() {
+        assert!(refuses_quotes(354), "no market data permission");
+        assert!(refuses_quotes(200), "no security definition");
+        assert!(refuses_quotes(10089), "a subscription is needed");
+        assert!(!refuses_quotes(10167), "delayed data is shown instead");
+        assert!(!refuses_quotes(2104), "farm connection is OK");
+    }
 
     #[test]
     fn the_ratio_needs_two_prices_above_zero() {

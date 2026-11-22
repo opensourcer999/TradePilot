@@ -23,27 +23,17 @@ fn spx_curve() -> Vec<(String, f64)> {
 
 fn quote(label: &str, last: f64, close: f64, curve: Vec<(String, f64)>) -> QuoteRow {
     QuoteRow {
-        label: label.to_string(),
-        req_id: 0,
         bid: Some(last - 0.05),
         ask: Some(last + 0.05),
         last: Some(last),
         last_move: Some(true),
-        bid_size: None,
-        ask_size: None,
-        last_size: None,
         close: Some(close),
         open: Some(close),
         last_update: Some("11:42:00".to_string()),
         acknowledged: true,
-        requested_at: Instant::now(),
-        attempts: 1,
-        history_req_id: None,
-        history: None,
         prev_close: Some(close),
-        bars_req_id: None,
-        curve_req_id: None,
         curve,
+        ..QuoteRow::new(label, 0, Instant::now())
     }
 }
 
