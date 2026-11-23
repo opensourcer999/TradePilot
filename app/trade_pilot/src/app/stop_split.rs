@@ -184,8 +184,8 @@ impl App {
         let mut cleared = side.clone();
         cleared.profit_price = None;
         if let (Some(target), Some(contract), Some(first_id)) = (target, trade_exit::exit_contract(&side, &legs), self.next_order_id) {
+            // With levels hit before, the new target becomes the order of the level that is next (see `place_attached_exits`).
             self.place_attached_exits(index, &cleared, contract, None, Some(target), first_id, &legs);
-            self.record_side_level(index);
         } else {
             self.log(&format!("WARNING: {label}: NO profit target placed (no target price, or the order cannot be built)"));
         }
@@ -195,22 +195,6 @@ impl App {
             self.log(&format!("WARNING: {label}: NO stop placed (its price is not known)"));
             self.notify_missing_stop(&[format!("{label}: no stop could be placed after the full stop split")]);
         }
-    }
-
-    /// A side with levels hit before: its new target is the order of the level that is next, so its fill ends the side.
-    fn record_side_level(&mut self, index: usize) {
-        let Some(trade) = self.trades_stored.get(index).cloned() else { return };
-        let (Some(mut levels), Some(id)) = (trade.exit_levels.clone(), trade.profit_order_id) else { return };
-        let slot = usize::from(levels.level);
-        if let Some(entry) = levels.order_ids.get_mut(slot) {
-            *entry = Some(id);
-        }
-        if let Some(qty) = levels.qty.get_mut(slot) {
-            *qty = trade.remaining_qty();
-        }
-        let mut updated = trade;
-        updated.exit_levels = Some(levels);
-        self.save_trade(index, updated);
     }
 }
 

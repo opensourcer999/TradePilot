@@ -1,7 +1,8 @@
 //! Decoders: what a message from TWS says, as events and values.
 
 use crate::{
-    ContractData, ExecutionRow, Position, TwsEvent, IB_ACCOUNT_SUMMARY_REQUEST_ID, IN_MARKET_DATA_TYPE, IN_TICK_GENERIC, IN_TICK_REQ_PARAMS, IN_TICK_STRING,
+    ContractData, ExecutionRow, OpenOrderInfo, Position, TwsEvent, IB_ACCOUNT_SUMMARY_REQUEST_ID, IN_MARKET_DATA_TYPE, IN_TICK_GENERIC, IN_TICK_REQ_PARAMS,
+    IN_TICK_STRING,
 };
 
 /// IB's documented convention for paper-trading account identifiers (e.g. "DU1234567"), used only
@@ -46,13 +47,66 @@ pub fn parse_historical_bars(fields: &[String]) -> Option<Vec<TwsEvent>> {
 }
 
 /// The order id of an `openOrder` message (`IBApi.EDecoder.OpenOrderEvent`): below server version
-/// 145 (`ORDER_CONTAINER`) a version field comes first, from 145 on the order id directly. The
-/// rest of the message (contract, order and state, several hundred version-dependent fields) is
-/// not needed: the app only asks which of its orders are still working.
+/// 145 (`ORDER_CONTAINER`) a version field comes first, from 145 on the order id directly.
 #[must_use]
 pub fn parse_open_order_id(fields: &[String], server_version: i32) -> Option<i32> {
     let index = if server_version < 145 { 2 } else { 1 };
     fields.get(index)?.parse().ok()
+}
+
+/// The message version of an `openOrder` from which every contract field this reads is sent (multiplier and trading class).
+const OPEN_ORDER_FULL_CONTRACT: i32 = 32;
+
+/// The head of an `openOrder` message (`IBApi.EDecoder.OpenOrderEvent` with its `OrderDecoder`): the order id, the contract (conId,
+/// symbol, secType, expiry, strike, right, multiplier, exchange, currency, localSymbol, tradingClass), then action, totalQuantity,
+/// orderType, lmtPrice, auxPrice, tif, ocaGroup, account, openClose, origin and orderRef. These come first in every version this app
+/// accepts (the message version is the server version from 145 on, else its own field, 32 or more for the full contract); what follows
+/// them (algo parameters, combo legs, conditions, the order state) depends on the version and is not read. `None` when the head is
+/// missing or a number in it cannot be read.
+#[must_use]
+pub fn parse_open_order(fields: &[String], server_version: i32) -> Option<OpenOrderInfo> {
+    let (version, first): (i32, usize) = if server_version < 145 { (fields.get(1)?.trim().parse::<i32>().ok()?, 2) } else { (server_version, 1) };
+    if version < OPEN_ORDER_FULL_CONTRACT {
+        return None;
+    }
+    let text = |offset: usize| -> Option<String> { fields.get(first.checked_add(offset)?).map(|f| f.trim().to_string()) };
+    // TWS sends an unset price as an empty field or as the largest double.
+    let price = |offset: usize| -> Option<Option<f64>> {
+        let value = text(offset)?;
+        if value.is_empty() {
+            return Some(None);
+        }
+        let number: f64 = value.parse().ok()?;
+        Some((number.is_finite() && number.abs() < 1.0e300).then_some(number))
+    };
+    let number = |offset: usize| -> Option<f64> {
+        let value = text(offset)?;
+        if value.is_empty() {
+            Some(0.0)
+        } else {
+            value.parse().ok().filter(|n: &f64| n.is_finite())
+        }
+    };
+    Some(OpenOrderInfo {
+        order_id: text(0)?.parse().ok()?,
+        con_id: text(1)?.parse().ok()?,
+        symbol: text(2)?,
+        sec_type: text(3)?,
+        expiry: text(4)?,
+        strike: number(5)?,
+        right: text(6)?,
+        // 7 multiplier, 8 exchange, 9 currency, 10 localSymbol, 11 tradingClass
+        action: text(12)?,
+        total_quantity: number(13)?,
+        order_type: text(14)?,
+        limit_price: price(15)?,
+        aux_price: price(16)?,
+        tif: text(17)?,
+        oca_group: text(18)?,
+        account: text(19)?,
+        // 20 openClose, 21 origin
+        order_ref: text(22)?,
+    })
 }
 
 /// `IBApi.EDecoder.TickPriceEvent`'s real field order: version, tickerId, tickType, price,

@@ -613,6 +613,14 @@ impl App {
 
     /// Deletes a schedule; the schedules that waited for it no longer wait.
     pub(super) fn delete_schedule(&mut self, id: u32) {
+        // Its runs that have not begun end with it; a run with an order in TWS is left to the handling of that order.
+        for index in 0..self.schedule.runs.len() {
+            if self.schedule.runs.get(index).is_some_and(|run| run.schedule_id == id && run.reentry.is_none() && run.trigger.is_none() && run.status.is_open())
+            {
+                self.end_schedule_run(index, RunStatus::Cancelled, "the schedule was deleted");
+            }
+        }
+        self.save_schedule_runs();
         self.schedule.list.retain(|s| s.id != id);
         for other in &mut self.schedule.list {
             if other.linked_schedule_id == id {

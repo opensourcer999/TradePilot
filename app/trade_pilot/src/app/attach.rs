@@ -6,18 +6,45 @@
 use super::alerts::is_order_failure;
 use super::{
     fix_price, live_legs, mask_account, muted_text, order_is_final, trade_exit, App, Color32, Decimal, IbOrder, OrderHandling, RichText, StoredTrade,
-    ToPrimitive, GREEN_TXT,
+    ToPrimitive, ACCENT_BLUE, GREEN_TXT, ORANGE_WARN,
 };
 use eframe::egui;
 
 /// A stop and target to attach, waiting for the user's confirmation.
 pub(super) struct PendingExits {
-    /// Index in `trades_stored`.
+    /// Index in `trades_stored` when the window was opened; the trade is found again by `key` (see `App::open_trade_of`).
     pub index: usize,
+    /// `StoredTrade::key` of the trade the window is for.
+    pub key: String,
     /// The price per contract that the trade is closed at when the stop is hit (paid to close); empty = no stop.
     pub stop: String,
     /// The price per contract the trade is closed at for its profit (paid to close); empty = no target.
     pub target: String,
+    /// Whether the stop is typed as a price or a percentage; `None` until the user chose (nothing is sent before).
+    pub stop_unit: Option<ExitUnit>,
+    /// Whether the target is typed as a price or a percentage; `None` until the user chose.
+    pub target_unit: Option<ExitUnit>,
+}
+
+/// How a typed stop or target is meant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ExitUnit {
+    /// The price per contract to close at.
+    Price,
+    /// A percentage of the credit (see `typed_stop` and `typed_target`).
+    Percent,
+}
+
+/// How many times the opening price a stop price may be at most: a price above that is surely a percentage typed as a price.
+const STOP_PRICE_LIMIT: i64 = 20;
+
+/// The number of a typed stop or target and whether it is a percentage: by the chosen unit, or by a `%` typed after it.
+fn number_of(text: &str, unit: ExitUnit) -> Option<(Decimal, bool)> {
+    let (number, percent) = match text.trim().strip_suffix('%') {
+        Some(number) => (number, true),
+        None => (text, unit == ExitUnit::Percent),
+    };
+    crate::pricing::parse_decimal(number).filter(|value| *value > Decimal::ZERO).map(|value| (value, percent))
 }
 
 /// The profit-target orders of a trade that still work: with levels, those of the levels not hit yet (a level that filled keeps its id on
@@ -79,9 +106,33 @@ pub(super) fn target_mode(trade: &StoredTrade) -> ExitMode {
     }
 }
 
-/// A typed price: a decimal comma is accepted; `None` for empty, unreadable or not above 0.
-fn typed_price(text: &str) -> Option<Decimal> {
-    crate::pricing::parse_decimal(text).filter(|price| *price > Decimal::ZERO)
+/// The typed profit target as a price to close: a price, or as a percentage (`ExitUnit::Percent`, or a `%` typed after it) the share
+/// of the credit to keep (e.g. 80% of a credit of 1.60 = closed at 0.32), worked out like the percentage target of a template; a target
+/// of 100% closes at 0.05. `None` for empty or unreadable text, a percentage above 100 or a value that is not above 0.
+pub(super) fn typed_target(text: &str, unit: ExitUnit, price_open: Decimal) -> Option<Decimal> {
+    let (value, is_percent) = number_of(text, unit)?;
+    if !is_percent {
+        return Some(value);
+    }
+    let percent = Some(value).filter(|p| *p <= Decimal::ONE_HUNDRED)?;
+    let price = price_open.checked_mul(Decimal::ONE_HUNDRED.checked_sub(percent)?)?.checked_div(Decimal::ONE_HUNDRED)?;
+    if price > Decimal::ZERO {
+        Some(price)
+    } else {
+        (price_open > Decimal::ZERO).then(|| Decimal::new(5, 2))
+    }
+}
+
+/// The typed stop as a price to close: a price, or as a percentage (`ExitUnit::Percent`, or a `%` typed after it) the loss on the
+/// credit it allows (e.g. 300% of a credit of 1.60 = a loss of 4.80, stopped at 6.40), worked out like the stop multiple of a template
+/// (300% = multiple 3). `None` for empty or unreadable text or a value that is not above 0.
+pub(super) fn typed_stop(text: &str, unit: ExitUnit, price_open: Decimal) -> Option<Decimal> {
+    let (percent, is_percent) = number_of(text, unit)?;
+    if !is_percent {
+        return Some(percent);
+    }
+    let loss = price_open.checked_mul(percent)?.checked_div(Decimal::ONE_HUNDRED)?;
+    price_open.checked_add(loss).filter(|price| *price > Decimal::ZERO)
 }
 
 impl App {
@@ -100,8 +151,12 @@ impl App {
                 String::new()
             }
         };
-        let (stop, target) = (shown(stop_mode, trade.stop_price), shown(target_mode, trade.profit_price));
-        self.exits_pending = Some(PendingExits { index, stop, target });
+        let (stop, target) = (shown(stop_mode, trade.stop_now()), shown(target_mode, trade.target_now()));
+        // A price on record is shown as a price; an empty field waits for the user to choose.
+        let unit = |text: &String| (!text.is_empty()).then_some(ExitUnit::Price);
+        let (stop_unit, target_unit) = (unit(&stop), unit(&target));
+        let key = trade.key();
+        self.exits_pending = Some(PendingExits { index, key, stop, target, stop_unit, target_unit });
     }
 
     fn block_exits(&mut self, reason: &str) {
@@ -112,7 +167,8 @@ impl App {
     /// The window: the price fields of what the trade is missing and what the market is now.
     pub(super) fn exits_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut pending) = self.exits_pending.take() else { return };
-        let Some(trade) = self.trades_stored.get(pending.index).filter(|t| t.is_open()).cloned() else { return };
+        let Some((index, trade)) = self.open_trade_of(pending.index, &pending.key) else { return };
+        pending.index = index;
         let de = self.german();
         let (needs_stop, needs_target) = editable_exits(&trade);
         let ask = self.closing_price(&trade);
@@ -136,21 +192,21 @@ impl App {
                         ui.end_row();
                     }
                     if needs_stop {
-                        ui.label(RichText::new(if de { "Stop (Schließkurs)" } else { "Stop (price to close)" }).color(muted_text()));
-                        crate::widgets::metal_field(ui, egui::TextEdit::singleline(&mut pending.stop).desired_width(80.0));
+                        ui.label(RichText::new("Stop").color(muted_text()));
+                        exit_field(ui, &mut pending.stop, &mut pending.stop_unit, trade.price_open, typed_stop, de);
                         ui.end_row();
                     }
                     if needs_target {
-                        ui.label(RichText::new(if de { "Ziel (Schließkurs)" } else { "Target (price to close)" }).color(muted_text()));
-                        crate::widgets::metal_field(ui, egui::TextEdit::singleline(&mut pending.target).desired_width(80.0));
+                        ui.label(RichText::new(if de { "Ziel" } else { "Target" }).color(muted_text()));
+                        exit_field(ui, &mut pending.target, &mut pending.target_unit, trade.price_open, typed_target, de);
                         ui.end_row();
                     }
                 });
                 ui.add_space(8.0);
                 ui.label(if de {
-                    "Die Orders schließen alle Legs, laufen als OCA-Gruppe (eine füllt, die andere wird storniert) und werden am Trade vermerkt. Leer lassen = nicht setzen. Ein vorhandener Stop/Ziel wird mit dem neuen Preis geändert."
+                    "Die Orders schließen alle Legs, laufen als OCA-Gruppe (eine füllt, die andere wird storniert) und werden am Trade vermerkt. Leer lassen = nicht setzen. Ein vorhandener Stop/Ziel wird mit dem neuen Preis geändert. Wähle je Feld „Kurs“ (Schließkurs pro Kontrakt) oder „%“ (vom Kredit, bei 1,60 Kredit): Ziel 80 % = Schließen zu 0,32, Stop 300 % = 300 % Verlust, Stop bei 6,40."
                 } else {
-                    "The orders close every leg and run as one OCA group (one fills, the other is cancelled); they are recorded on the trade. Leave a field empty to skip it. An existing stop/target is changed to the new price."
+                    "The orders close every leg and run as one OCA group (one fills, the other is cancelled); they are recorded on the trade. Leave a field empty to skip it. An existing stop/target is changed to the new price. Choose \"Price\" (price to close per contract) or \"%\" (of the credit, credit 1.60) for each field: a target of 80% closes at 0.32, a stop of 300% allows a loss of 300% and stops at 6.40."
                 });
                 if !needs_stop || !needs_target {
                     ui.label(RichText::new(locked_note(de)).small().color(muted_text()));
@@ -177,13 +233,34 @@ impl App {
 
     /// "Send now": checks the prices against the market, then places the stop and the target.
     pub(super) fn confirm_exits(&mut self) {
-        let Some(pending) = self.exits_pending.take() else { return };
-        let Some(trade) = self.trades_stored.get(pending.index).filter(|t| t.is_open()).cloned() else { return };
+        let Some(mut pending) = self.exits_pending.take() else { return };
+        let Some((index, trade)) = self.open_trade_of(pending.index, &pending.key) else { return };
+        pending.index = index;
         let (stop_editable, target_editable) = editable_exits(&trade);
-        let stop = stop_editable.then(|| typed_price(&pending.stop)).flatten();
-        let target = target_editable.then(|| typed_price(&pending.target)).flatten();
+        // A typed value without its unit is never guessed: 300 can be a price or 300%.
+        let unit_missing =
+            |editable: bool, text: &str, unit: Option<ExitUnit>| editable && !text.trim().is_empty() && !text.trim().ends_with('%') && unit.is_none();
+        if unit_missing(stop_editable, &pending.stop, pending.stop_unit) || unit_missing(target_editable, &pending.target, pending.target_unit) {
+            self.block_exits("choose whether the value is a price or a percentage (\"Price\" or \"%\" next to the field)");
+            self.exits_pending = Some(pending);
+            return;
+        }
+        let stop = stop_editable.then(|| typed_stop(&pending.stop, pending.stop_unit.unwrap_or(ExitUnit::Price), trade.price_open)).flatten();
+        let target = target_editable.then(|| typed_target(&pending.target, pending.target_unit.unwrap_or(ExitUnit::Price), trade.price_open)).flatten();
         if stop.is_none() && target.is_none() {
-            self.block_exits("enter a price above 0 for the stop or the target");
+            self.block_exits("enter a price above 0 for the stop or the target, or a percentage of the credit (e.g. a stop of 300%, a target of 80%)");
+            return;
+        }
+        // A stop far above anything the trade can cost to close is a percentage typed as a price.
+        if let Some(stop) =
+            stop.filter(|stop| trade.price_open.checked_mul(Decimal::from(STOP_PRICE_LIMIT)).is_some_and(|limit| limit > Decimal::ZERO && *stop > limit))
+        {
+            self.block_exits(&format!(
+                "a stop at {} is more than {STOP_PRICE_LIMIT} times the opening price {} - was it meant as a percentage?",
+                stop.normalize(),
+                trade.price_open.normalize()
+            ));
+            self.exits_pending = Some(pending);
             return;
         }
         let legs = trade_exit::close_legs(&trade);
@@ -209,8 +286,8 @@ impl App {
             return;
         };
         // A price that is the one on record once it is on the grid changes nothing and is left out.
-        let stop = stop.filter(|p| Some(*p) != trade.stop_price);
-        let target = target.filter(|p| Some(*p) != trade.profit_price);
+        let stop = stop.filter(|p| Some(*p) != trade.stop_now());
+        let target = target.filter(|p| Some(*p) != trade.target_now());
         if stop.is_none() && target.is_none() {
             self.block_exits("the prices are the ones on record (on the exchange's price grid) - nothing to change");
             return;
@@ -268,7 +345,7 @@ impl App {
         if let Some(price) = stop.and_then(|p| p.to_f64().map(|f| (p, f))) {
             let change = stop_mode(trade) == ExitMode::Change;
             let stop_order = IbOrder { order_type: "STP".to_string(), aux_price: price.1, ..order("SL", stop_id) };
-            let old = trade.stop_price.filter(|_| change);
+            let old = trade.stop_now().filter(|_| change);
             self.log(&exit_order_line("STP", stop_id, old, price.1, stop_order.total_quantity, &label));
             if self.submit_order(stop_id, contract.clone(), stop_order).is_ok() {
                 placed = true;
@@ -276,14 +353,14 @@ impl App {
                     self.watch.exit_changes.insert(stop_id, price.0.normalize());
                 } else {
                     updated.stop_order_id = Some(stop_id);
-                    updated.stop_price = Some(price.0.normalize());
+                    updated.set_stop(Some(price.0));
                 }
             }
         }
         if let Some(price) = target.and_then(|p| p.to_f64().map(|f| (p, f))) {
             let change = target_mode(trade) == ExitMode::Change;
             let target_order = IbOrder { order_type: "LMT".to_string(), lmt_price: price.1, ..order("TP", target_id) };
-            let old = trade.profit_price.filter(|_| change);
+            let old = trade.target_now().filter(|_| change);
             self.log(&exit_order_line("Profit Limit", target_id, old, price.1, target_order.total_quantity, &label));
             if self.submit_order(target_id, contract, target_order).is_ok() {
                 placed = true;
@@ -292,6 +369,20 @@ impl App {
                 } else {
                     updated.profit_order_id = Some(target_id);
                     updated.profit_price = Some(price.0.normalize());
+                    // With levels the new target is the order of the level that is next, for the contracts still open: its fill ends
+                    // the trade, and the trade no longer counts as one without a target.
+                    let remaining = updated.remaining_qty();
+                    if let Some(levels) = updated.exit_levels.as_mut() {
+                        let slot = usize::from(levels.level);
+                        if let (Some(id), Some(qty), Some(at)) = (levels.order_ids.get_mut(slot), levels.qty.get_mut(slot), levels.prices.get_mut(slot)) {
+                            *id = Some(target_id);
+                            *qty = remaining;
+                            *at = Some(price.0.normalize().to_string());
+                        }
+                        for qty in levels.qty.iter_mut().skip(slot.saturating_add(1)) {
+                            *qty = 0;
+                        }
+                    }
                 }
             }
         }
@@ -323,7 +414,7 @@ impl App {
         let label = trade.label();
         let mut updated = trade.clone();
         if trade.stop_order_id == Some(order_id) {
-            updated.stop_price = Some(price);
+            updated.set_stop(Some(price));
         } else {
             updated.profit_price = Some(price);
         }
@@ -342,6 +433,48 @@ impl App {
         ));
         self.show_notice(format!("{}: TWS {code}: {message}", self.tr("Change not made", "Änderung nicht übernommen")));
     }
+}
+
+/// One value of the window: the field, the choice "Price" or "%" (none chosen at first for an empty field), and the price a
+/// percentage stands for - or the request to choose the unit.
+fn exit_field(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    unit: &mut Option<ExitUnit>,
+    price_open: Decimal,
+    price_of: fn(&str, ExitUnit, Decimal) -> Option<Decimal>,
+    de: bool,
+) {
+    ui.horizontal(|ui| {
+        crate::widgets::metal_field(ui, egui::TextEdit::singleline(text).desired_width(80.0));
+        // A `%` typed after the number chooses the unit as well.
+        if text.trim().ends_with('%') {
+            *unit = Some(ExitUnit::Percent);
+        }
+        let options = [(if de { "Kurs" } else { "Price" }, ACCENT_BLUE), ("%", ACCENT_BLUE)];
+        let selected = match unit {
+            Some(ExitUnit::Price) => 0,
+            Some(ExitUnit::Percent) => 1,
+            None => usize::MAX,
+        };
+        if let (Some(index), _) = crate::widgets::segmented(ui, &options, selected, 44.0) {
+            *unit = Some(if index == 0 { ExitUnit::Price } else { ExitUnit::Percent });
+        }
+        if text.trim().is_empty() {
+            return;
+        }
+        match *unit {
+            None => {
+                ui.label(RichText::new(if de { "Kurs oder % wählen" } else { "choose price or %" }).color(ORANGE_WARN));
+            }
+            Some(ExitUnit::Percent) => {
+                let shown = price_of(text, ExitUnit::Percent, price_open)
+                    .map_or_else(|| (if de { "ungültig" } else { "not valid" }).to_string(), |price| format!("= {}", price.round_dp(2).normalize()));
+                ui.label(RichText::new(shown).color(muted_text()));
+            }
+            Some(ExitUnit::Price) => {}
+        }
+    });
 }
 
 /// The log line of a stop or target sent from the window: a new order, or the change of a working one from `old` to `price`.

@@ -10,7 +10,7 @@ use super::{
     IbOrder, Instant, OrderBlocked, PendingTemplateOrder, SentTemplateOrder, StopAdjustment, StopAdjustments, StoredTrade, ToPrimitive, TradeStatus,
     TradeTemplate, TwsCommand,
 };
-use crate::reconcile::{reconcile_trade, Reconciliation};
+use crate::reconcile::{fill_of_order, reconcile_trade, Reconciliation};
 use crate::trade_mail;
 
 impl App {
@@ -684,17 +684,16 @@ impl App {
                 self.log(&format!("Stop Adjustment {number} of {label}: the old stop could not be cancelled - the stop stays as it is"));
                 continue;
             }
-            if new_type == trade_exit::StopOrderType::None {
+            let no_stop = new_type == trade_exit::StopOrderType::None;
+            let stop = if no_stop { None } else { next.stop.as_deref().and_then(|p| p.parse::<Decimal>().ok()) };
+            next.replace_pending = !no_stop;
+            if no_stop {
                 // No stop any more: the cancelled orders are forgotten at once.
                 updated.stop_order_id = None;
                 updated.stop_limit_order_id = None;
-                updated.stop_price = None;
-                next.replace_pending = false;
-            } else {
-                next.replace_pending = true;
-                updated.stop_price = next.stop.as_deref().and_then(|p| p.parse::<Decimal>().ok());
             }
             updated.adjustments = Some(next);
+            updated.set_stop(stop);
             self.save_trade(index, updated);
         }
     }
@@ -764,6 +763,11 @@ impl App {
                     }
                 }
                 Reconciliation::Missing { filled, missing, stop_gone } => {
+                    // A stop or target that filled meanwhile ends the trade as it would have live; TWS cancelled the other exit
+                    // orders of its OCA group, so their absence is no problem then.
+                    if !filled.is_empty() && self.close_by_missed_fills(index, &filled) {
+                        continue;
+                    }
                     problems += 1;
                     if stop_gone {
                         self.notify_missing_stop(&[format!("{label}: the stop is no longer working in TWS - the trade may have NO stop")]);
@@ -849,13 +853,13 @@ impl App {
                 updated.stop_limit_order_id = Some(limit_id);
             }
         }
-        if updated.stop_order_id.is_some() || updated.stop_limit_order_id.is_some() {
-            updated.stop_price = adjustments.stop.as_deref().and_then(|p| p.parse::<Decimal>().ok());
-        } else {
-            updated.stop_price = None;
+        let placed = updated.stop_order_id.is_some() || updated.stop_limit_order_id.is_some();
+        let stop = adjustments.stop.as_deref().and_then(|p| p.parse::<Decimal>().ok()).filter(|_| placed);
+        if !placed {
             self.log(&format!("WARNING: the adjusted stop of {label} was NOT placed - the trade has no stop"));
         }
         updated.adjustments = Some(adjustments);
+        updated.set_stop(stop);
         self.save_trade(index, updated);
     }
 
@@ -1034,20 +1038,7 @@ impl App {
             // trade at a negative price; a debit combo is bought at a negative limit, so a fill at
             // -2.25 brought 2.25; a single long option is sold, so its price is what it brought.
             let price = if trade_exit::closes_by_selling(&trade) { paid } else { -paid };
-            let how = format!("{kind} {order_id}");
-            if kind == "profit target" {
-                self.on_profit_level_filled(index, level.unwrap_or(0), price, &how);
-                return;
-            }
-            // A stop or close order ends what is left; the levels hit before count in the average.
-            let Some(average) = self.average_close_price(&trade, price) else {
-                self.log(&format!("The {kind} {order_id} of {label} filled, but the closing price cannot be averaged - trade left open"));
-                return;
-            };
-            self.finish_trade(index, if kind == "stop" { TradeStatus::Stopped } else { TradeStatus::Closed }, average, &how);
-            if kind == "stop" {
-                self.sell_leftover_longs(&trade);
-            }
+            self.end_by_exit_fill(index, &trade, order_id, kind, level, price);
         } else if order_is_final(status) {
             // An order the person deleted ends as asked - also a stop an adjustment was about to replace: it is not placed again.
             if self.watch.user_cancelled.remove(&order_id) {
@@ -1072,6 +1063,109 @@ impl App {
             self.instant.template_status = Some(format!("{label}: {kind} {order_id} {status}"));
             self.forget_ended_exit_order(index, order_id);
         }
+    }
+
+    /// What TWS reports for a working order (`openOrder`, sent on every change of it and for the reconciliation) holds over the app's
+    /// record: a stop or target changed in TWS by hand, or changed while `TradePilot` was not running, is taken over and logged. Only
+    /// prices that mean the same as the record are taken: the stop price of a plain stop (`STP`, a trade without a stop-limit; a REL or
+    /// trailing order carries an offset there, the backstop of a stop-limit pair another price), and the limit of a profit target.
+    pub(super) fn adopt_working_prices(&mut self, info: &broker::OpenOrderInfo) {
+        let order_id = info.order_id;
+        let Some(index) = self.trades_stored.iter().position(|t| t.is_open() && t.exit_order_ids().contains(&order_id)) else { return };
+        let Some(trade) = self.trades_stored.get(index).cloned() else { return };
+        let label = trade.label();
+        let mut updated = trade.clone();
+        let (kind, old, new) = if trade.stop_order_id == Some(order_id) && trade.stop_limit_order_id.is_none() && info.order_type == "STP" {
+            let Some(price) = info.aux_price.and_then(dec).map(|p| p.normalize()) else { return };
+            updated.set_stop(Some(price));
+            ("stop", trade.stop_now(), price)
+        } else if info.order_type == "LMT" {
+            let Some(price) = info.limit_price.and_then(dec).map(|p| p.normalize()) else { return };
+            let slot = trade.exit_levels.as_ref().and_then(|levels| levels.order_ids.iter().position(|id| *id == Some(order_id)));
+            match (slot, updated.exit_levels.as_mut()) {
+                (Some(slot), Some(levels)) => {
+                    if let Some(entry) = levels.prices.get_mut(slot) {
+                        *entry = Some(price.to_string());
+                    }
+                    if slot == 0 {
+                        updated.profit_price = Some(price);
+                    }
+                }
+                _ if trade.profit_order_id == Some(order_id) => updated.profit_price = Some(price),
+                _ => return,
+            }
+            ("profit target", trade.target_now(), price)
+        } else {
+            return;
+        };
+        if old == Some(new) {
+            return;
+        }
+        self.log(&format!(
+            "The {kind} {order_id} of {label} is at {new} in TWS ({} on record) - taken over",
+            old.map_or_else(|| "-".to_string(), |p| p.normalize().to_string())
+        ));
+        self.save_trade(index, updated);
+    }
+
+    /// The exit order `order_id` (a `kind` of "stop", "profit target" or "close order"; `level` the profit-target level it is) of the
+    /// open `trade` at `index` filled completely at `price` per contract (negative = paid to close): a profit target records its level,
+    /// a stop or close order ends what is left.
+    fn end_by_exit_fill(&mut self, index: usize, trade: &StoredTrade, order_id: i32, kind: &str, level: Option<usize>, price: Decimal) {
+        let how = format!("{kind} {order_id}");
+        if kind == "profit target" {
+            self.on_profit_level_filled(index, level.unwrap_or(0), price, &how);
+            return;
+        }
+        // A stop or close order ends what is left; the levels hit before count in the average.
+        let Some(average) = self.average_close_price(trade, price) else {
+            self.log(&format!("The {kind} {order_id} of {} filled, but the closing price cannot be averaged - trade left open", trade.label()));
+            return;
+        };
+        self.finish_trade(index, if kind == "stop" { TradeStatus::Stopped } else { TradeStatus::Closed }, average, &how);
+        if kind == "stop" {
+            self.sell_leftover_longs(trade);
+        }
+    }
+
+    /// The exit orders `filled` of the open trade at `index` filled while `TradePilot` was not running (the executions of TWS show it):
+    /// each one that filled for all its contracts ends the trade, or its profit-target level, at the price of its fills, as its fill would
+    /// have done live. Returns whether the trade is closed now; an order filled only in part is reported and changes nothing.
+    fn close_by_missed_fills(&mut self, index: usize, filled: &[i32]) -> bool {
+        for &order_id in filled {
+            let Some(trade) = self.trades_stored.get(index).cloned().filter(StoredTrade::is_open) else {
+                break;
+            };
+            let label = trade.label();
+            let level = trade.exit_levels.as_ref().and_then(|levels| levels.order_ids.iter().position(|id| *id == Some(order_id)));
+            let kind = if trade.stop_order_id == Some(order_id) || trade.stop_limit_order_id == Some(order_id) {
+                "stop"
+            } else if trade.profit_order_id == Some(order_id) || level.is_some() {
+                "profit target"
+            } else {
+                "close order"
+            };
+            let expected = match (kind, level, trade.exit_levels.as_ref()) {
+                ("profit target", Some(level), Some(levels)) => levels.qty.get(level).copied().unwrap_or(0),
+                _ => trade.remaining_qty(),
+            };
+            let Some((contracts, price)) = fill_of_order(&self.exec_history, order_id) else {
+                self.log(&format!("WARNING: {label}: the {kind} {order_id} filled while TradePilot was not running, but its price cannot be read from the executions - use Mark closed"));
+                continue;
+            };
+            if contracts < expected {
+                self.log(&format!(
+                    "WARNING: {label}: the {kind} {order_id} filled only {contracts} of {expected} contract(s) while TradePilot was not running - check the trade in TWS"
+                ));
+                continue;
+            }
+            self.log(&format!("{label}: the {kind} {order_id} filled while TradePilot was not running ({contracts} contract(s) at {price} per contract)"));
+            self.end_by_exit_fill(index, &trade, order_id, kind, level, price);
+            if self.trades_stored.get(index).is_some_and(|t| !t.is_open()) {
+                self.watch.closed_by.insert(trade.key(), order_id);
+            }
+        }
+        self.trades_stored.get(index).is_some_and(|t| !t.is_open())
     }
 
     /// An exit order of an open trade ended without a fill (cancelled in TWS, say): the trade no longer has it, so the
@@ -1102,8 +1196,8 @@ impl App {
         }
         if updated.stop_order_id.is_none() && updated.stop_limit_order_id.is_none() && (trade.stop_order_id.is_some() || trade.stop_limit_order_id.is_some()) {
             // Without a stop there is nothing the adjustments could move.
-            updated.stop_price = None;
             updated.adjustments = None;
+            updated.set_stop(None);
         }
         if updated != *trade {
             self.log(&format!("{}: order {order_id} is no longer part of the trade", trade.label()));

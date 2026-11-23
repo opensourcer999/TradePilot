@@ -1115,6 +1115,95 @@ fn open_orders_are_requested_with_version_1_and_their_ids_read_for_every_server_
 }
 
 #[test]
+fn the_head_of_an_open_order_gives_its_contract_and_its_prices_for_every_server_version() {
+    let fields = |values: &[&str]| values.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
+    // A stop of a combo (server version 200): id, contract (conId 0 for a BAG, no expiry/strike/right), the order, then the
+    // version-dependent rest, which is not read. TWS sends the unset limit as the largest double.
+    let combo_stop = [
+        "5",
+        "11",
+        "0",
+        "SPX",
+        "BAG",
+        "",
+        "0",
+        "",
+        "",
+        "SMART",
+        "USD",
+        "",
+        "",
+        "BUY",
+        "1",
+        "STP",
+        "1.7976931348623157E308",
+        "1.2",
+        "DAY",
+        "TradePilot-11",
+        "DU1234567",
+        "O",
+        "0",
+        "TraPi-11 (SL)",
+        "0",
+        "123",
+        "0",
+        "0",
+        "0",
+    ];
+    let info = parse_open_order(&fields(&combo_stop), 200).expect("the head is complete");
+    assert_eq!(
+        (info.order_id, info.sec_type.as_str(), info.action.as_str(), info.order_type.as_str(), info.limit_price, info.aux_price),
+        (11, "BAG", "BUY", "STP", None, Some(1.2))
+    );
+    assert_eq!((info.total_quantity, info.tif.as_str(), info.oca_group.as_str()), (1.0, "DAY", "TradePilot-11"));
+    assert_eq!((info.account.as_str(), info.order_ref.as_str()), ("DU1234567", "TraPi-11 (SL)"));
+
+    // A limit order of one option; an empty aux price is none as well.
+    let option_target = [
+        "5",
+        "12",
+        "945737094",
+        "SPX",
+        "OPT",
+        "20261123",
+        "7155",
+        "P",
+        "100",
+        "SMART",
+        "USD",
+        "SPXW  261123P07155000",
+        "SPXW",
+        "BUY",
+        "2",
+        "LMT",
+        "0.2",
+        "",
+        "GTC",
+        "",
+        "DU1234567",
+        "O",
+        "0",
+        "TraPi-12 (TP)",
+    ];
+    let info = parse_open_order(&fields(&option_target), 200).unwrap();
+    assert_eq!((info.con_id, info.expiry.as_str(), info.strike, info.right.as_str()), (945_737_094, "20261123", 7155.0, "P"));
+    assert_eq!((info.total_quantity, info.limit_price, info.aux_price, info.oca_group.as_str()), (2.0, Some(0.2), None, ""));
+
+    // Below server version 145 the message version comes first: from 32 on the same head follows.
+    let mut old = vec!["5", "34"];
+    old.extend_from_slice(&option_target[1..]);
+    assert_eq!(parse_open_order(&fields(&old), 144).map(|i| (i.order_id, i.limit_price)), Some((12, Some(0.2))));
+    // An older message version leaves out contract fields: nothing is read rather than shifted fields.
+    old[1] = "31";
+    assert_eq!(parse_open_order(&fields(&old), 144), None);
+    // A head that ends early or holds a garbled price is not read.
+    assert_eq!(parse_open_order(&fields(&combo_stop[..20]), 200), None);
+    let mut garbled = combo_stop;
+    garbled[17] = "x";
+    assert_eq!(parse_open_order(&fields(&garbled), 200), None);
+}
+
+#[test]
 fn order_status_carries_the_average_fill_price() {
     let fields: Vec<String> = ["3", "42", "Filled", "1", "0", "-2.35", "9", "0", "-2.35", "0", "", "0"].iter().map(std::string::ToString::to_string).collect();
     match parse_order_status(&fields, 200) {

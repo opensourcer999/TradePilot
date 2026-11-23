@@ -305,12 +305,15 @@ fn a_stop_and_a_target_can_be_attached_to_an_open_trade_that_lacks_them() {
     app.exits_pending = None;
     // The stop and the target are gone (say, cancelled in TWS and the trade was edited by hand).
     let mut bare = app.trades_stored.first().unwrap().clone();
-    (bare.stop_order_id, bare.profit_order_id, bare.stop_price, bare.profit_price, bare.oca_group) = (None, None, None, None, None);
+    (bare.stop_order_id, bare.profit_order_id, bare.profit_price, bare.oca_group, bare.adjustments) = (None, None, None, None, None);
+    bare.set_stop(None);
     app.trades_stored[0] = bare;
     app.request_exits(0);
     assert!(app.exits_pending.is_some());
     app.exits_pending.as_mut().unwrap().stop = "0,90".to_string();
     app.exits_pending.as_mut().unwrap().target = "0.15".to_string();
+    app.exits_pending.as_mut().unwrap().stop_unit = Some(super::attach::ExitUnit::Price);
+    app.exits_pending.as_mut().unwrap().target_unit = Some(super::attach::ExitUnit::Price);
     let first_id = app.next_order_id.unwrap();
     app.confirm_exits();
     let sent = drain(&commands);
@@ -349,6 +352,23 @@ fn a_stop_and_a_target_can_be_attached_to_an_open_trade_that_lacks_them() {
 }
 
 #[test]
+fn a_changed_stop_is_the_stop_the_list_shows_also_when_the_adjustments_keep_one() {
+    let (mut app, commands, _) = trade_with_attached_exits();
+    let mut trade = app.trades_stored.first().unwrap().clone();
+    trade.adjustments = Some(StopAdjustments { stop: trade.stop_price.map(|p| p.normalize().to_string()), ..StopAdjustments::default() });
+    app.trades_stored[0] = trade;
+    let stop_id = app.trades_stored.first().unwrap().stop_order_id.unwrap();
+    app.request_exits(0);
+    app.exits_pending.as_mut().expect("the stop can be changed").stop = "1,10".to_string();
+    app.confirm_exits();
+    drain(&commands);
+    app.tws_sender.send(order_status(stop_id, "Submitted", 0.0, 1.0)).unwrap();
+    app.poll_tws();
+    assert_eq!(app.trades_stored.first().unwrap().stop_now().map(|p| p.normalize().to_string()).as_deref(), Some("1.1"));
+    assert_eq!(app.trade_row_views()[0].stop, "1.10");
+}
+
+#[test]
 fn a_typed_price_that_rounds_to_the_price_on_record_sends_nothing() {
     let (mut app, commands, _) = trade_with_attached_exits();
     app.request_exits(0);
@@ -358,6 +378,88 @@ fn a_typed_price_that_rounds_to_the_price_on_record_sends_nothing() {
     assert!(drain(&commands).iter().all(|c| !matches!(c, TwsCommand::PlaceOrder { .. })), "no order is sent");
     assert!(app.log_lines.iter().any(|l| l.contains("nothing to change")), "{:?}", app.log_lines);
     assert!(!app.log_lines.iter().any(|l| l.contains("TWS did not take the orders")), "{:?}", app.log_lines);
+}
+
+#[test]
+fn the_target_of_a_running_trade_can_be_given_as_a_percentage_of_its_credit() {
+    use super::attach::typed_target;
+    let credit = Decimal::new(160, 2);
+    assert_eq!(typed_target("80%", super::attach::ExitUnit::Price, credit), Some(Decimal::new(32, 2)), "80% of 1.60 kept: closed at 0.32");
+    assert_eq!(typed_target(" 50,5 % ", super::attach::ExitUnit::Price, credit), Some(Decimal::new(792, 3)), "a decimal comma and spaces");
+    assert_eq!(typed_target("100%", super::attach::ExitUnit::Price, credit), Some(Decimal::new(5, 2)), "all of it: closed at 0.05, like a template");
+    assert_eq!(typed_target("0%", super::attach::ExitUnit::Price, credit), None);
+    assert_eq!(typed_target("120%", super::attach::ExitUnit::Price, credit), None);
+    assert_eq!(typed_target("0.15", super::attach::ExitUnit::Price, credit), Some(Decimal::new(15, 2)), "a price stays a price");
+    // In the window: the working target is changed to the price the percentage stands for, on the price grid.
+    let (mut app, commands, _) = trade_with_attached_exits();
+    let open = app.trades_stored.first().unwrap().price_open;
+    app.request_exits(0);
+    app.exits_pending.as_mut().unwrap().target = "80%".to_string();
+    app.confirm_exits();
+    let sent = drain(&commands);
+    let target =
+        sent.iter().find_map(|c| if let TwsCommand::PlaceOrder { order, .. } = c { Some((**order).clone()) } else { None }).expect("the target is sent");
+    let expected = super::fix_price(typed_target("80%", super::attach::ExitUnit::Price, open).unwrap(), "SPX", 2).unwrap().to_f64().unwrap();
+    assert_eq!((target.order_type.as_str(), target.lmt_price), ("LMT", expected), "opened at {open}");
+}
+
+#[test]
+fn the_stop_of_a_running_trade_can_be_given_as_the_loss_in_percent_of_its_credit() {
+    use super::attach::typed_stop;
+    let credit = Decimal::new(160, 2);
+    assert_eq!(
+        typed_stop("300%", super::attach::ExitUnit::Price, credit),
+        Some(Decimal::new(640, 2)),
+        "a loss of 4.80 on 1.60: stopped at 6.40, like multiple 3"
+    );
+    assert_eq!(typed_stop("100 %", super::attach::ExitUnit::Price, credit), Some(Decimal::new(320, 2)));
+    assert_eq!(typed_stop("0%", super::attach::ExitUnit::Price, credit), None);
+    assert_eq!(typed_stop("x%", super::attach::ExitUnit::Price, credit), None);
+    assert_eq!(typed_stop("2,5", super::attach::ExitUnit::Price, credit), Some(Decimal::new(25, 1)), "a price stays a price");
+    // In the window: the working stop is changed to the price the percentage stands for, on the price grid.
+    let (mut app, commands, stop_id) = trade_with_attached_exits();
+    let open = app.trades_stored.first().unwrap().price_open;
+    app.request_exits(0);
+    app.exits_pending.as_mut().unwrap().stop = "300%".to_string();
+    app.confirm_exits();
+    let sent = drain(&commands);
+    let (id, stop) = sent
+        .iter()
+        .find_map(|c| if let TwsCommand::PlaceOrder { order_id, order, .. } = c { Some((*order_id, (**order).clone())) } else { None })
+        .expect("the stop is sent");
+    let expected = super::fix_price(typed_stop("300%", super::attach::ExitUnit::Price, open).unwrap(), "SPX", 2).unwrap().to_f64().unwrap();
+    assert_eq!((id, stop.order_type.as_str(), stop.aux_price), (stop_id, "STP", expected), "opened at {open}");
+}
+
+#[test]
+fn a_value_without_its_unit_or_a_stop_price_far_above_the_trade_is_never_sent() {
+    use super::attach::ExitUnit;
+    let (mut app, commands, _) = trade_with_attached_exits();
+    let mut bare = app.trades_stored.first().unwrap().clone();
+    (bare.stop_order_id, bare.profit_order_id, bare.profit_price, bare.oca_group, bare.adjustments) = (None, None, None, None, None);
+    bare.set_stop(None);
+    app.trades_stored[0] = bare;
+    app.request_exits(0);
+    let pending = app.exits_pending.as_mut().unwrap();
+    assert_eq!((pending.stop_unit, pending.target_unit), (None, None), "an empty field has no unit until the user chooses");
+    // "300" alone: a price or 300%? Nothing is sent, the window stays open.
+    pending.stop = "300".to_string();
+    app.confirm_exits();
+    assert!(drain(&commands).iter().all(|c| !matches!(c, TwsCommand::PlaceOrder { .. })));
+    assert!(app.log_lines.iter().any(|l| l.contains("choose whether the value is a price or a percentage")), "{:?}", app.log_lines);
+    // Chosen as a price, 300 is far beyond any price this trade can cost to close.
+    let pending = app.exits_pending.as_mut().expect("the window stays open");
+    pending.stop_unit = Some(ExitUnit::Price);
+    app.confirm_exits();
+    assert!(drain(&commands).iter().all(|c| !matches!(c, TwsCommand::PlaceOrder { .. })));
+    assert!(app.log_lines.iter().any(|l| l.contains("was it meant as a percentage?")), "{:?}", app.log_lines);
+    // Chosen as a percentage, it is sent as the stop the percentage stands for.
+    let open = app.trades_stored.first().unwrap().price_open;
+    app.exits_pending.as_mut().expect("still open").stop_unit = Some(ExitUnit::Percent);
+    app.confirm_exits();
+    let stop = drain(&commands).iter().find_map(|c| if let TwsCommand::PlaceOrder { order, .. } = c { Some((**order).clone()) } else { None }).expect("sent");
+    let expected = super::fix_price(super::attach::typed_stop("300", ExitUnit::Percent, open).unwrap(), "SPX", 2).unwrap().to_f64().unwrap();
+    assert_eq!((stop.order_type.as_str(), stop.aux_price), ("STP", expected));
 }
 
 #[test]

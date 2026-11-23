@@ -3,8 +3,10 @@
 //! executions seen. Pure logic - no `App`, no connection, no log: `App::reconcile_open_orders`
 //! carries the decision out. It can be tested on its own, with plain data.
 
+use crate::pricing::dec;
 use crate::records::{StoredExecution, StoredTrade};
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 
 /// What the reconciliation found for one trade.
@@ -70,6 +72,40 @@ pub fn reconcile_trade(trade: &StoredTrade, working: &[i32], executions: &[Store
     let (filled_ids, missing): (Vec<i32>, Vec<i32>) = gone.into_iter().partition(|id| filled(*id));
     let stop_gone = old_stops.iter().any(|id| missing.contains(id));
     Reconciliation::Missing { filled: filled_ids, missing, stop_gone }
+}
+
+/// What the option fills of `order_id` closed: the contracts (its smallest leg) and the price per contract, positive when the fills
+/// brought money and negative when they cost it - the sign of `StoredTrade::price_close`. A fill that TWS reported twice counts once.
+/// `None` without option fills of the order or with a price that cannot be computed.
+#[must_use]
+pub fn fill_of_order(executions: &[StoredExecution], order_id: i32) -> Option<(u32, Decimal)> {
+    let mut seen: Vec<&str> = Vec::new();
+    // Per option: the contracts filled and the money they brought (sold) or cost (bought).
+    let mut legs: Vec<(i32, Decimal, Decimal)> = Vec::new();
+    for e in executions.iter().filter(|e| e.order_id == order_id && e.sec_type == "OPT") {
+        if seen.contains(&e.exec_id.as_str()) {
+            continue;
+        }
+        seen.push(e.exec_id.as_str());
+        let (qty, price) = (dec(e.quantity)?, dec(e.price)?);
+        let amount = price.checked_mul(qty)?;
+        let value = if e.side == "SLD" { amount } else { -amount };
+        match legs.iter_mut().find(|(con_id, _, _)| *con_id == e.con_id) {
+            Some(leg) => {
+                leg.1 = leg.1.checked_add(qty)?;
+                leg.2 = leg.2.checked_add(value)?;
+            }
+            None => legs.push((e.con_id, qty, value)),
+        }
+    }
+    let units = legs.iter().map(|(_, qty, _)| *qty).min()?;
+    let contracts = u32::try_from(units.to_i64()?).ok().filter(|q| *q > 0)?;
+    let mut total = Decimal::ZERO;
+    for (_, _, value) in &legs {
+        total = total.checked_add(*value)?;
+    }
+    let price = total.checked_div(units)?.round_dp_with_strategy(4, rust_decimal::RoundingStrategy::MidpointAwayFromZero);
+    Some((contracts, price.normalize()))
 }
 
 /// How many contracts the stop of `trade` covers when that is fewer than the trade holds: `Some((covered, held))`. `remaining` are the
@@ -208,6 +244,33 @@ mod tests {
         assert_eq!(reconcile_trade(&t, &[12], &[fill_of(11)], true), Reconciliation::AdjustmentStopFilled { order_id: 11 });
         // The fill counts first: also while the old stop is still listed, and with the gate shut.
         assert_eq!(reconcile_trade(&t, &[11, 12], &[fill_of(11)], false), Reconciliation::AdjustmentStopFilled { order_id: 11 });
+    }
+
+    #[test]
+    fn the_fills_of_a_closing_order_give_its_contracts_and_its_price_per_contract() {
+        let leg = |id: &str, order_id: i32, con_id: i32, side: &str, qty: f64, price: f64| StoredExecution {
+            exec_id: id.into(),
+            con_id,
+            side: side.into(),
+            quantity: qty,
+            price,
+            ..fill_of(order_id)
+        };
+        // A credit spread bought back for 0.20: the short leg bought at 0.30, the long leg sold at 0.10.
+        let spread = [leg("a", 8, 1, "BOT", 1.0, 0.3), leg("b", 8, 2, "SLD", 1.0, 0.1)];
+        assert_eq!(fill_of_order(&spread, 8), Some((1, Decimal::new(-2, 1))));
+        // The same fill reported twice, a fill of another order and a combo row are not counted.
+        let mut noisy = spread.to_vec();
+        noisy.push(leg("a", 8, 1, "BOT", 1.0, 0.3));
+        noisy.push(leg("c", 9, 1, "BOT", 5.0, 9.0));
+        noisy.push(StoredExecution { sec_type: "BAG".into(), ..leg("d", 8, 3, "BOT", 1.0, 0.2) });
+        assert_eq!(fill_of_order(&noisy, 8), Some((1, Decimal::new(-2, 1))));
+        // Two partial fills of two contracts: the price is per contract.
+        let two = [leg("a", 8, 1, "BOT", 1.0, 0.3), leg("b", 8, 1, "BOT", 1.0, 0.5), leg("c", 8, 2, "SLD", 2.0, 0.1)];
+        assert_eq!(fill_of_order(&two, 8), Some((2, Decimal::new(-3, 1))));
+        // A single option sold to close brings its price.
+        assert_eq!(fill_of_order(&[leg("a", 8, 1, "SLD", 1.0, 1.25)], 8), Some((1, Decimal::new(125, 2))));
+        assert_eq!(fill_of_order(&spread, 99), None, "no fills of that order");
     }
 
     #[test]

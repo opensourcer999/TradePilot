@@ -4,11 +4,14 @@ use super::{
     credit_summary, data_table, data_table_rows, delta_total, display_currency, display_percent, empty_state, execution_time_text, format_date, gauge_card,
     gauge_card_height, group_name, kpi_card, mask_account, money_text, muted_text, newest_first, next_selection, profit_summary, segmented, show_date,
     sign_color_of, stat_tile, text_primary, trade_table, App, DashboardFigures, Decimal, GaugeSpec, Lang, Page, ProfitSummary, RichText, RunStatus,
-    ScheduleForm, ScheduleRun, TableCell, TableColumn, ACCENT_BLUE, GROUPS, PCR_TICKS, STATUS_ERROR, WIN_TICKS,
+    ScheduleForm, ScheduleRun, StoredTrade, TableCell, TableColumn, ACCENT_BLUE, GROUPS, PCR_TICKS, STATUS_ERROR, WIN_TICKS,
 };
 use crate::widgets::{framed_card, plate_label};
 use eframe::egui;
 use rust_decimal::prelude::ToPrimitive;
+
+/// How many seconds before its start a scheduled trade shows in the top bar.
+const STARTING_SOON_SECS: i64 = 300;
 
 impl App {
     /// The figures of the dashboard's first row, worked out from today's trades.
@@ -119,13 +122,19 @@ impl App {
 
     /// Row 2 of the dashboard: today's trades - title, count, All / Open / Closed, then the list.
     fn dashboard_trades_card(&mut self, ui: &mut egui::Ui) {
-        let views = self.trade_row_views();
         framed_card(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(self.tr("Trades today", "Heutige Trades")).size(16.0).strong().color(text_primary()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let options =
-                        [(self.tr("All", "Alle"), ACCENT_BLUE), (self.tr("Open", "Offen"), ACCENT_BLUE), (self.tr("Closed", "Geschlossen"), ACCENT_BLUE)];
+                    // Each choice says how many trades it shows, so a click visibly changes something even when two choices
+                    // show the same trades.
+                    let (open, closed) = self.trade_filter_counts();
+                    let labels = [
+                        format!("{} ({})", self.tr("All", "Alle"), open + closed),
+                        format!("{} ({open})", self.tr("Open", "Offen")),
+                        format!("{} ({closed})", self.tr("Closed", "Geschlossen")),
+                    ];
+                    let options = labels.each_ref().map(|label| (label.as_str(), ACCENT_BLUE));
                     let current = match self.ui_state.trade_filter.as_str() {
                         "Open" => 1,
                         "Closed" => 2,
@@ -134,11 +143,25 @@ impl App {
                     let (clicked, _) = segmented(ui, &options, current, 64.0);
                     if let Some(index) = clicked {
                         self.ui_state.trade_filter = ["All", "Open", "Closed"].get(index).copied().unwrap_or("All").to_string();
+                        ui.ctx().request_repaint();
                     }
                 });
             });
+            // The list after the choice above, so a click shows its trades in the same frame.
+            let views = self.trade_row_views();
             ui.add_space(8.0);
-            if views.is_empty() {
+            if views.is_empty() && !self.trades_stored.iter().all(StoredTrade::is_split) {
+                // There are trades, the filter hides them all.
+                let (title, hint) = if self.ui_state.trade_filter == "Closed" {
+                    (self.tr("No closed trades", "Keine geschlossenen Trades"), self.tr("All trades are still open.", "Alle Trades sind noch offen."))
+                } else {
+                    (
+                        self.tr("No open trades", "Keine offenen Trades"),
+                        self.tr("\"All\" also shows the closed trades.", "„Alle“ zeigt auch die geschlossenen Trades."),
+                    )
+                };
+                empty_state(ui, title, hint);
+            } else if views.is_empty() {
                 empty_state(
                     ui,
                     self.tr("No trades yet", "Noch keine Trades"),
@@ -162,8 +185,8 @@ impl App {
                     "Ask",
                     self.tr("P/L", "G/V"),
                 ];
-                let clicks = trade_table(ui, &views, titles, self.ui_state.selected_trade);
-                self.ui_state.selected_trade = next_selection(self.ui_state.selected_trade, clicks, Some);
+                let clicks = trade_table(ui, &views, titles, self.selected_open_index());
+                self.apply_trade_clicks(clicks);
             }
             self.open_trade_actions(ui);
             // The raw executions TWS reports for today: collapsed once the list above has trades.
@@ -229,9 +252,12 @@ impl App {
     }
 
     /// The name of the template of a run's schedule, for the lists of runs.
-    fn run_template_name(&self, run: &ScheduleRun) -> String {
+    pub(super) fn run_template_name(&self, run: &ScheduleRun) -> String {
         let template_id = self.schedule_of_run(run).map(|schedule| schedule.template_id);
-        template_id.and_then(|id| self.template(id)).map_or_else(|| "?".to_string(), |t| t.name.clone())
+        match template_id {
+            None => self.tr("(schedule deleted)", "(Zeitplan gelöscht)").to_string(),
+            Some(id) => self.template(id).map_or_else(|| self.tr("(template deleted)", "(Template gelöscht)").to_string(), |t| t.name.clone()),
+        }
     }
 
     /// A run's window as text in New York time, e.g. `09:35:00`.
@@ -244,6 +270,54 @@ impl App {
         run.window_start.with_timezone(&chrono::Local).format("%H:%M:%S").to_string()
     }
 
+    /// The place in `trades_stored` of the selected trade, while it is open; a trade that closed is no longer selected.
+    pub(super) fn selected_open_index(&self) -> Option<usize> {
+        let key = self.ui_state.selected_trade.as_deref()?;
+        self.trades_stored.iter().position(|t| t.is_open() && t.key() == key)
+    }
+
+    /// The clicks on the list of today's trades: only an open trade can be selected, a click on a closed one changes nothing.
+    pub(super) fn apply_trade_clicks(&mut self, clicks: crate::widgets::RowClicks) {
+        let current = self.selected_open_index().and(self.ui_state.selected_trade.clone());
+        let trades = &self.trades_stored;
+        self.ui_state.selected_trade = next_selection(current, clicks, |index| trades.get(index).filter(|t| t.is_open()).map(StoredTrade::key));
+    }
+
+    /// The waiting run that starts next within `STARTING_SOON_SECS`, with the seconds left until its start.
+    pub(super) fn run_starting_soon(runs: &[ScheduleRun], now: chrono::DateTime<chrono::Utc>) -> Option<(&ScheduleRun, i64)> {
+        runs.iter()
+            .filter(|run| run.status == RunStatus::Waiting)
+            .map(|run| (run, (run.window_start - now).num_seconds()))
+            .filter(|(_, left)| (1..=STARTING_SOON_SECS).contains(left))
+            .min_by_key(|(_, left)| *left)
+    }
+
+    /// The sign of the top bar that a scheduled trade starts within five minutes: a clock at five to twelve and the time left; the
+    /// template on hover. A click shows the run on the Dashboard. Nothing while no run starts that soon.
+    pub(super) fn starting_soon_item(&mut self, ui: &mut egui::Ui) {
+        let now = self.clock.utc();
+        let runs = self.dashboard_runs();
+        let Some((run, left)) = Self::run_starting_soon(&runs, now) else { return };
+        let template = self.run_template_name(run);
+        let left_text = format!("{}:{:02}", left / 60, left % 60);
+        crate::widgets::bar_separator(ui);
+        let size = egui::vec2(22.0, 22.0);
+        let (rect, clock) = ui.allocate_exact_size(size, egui::Sense::click());
+        let seconds = f32::from(u8::try_from(now.timestamp().rem_euclid(60)).unwrap_or(0));
+        ui.painter().extend(crate::metal::five_to_twelve_clock(ui.ctx(), rect.center(), 10.0, super::ORANGE_WARN, seconds));
+        let label = ui.add(egui::Label::new(RichText::new(left_text.clone()).color(super::ORANGE_WARN).strong().size(13.0)).sense(egui::Sense::click()));
+        let hover = match self.settings.lang {
+            Lang::De => format!("Geplanter Trade „{template}“ startet in {left_text} (NY {}).", Self::run_time_text(run)),
+            Lang::En => format!("Scheduled trade \"{template}\" starts in {left_text} (NY {}).", Self::run_time_text(run)),
+        };
+        let clicked = clock.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&hover).clicked()
+            || label.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&hover).clicked();
+        if clicked {
+            self.page = Page::Dashboard;
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
     /// The time left until a waiting run starts as `HH:MM:SS`; `None` once it has started or for a run that is not waiting.
     pub(super) fn run_countdown(run: &ScheduleRun, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
         if run.status != RunStatus::Waiting {
@@ -253,12 +327,26 @@ impl App {
         (left > 0).then(|| format!("{:02}:{:02}:{:02}", left / 3600, left % 3600 / 60, left % 60))
     }
 
+    /// Today's runs as the Dashboard lists them, by their time. A run of a deleted schedule is listed only while it has an order or a
+    /// trade to show; else it is gone with its schedule (the task log of the reports keeps it).
+    pub(super) fn dashboard_runs(&self) -> Vec<ScheduleRun> {
+        let today = self.clock.new_york().date();
+        let mut runs: Vec<ScheduleRun> = self
+            .schedule
+            .runs
+            .iter()
+            .filter(|run| run.day == today)
+            .filter(|run| self.schedule_of_run(run).is_some() || matches!(run.status, RunStatus::Working | RunStatus::Complete | RunStatus::Partial))
+            .cloned()
+            .collect();
+        runs.sort_by_key(|run| run.window_start);
+        runs
+    }
+
     /// The card "Scheduled Tasks" of the dashboard: today's runs (time, type, status, template). A click
     /// selects a run, the bar below acts on it and its schedule; a double-click opens the schedule.
     fn scheduled_tasks_card(&mut self, ui: &mut egui::Ui) {
-        let today = self.clock.new_york().date();
-        let mut runs: Vec<ScheduleRun> = self.schedule.runs.iter().filter(|run| run.day == today).cloned().collect();
-        runs.sort_by_key(|run| run.window_start);
+        let runs = self.dashboard_runs();
         let now = self.clock.utc();
         let mut group = self.schedule.group;
         framed_card(ui, |ui| {

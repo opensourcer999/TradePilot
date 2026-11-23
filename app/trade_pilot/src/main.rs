@@ -95,7 +95,8 @@ fn main() -> eframe::Result<()> {
     let try_save = args.iter().position(|a| a == "--try-save").and_then(|i| args.get(i + 1)).cloned();
     let window_width = args.iter().position(|a| a == "--width").and_then(|i| args.get(i + 1)).and_then(|value| value.parse::<f32>().ok()).unwrap_or(1430.0);
     let window_height = args.iter().position(|a| a == "--height").and_then(|i| args.get(i + 1)).and_then(|value| value.parse::<f32>().ok()).unwrap_or(800.0);
-    let title = "TradePilot".to_string();
+    // The window's title bar names the version after the app.
+    let title = format!("TradePilot {}", app::APP_VERSION);
     // The dashboard's credit-trades card + two gauges are fixed-pixel widgets (250 + 24 + 200 +
     // 12 + 200 = 686px) inside a 320px fixed sidebar and a 20px CentralPanel margin on each side;
     // below ~1100px window width that row has nowhere to shrink and overflows the window, as

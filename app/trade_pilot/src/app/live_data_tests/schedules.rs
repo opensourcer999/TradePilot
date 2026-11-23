@@ -470,3 +470,29 @@ fn deleting_a_schedule_frees_the_schedules_that_waited_for_it_and_a_blocked_file
     app.save_schedules();
     assert!(app.schedule.status.as_deref().is_some_and(|s| s.contains("NOT saved")));
 }
+
+#[test]
+fn a_deleted_schedule_takes_its_waiting_runs_with_it_off_the_dashboard() {
+    let (mut app, _commands) = app_with_a_schedule(0);
+    assert_eq!(app.dashboard_runs().len(), 1, "today's run of the schedule");
+    app.delete_schedule(1);
+    assert_eq!(app.schedule.runs.first().map(|run| run.status), Some(RunStatus::Cancelled), "the waiting run ends with it");
+    assert!(app.dashboard_runs().is_empty(), "and is gone from the Dashboard");
+    app.schedule.runs_checked_at = None;
+    app.update_schedule_runs();
+    assert!(app.dashboard_runs().is_empty(), "no new run for a schedule that is gone");
+    assert_eq!(app.schedule.runs.len(), 1, "the task log keeps it");
+}
+
+#[test]
+fn a_run_of_a_deleted_schedule_with_an_order_stays_listed_under_its_own_name() {
+    let (mut app, _commands) = app_with_a_schedule(0);
+    if let Some(run) = app.schedule.runs.first_mut() {
+        run.status = RunStatus::Working;
+    }
+    app.delete_schedule(1);
+    let runs = app.dashboard_runs();
+    assert_eq!(runs.len(), 1, "its order in TWS still needs it");
+    assert_eq!(runs[0].status, RunStatus::Working, "not cancelled: the order has its own handling");
+    assert_eq!(app.run_template_name(&runs[0]), "(schedule deleted)");
+}

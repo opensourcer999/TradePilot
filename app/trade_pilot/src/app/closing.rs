@@ -20,7 +20,15 @@ impl App {
         let leg_count = trade_exit::close_legs(trade).len();
         let suggestion = self.closing_price(trade).and_then(|ask| fix_price(ask, &trade.symbol, leg_count)).filter(|_| kind != CloseKind::Market);
         let price = suggestion.map_or_else(String::new, |p| p.normalize().to_string());
-        self.close_pending = Some(PendingClose { index, kind, price });
+        self.close_pending = Some(PendingClose { index, key: trade.key(), kind, price });
+    }
+
+    /// The open trade a dialog was opened for and its place in the list now. The list can be loaded again while the dialog is open (new
+    /// fills, a split, the change of day), so the trade is found by its key, never by its old place alone; `None` once it is not open.
+    pub(super) fn open_trade_of(&self, index: usize, key: &str) -> Option<(usize, StoredTrade)> {
+        let index =
+            if self.trades_stored.get(index).is_some_and(|t| t.key() == key) { index } else { self.trades_stored.iter().position(|t| t.key() == key)? };
+        self.trades_stored.get(index).filter(|t| t.is_open()).cloned().map(|trade| (index, trade))
     }
 
     /// Shows `text` below the Enter Trade button for `NOTICE_SECONDS`; a newer status replaces it earlier.
@@ -70,12 +78,12 @@ impl App {
         let Some(pending) = self.close_pending.take() else {
             return;
         };
-        let Some(trade) = self.trades_stored.get(pending.index).filter(|t| t.is_open()).cloned() else {
+        let Some((index, trade)) = self.open_trade_of(pending.index, &pending.key) else {
             return;
         };
         let price = crate::pricing::parse_decimal(&pending.price).filter(|p| *p >= Decimal::ZERO);
         if pending.kind == CloseKind::Mark {
-            self.mark_closed(pending.index, &trade, price);
+            self.mark_closed(index, &trade, price);
             return;
         }
 
@@ -89,7 +97,7 @@ impl App {
         } else {
             None
         };
-        match self.place_close_order(pending.index, limit) {
+        match self.place_close_order(index, limit) {
             Ok(order_id) => {
                 self.instant.template_status = Some(format!("#{order_id}: {}", self.tr("close order sent to TWS", "Close-Order an die TWS gesendet")));
             }
@@ -185,9 +193,10 @@ impl App {
         let Some(mut pending) = self.close_pending.take() else {
             return;
         };
-        let Some(trade) = self.trades_stored.get(pending.index).filter(|t| t.is_open()).cloned() else {
+        let Some((index, trade)) = self.open_trade_of(pending.index, &pending.key) else {
             return;
         };
+        pending.index = index;
         let de = self.german();
         let title = match (pending.kind, de) {
             (CloseKind::Limit, true) => "Trade mit Limit schließen?",
@@ -328,8 +337,8 @@ impl App {
             .enumerate()
             .filter(|(_, t)| t.is_open())
             .map(|(index, t)| {
-                let stop = t.stop_price.map(|p| format!("Stop {}", p.normalize()));
-                let target = t.profit_price.map(|p| format!("{} {}", self.tr("Target", "Ziel"), p.normalize()));
+                let stop = t.stop_now().map(|p| format!("Stop {}", p.normalize()));
+                let target = t.target_now().map(|p| format!("{} {}", self.tr("Target", "Ziel"), p.normalize()));
                 let parts: Vec<String> = [stop, target].into_iter().flatten().collect();
                 let protected = !parts.is_empty();
                 let mut info = if protected { parts.join(" · ") } else { self.tr("no stop or target", "kein Stop, kein Ziel").to_string() };
@@ -355,20 +364,17 @@ impl App {
         let mut exits_request: Option<usize> = None;
         let mut delete_request: Option<(usize, bool)> = None;
         egui::CollapsingHeader::new(RichText::new(heading).size(13.0).color(muted_text())).default_open(true).show(ui, |ui| {
-            if !rows.iter().any(|(index, ..)| self.ui_state.selected_trade == Some(*index)) {
+            let chosen = self.selected_open_index();
+            if !rows.iter().any(|(index, ..)| chosen == Some(*index)) {
                 ui.label(
-                    RichText::new(self.tr(
-                        "Click a trade in the list above to select it, then close it here.",
-                        "Klicke oben auf einen Trade, um ihn auszuwählen, und schließe ihn hier.",
-                    ))
-                    .color(muted_text())
-                    .italics(),
+                    RichText::new(self.tr("Select an open trade to edit it here.", "Markiere einen offenen Trade, um ihn hier zu bearbeiten."))
+                        .color(muted_text())
+                        .italics(),
                 );
             }
-            let chosen = self.ui_state.selected_trade;
             for (index, label, info, protected) in rows.iter().filter(|(index, ..)| chosen == Some(*index)) {
                 ui.horizontal(|ui| {
-                    let selected = self.ui_state.selected_trade == Some(*index);
+                    let selected = chosen == Some(*index);
                     let text = RichText::new(if selected { format!("> {label}") } else { label.clone() }).strong();
                     ui.label(if selected { text.color(ACCENT_BLUE) } else { text });
                     ui.label(RichText::new(info).color(if *protected { muted_text() } else { STATUS_ERROR }));

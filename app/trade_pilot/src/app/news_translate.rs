@@ -285,6 +285,17 @@ mod tests {
     }
 
     #[test]
+    fn the_news_line_of_the_dashboard_asks_for_the_translation_of_its_headline() {
+        let mut app = german_app();
+        app.news.items = vec![titled("Stocks soar", Region::Us)];
+        app.news.seen = Some(crate::app::news::SeenNews { up_to: Some(0) });
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.news_bulletin(ui));
+        });
+        assert!(app.news.translation.queued.contains(&key_of("en|de", "Stocks soar")), "{:?}", app.news.translation.queued);
+    }
+    #[test]
     fn an_answer_goes_into_the_cache_and_a_failure_pauses_the_requests() {
         let mut app = german_app();
         let ctx = egui::Context::default();

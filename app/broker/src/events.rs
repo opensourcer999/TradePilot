@@ -83,6 +83,44 @@ pub enum TwsCommand {
     },
 }
 
+/// What an `openOrder` message says about a working order: its contract and the order fields that come before every
+/// version-dependent part of the message (see `parse_open_order`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenOrderInfo {
+    /// The order id.
+    pub order_id: i32,
+    /// The contract id (0 for a combo).
+    pub con_id: i32,
+    /// The symbol.
+    pub symbol: String,
+    /// The security type ("OPT", "BAG", ...).
+    pub sec_type: String,
+    /// The expiry (yyyyMMdd) of an option; empty for a combo.
+    pub expiry: String,
+    /// The strike of an option (0 for a combo).
+    pub strike: f64,
+    /// "P" or "C" for an option; empty for a combo.
+    pub right: String,
+    /// "BUY" or "SELL".
+    pub action: String,
+    /// The order's quantity.
+    pub total_quantity: f64,
+    /// "LMT", "STP", "STP LMT", "REL", "MKT", ...
+    pub order_type: String,
+    /// The limit price; `None` when the order has none.
+    pub limit_price: Option<f64>,
+    /// The stop price (or the offset of a relative or trailing order); `None` when the order has none.
+    pub aux_price: Option<f64>,
+    /// The time in force ("DAY", "GTC", ...).
+    pub tif: String,
+    /// The OCA group; empty without one.
+    pub oca_group: String,
+    /// The account.
+    pub account: String,
+    /// The order reference (`TraPi-12 (SL)` for an order of this app).
+    pub order_ref: String,
+}
+
 /// One position TWS reports (`position`).
 #[derive(Clone)]
 pub struct Position {
@@ -235,6 +273,8 @@ pub enum TwsEvent {
     OpenOrder {
         /// The order id.
         order_id: i32,
+        /// The contract and prices of the order; `None` when the message is too old or too short to read them.
+        details: Option<Box<OpenOrderInfo>>,
     },
     /// The list of working orders (`OpenOrder`) is complete (`openOrderEnd`).
     OpenOrderEnd,

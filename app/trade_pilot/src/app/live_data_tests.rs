@@ -15,6 +15,7 @@ mod sibling_trades;
 mod stop_management;
 mod template_entry_and_valuation;
 mod timed_exits_and_conditions;
+mod trade_lifecycle;
 mod triggers;
 
 /// The day the clock of the test app stands on (see `connected_app`): the tests build their expirations from it.
@@ -225,7 +226,7 @@ fn reconnect_with_working_orders(app: &mut App, commands: &mpsc::Receiver<TwsCom
     let asked = drain(commands);
     assert_eq!(asked.iter().filter(|c| matches!(c, TwsCommand::RequestOpenOrders)).count(), 1, "the working orders are asked for once");
     for order_id in working {
-        app.tws_sender.send(TwsEvent::OpenOrder { order_id: *order_id }).unwrap();
+        app.tws_sender.send(TwsEvent::OpenOrder { order_id: *order_id, details: None }).unwrap();
     }
     app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
     app.poll_tws();
@@ -552,11 +553,14 @@ fn trade_with_attached_exits() -> (App, std::sync::mpsc::Receiver<TwsCommand>, i
     let (mut app, commands) = app_with_a_sent_template_order(true);
     filled_trade_with_exits(&mut app, &commands);
     let mut bare = app.trades_stored.first().unwrap().clone();
-    (bare.stop_order_id, bare.profit_order_id, bare.stop_price, bare.profit_price, bare.oca_group) = (None, None, None, None, None);
+    (bare.stop_order_id, bare.profit_order_id, bare.profit_price, bare.oca_group, bare.adjustments) = (None, None, None, None, None);
+    bare.set_stop(None);
     app.trades_stored[0] = bare;
     app.request_exits(0);
     app.exits_pending.as_mut().unwrap().stop = "0.9".to_string();
     app.exits_pending.as_mut().unwrap().target = "0.15".to_string();
+    app.exits_pending.as_mut().unwrap().stop_unit = Some(attach::ExitUnit::Price);
+    app.exits_pending.as_mut().unwrap().target_unit = Some(attach::ExitUnit::Price);
     let stop_id = app.next_order_id.unwrap();
     app.confirm_exits();
     drain(&commands);

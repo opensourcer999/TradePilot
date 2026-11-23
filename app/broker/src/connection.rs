@@ -4,11 +4,11 @@ use crate::{
     encode_cancel_order, encode_place_order, encode_req_bars, encode_req_contract_details, encode_req_daily_bars, encode_req_executions, encode_req_mkt_data,
     encode_req_open_orders, encode_req_sec_def_opt_params, market_data_farm_status, parse_account_summary, parse_commission_report, parse_contract_data,
     parse_execution_data, parse_historical_bars, parse_historical_update, parse_incoming_message, parse_managed_accounts, parse_market_data_ack,
-    parse_open_order_id, parse_option_delta, parse_order_status, parse_position, parse_security_definition_option_parameter, parse_tick_price, parse_tick_size,
-    read_api_frame, read_tws_handshake, send_outgoing_message, tws_error_message, BarsRequest, IbExecutionFilter, TwsCommand, TwsEvent,
-    IB_ACCOUNT_SUMMARY_REQUEST_ID, IB_API_VERSION_MAX, IB_API_VERSION_MIN, IB_CLIENT_ID, IB_EXECUTIONS_REQUEST_ID, IN_COMMISSION_REPORT, IN_CONTRACT_DATA,
-    IN_CONTRACT_DATA_END, IN_EXECUTION_DATA, IN_EXECUTION_DATA_END, IN_HISTORICAL_DATA, IN_HISTORICAL_DATA_END, IN_HISTORICAL_DATA_UPDATE, IN_MANAGED_ACCOUNTS,
-    IN_MARKET_DATA_TYPE, IN_OPEN_ORDER, IN_OPEN_ORDER_END, IN_ORDER_STATUS, IN_SECURITY_DEFINITION_OPTION_PARAMETER,
+    parse_open_order, parse_open_order_id, parse_option_delta, parse_order_status, parse_position, parse_security_definition_option_parameter,
+    parse_tick_price, parse_tick_size, read_api_frame, read_tws_handshake, send_outgoing_message, tws_error_message, BarsRequest, IbExecutionFilter,
+    TwsCommand, TwsEvent, IB_ACCOUNT_SUMMARY_REQUEST_ID, IB_API_VERSION_MAX, IB_API_VERSION_MIN, IB_CLIENT_ID, IB_EXECUTIONS_REQUEST_ID, IN_COMMISSION_REPORT,
+    IN_CONTRACT_DATA, IN_CONTRACT_DATA_END, IN_EXECUTION_DATA, IN_EXECUTION_DATA_END, IN_HISTORICAL_DATA, IN_HISTORICAL_DATA_END, IN_HISTORICAL_DATA_UPDATE,
+    IN_MANAGED_ACCOUNTS, IN_MARKET_DATA_TYPE, IN_OPEN_ORDER, IN_OPEN_ORDER_END, IN_ORDER_STATUS, IN_SECURITY_DEFINITION_OPTION_PARAMETER,
     IN_SECURITY_DEFINITION_OPTION_PARAMETER_END, IN_TICK_GENERIC, IN_TICK_OPTION_COMPUTATION, IN_TICK_PRICE, IN_TICK_REQ_PARAMS, IN_TICK_SIZE, IN_TICK_STRING,
     MARKET_DATA_REQUEST_SPACING_MS, OUT_CANCEL_MKT_DATA, OUT_CANCEL_ORDER, OUT_PLACE_ORDER, OUT_REQ_CONTRACT_DETAILS, OUT_REQ_EXECUTIONS,
     OUT_REQ_HISTORICAL_DATA, OUT_REQ_MKT_DATA, OUT_REQ_OPEN_ORDERS, OUT_REQ_SEC_DEF_OPT_PARAMS,
@@ -271,7 +271,8 @@ fn handle_order_and_chain_message(message_fields: &[String], server_version_num:
         }
         Some(id) if id.parse::<i32>() == Ok(IN_OPEN_ORDER) => match parse_open_order_id(message_fields, server_version_num) {
             Some(order_id) => {
-                let _ = sender.send(TwsEvent::OpenOrder { order_id });
+                let details = parse_open_order(message_fields, server_version_num).filter(|d| d.order_id == order_id).map(Box::new);
+                let _ = sender.send(TwsEvent::OpenOrder { order_id, details });
             }
             None => {
                 let _ = sender.send(TwsEvent::Log("Malformed TWS openOrder message: no order id".into()));

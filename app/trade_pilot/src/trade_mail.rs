@@ -35,7 +35,7 @@ fn today_table(today: &[&StoredTrade], account: &dyn Fn(&str) -> String) -> Stri
     let rows: String = today
         .iter()
         .map(|trade| {
-            let stop = trade.stop_price.map_or_else(|| "-".to_string(), |price| price.normalize().to_string());
+            let stop = trade.stop_now().map_or_else(|| "-".to_string(), |price| price.normalize().to_string());
             let close = trade.price_close.map_or_else(|| "-".to_string(), |price| price.normalize().to_string());
             let cells = [
                 escape(opened_time(trade)),
@@ -74,7 +74,7 @@ pub fn trade_opened(opened: &[&StoredTrade], today: &[&StoredTrade], mask: &dyn 
     let lines: Vec<String> = opened
         .iter()
         .flat_map(|trade| {
-            let stop = trade.stop_price.map_or_else(|| "-".to_string(), |price| price.normalize().to_string());
+            let stop = trade.stop_now().map_or_else(|| "-".to_string(), |price| price.normalize().to_string());
             [format!("{} @ {}", describe(trade), trade.price_open.normalize()), format!("Stop Target: {stop}")]
         })
         .collect();
@@ -209,6 +209,17 @@ pub fn quotes_missing(problems: &[String]) -> TradeMail {
         "Trade Quotes Missing or Outdated",
         problems,
         "Without current quotes the exit conditions cannot be checked. Open the Quotes page and click Refresh Quote Subscriptions; if that does not help, restart TWS and reconnect.",
+    )
+}
+
+/// "ALERT: Open trade not in the TWS positions": an open trade whose options TWS no longer holds.
+#[must_use]
+pub fn position_gone(problems: &[String]) -> TradeMail {
+    alert(
+        "ALERT: Open trade not in the TWS positions",
+        "Trade Position Missing",
+        problems,
+        "The trade was probably closed in TWS by hand. Its stop and profit target are still working there and would open a new position: check the orders in TWS, then use Mark closed.",
     )
 }
 

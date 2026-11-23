@@ -26,8 +26,8 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// What the person has seen: the time of the newest item (seconds since 1970). It is kept in `news_seen.json`, so a restart does not
 /// show the same news as new again.
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
-struct SeenNews {
-    up_to: Option<i64>,
+pub(super) struct SeenNews {
+    pub(super) up_to: Option<i64>,
 }
 
 /// The file in the data folder that keeps what has been seen.
@@ -51,7 +51,7 @@ pub(super) struct NewsState {
     /// The translations of the headlines and texts.
     pub(super) translation: super::news_translate::TranslationState,
     /// What the person has seen; `None` until it is read from its file.
-    seen: Option<SeenNews>,
+    pub(super) seen: Option<SeenNews>,
     /// The item that is opened (its address, or its headline without one).
     opened: Option<String>,
 }
@@ -161,9 +161,13 @@ impl App {
     pub(super) fn news_bulletin(&mut self, ui: &mut egui::Ui) {
         let (count, newest) = {
             let unseen = self.unseen_news();
-            (unseen.len(), unseen.first().map(|item| item.title.clone()))
+            (unseen.len(), unseen.first().map(|item| (item.region, item.title.clone())))
         };
-        let Some(newest) = newest else { return };
+        let Some((region, newest)) = newest else { return };
+        // The headline in the language of the screens, like on the News page; the original until the translation is there.
+        let ctx = ui.ctx().clone();
+        self.want_translation(&ctx, region, &newest);
+        let newest = self.translated(region, &newest).unwrap_or(newest);
         let title = if count == 1 {
             self.tr("1 new news item", "1 neue Nachricht").to_string()
         } else {

@@ -411,8 +411,10 @@ enum CloseKind {
 
 /// A manual close waiting for the user's confirmation.
 struct PendingClose {
-    /// Index in `trades_stored`.
+    /// Index in `trades_stored` when the dialog was opened; the trade is found again by `key` (see `App::open_trade_of`).
     index: usize,
+    /// `StoredTrade::key` of the trade the dialog is for.
+    key: String,
     kind: CloseKind,
     /// The price per contract the user types: the limit (paid to close), or for Mark Closed the
     /// price the trade was closed at. Not used for a market order.
@@ -1401,8 +1403,9 @@ struct UiState {
     log_view: Option<String>,
     /// Which of today's trades the Dashboard list shows: "All", "Open" or "Closed".
     trade_filter: String,
-    /// The trade selected in the list of today's trades (its index in `trades_stored`), to be closed with the buttons under the list.
-    selected_trade: Option<usize>,
+    /// The trade selected in the list of today's trades (its `StoredTrade::key`), to be closed with the buttons under the list. Only an
+    /// open trade can be selected; read through `App::selected_open_index`.
+    selected_trade: Option<String>,
     /// What the last notification email did (sending, sent, why not), shown under the "sample" button.
     mail_status: Option<String>,
     /// The question whether the logs are really to be cleared is open.
@@ -1417,7 +1420,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             log_view: None,
-            trade_filter: "All".to_string(),
+            trade_filter: "Open".to_string(),
             selected_trade: None,
             mail_status: None,
             confirm_clear_logs: false,
@@ -2159,9 +2162,16 @@ impl App {
                     // The trades are complete now: compare their exit orders with what TWS has.
                     self.request_open_orders();
                 }
-                TwsEvent::OpenOrder { order_id } => {
+                TwsEvent::OpenOrder { order_id, details } => {
                     let role = self.order_role(order_id);
                     self.debug(&format!("TWS open order {order_id} - {role}"));
+                    if let Some(info) = details {
+                        self.debug(&format!(
+                            "TWS open order {order_id}: {} {} {} limit {:?} stop {:?} ({})",
+                            info.action, info.total_quantity, info.order_type, info.limit_price, info.aux_price, info.order_ref
+                        ));
+                        self.adopt_working_prices(&info);
+                    }
                     if let Some(snapshot) = self.open_orders_snapshot.as_mut() {
                         if !snapshot.contains(&order_id) {
                             snapshot.push(order_id);
@@ -2265,8 +2275,8 @@ impl App {
             let is_paper = looks_like_paper_account(&account);
             self.session.account_is_paper = Some(is_paper);
             self.log(&format!(
-                "Account {account} {} IB's paper-account prefix ('DU'); order placement is {}.",
-                if is_paper { "matches" } else { "does not match" },
+                "Account {account} is {}; order placement is {}.",
+                if is_paper { "a paper account (IB's paper accounts start with 'DU')" } else { "a live account (no 'DU' of an IB paper account)" },
                 if is_paper == self.link.trading_live {
                     "blocked (account does not match the Live/Paper switch)".to_string()
                 } else if self.link.trading_live {
@@ -2805,6 +2815,13 @@ impl App {
         self.log_unsent_requests("request chain lookups", unsent);
     }
 
+    /// How many trades of the Dashboard's list are open and how many closed (the sides of a split trade count, the split trade itself not).
+    pub(super) fn trade_filter_counts(&self) -> (usize, usize) {
+        let shown = self.trades_stored.iter().filter(|t| !t.is_split());
+        let open = shown.clone().filter(|t| t.is_open()).count();
+        (open, shown.count().saturating_sub(open))
+    }
+
     /// The rows of the Dashboard's trade list (newest first), after the All / Open / Closed filter:
     /// each trade with its live bid and ask to close, and its profit.
     fn trade_row_views(&self) -> Vec<TradeRowView> {
@@ -2860,7 +2877,7 @@ impl App {
                             self.tr("contracts: the rest has no stop.", "Kontrakten: der Rest hat keinen Stop.")
                         )
                     }),
-                    target: money(t.profit_price),
+                    target: money(t.target_now()),
                     bid: money(bid),
                     mid: money(bid.zip(ask).and_then(|(bid, ask)| bid.checked_add(ask)).map(|sum| sum / Decimal::TWO)),
                     ask: money(ask),
@@ -3120,11 +3137,8 @@ impl App {
         }
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-            ui.add_space(10.0);
-            if self.window.sidebar_expanded {
-                ui.label(RichText::new(APP_VERSION).small().color(nav_inactive()));
-            }
-            ui.add_space(4.0);
+            // The version is in the title bar of the window.
+            ui.add_space(14.0);
             let light = self.settings.light_mode;
             let expanded = self.window.sidebar_expanded;
             let text = if expanded { ui_mode_name(light) } else { ui_mode_name(light).get(..1).unwrap_or_default() };
@@ -3235,12 +3249,12 @@ impl App {
                         let color = if warning.is_some() {
                             ORANGE_WARN
                         } else {
-                            spx_direction(spx).map_or_else(text_primary, |up| action_color(if up { "BUY" } else { "SELL" }))
+                            spx_direction(spx).map_or(crate::widgets::READOUT_TEXT, |up| action_color(if up { "BUY" } else { "SELL" }))
                         };
                         ui.scope(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             ui.label(RichText::new("SPX").color(muted_text()).size(13.0));
-                            ui.label(RichText::new(format!("{last:.2}")).color(color).strong().size(13.0));
+                            crate::widgets::price_readout(ui, &format!("{last:.2}"), color);
                             if let Some(day) = &updated {
                                 ui.label(RichText::new(day).color(muted_text()).size(13.0));
                             }
@@ -3255,6 +3269,8 @@ impl App {
             let text = self.market_close_text().map_or(clock.clone(), |closes| format!("{clock} · {closes}"));
             ui.label(RichText::new(text).color(muted_text()).size(13.0));
             ui.ctx().request_repaint_after(Duration::from_secs(1));
+            // A scheduled trade that starts within five minutes.
+            self.starting_soon_item(ui);
             // Right side: the mode switch, then (shortened, full text on hover) the market data
             // notice in the space that is left.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3689,7 +3705,13 @@ impl eframe::App for App {
         self.mode_mismatch_dialog(ctx);
         self.clear_logs_dialog(ctx);
         self.screenshot_step(ctx);
+        self.draw_window(ctx);
+    }
+}
 
+impl App {
+    /// The window: the top bar, the sidebar and the page that is chosen.
+    fn draw_window(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("topbar").exact_height(60.0).frame(egui::Frame::none().fill(topbar_bg()).inner_margin(egui::vec2(14.0, 10.0))).show(
             ctx,
             |ui| {
@@ -3734,9 +3756,7 @@ impl eframe::App for App {
             });
         });
     }
-}
 
-impl App {
     /// The page that is chosen in the sidebar.
     fn show_page(&mut self, ui: &mut egui::Ui) {
         match self.page {

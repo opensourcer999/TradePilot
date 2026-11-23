@@ -695,7 +695,7 @@ fn grid_font_size() -> f32 {
 /// ellipsis. Column widths are shares of the available width. The text size and row height follow
 /// the grid font size of the settings.
 pub fn data_table(ui: &mut egui::Ui, id: &str, columns: &[TableColumn], rows: &[Vec<TableCell>]) {
-    table(ui, id, columns, rows, false, None);
+    table(ui, id, columns, rows, false, None, &[]);
 }
 
 /// The box in front of a row of a list that can be selected: empty, or filled with a tick for the
@@ -749,6 +749,20 @@ pub fn selection_mark(ui: &mut egui::Ui, selected: bool, size: f32) -> egui::Res
     response
 }
 
+/// The fill and the outline of the box of a row that cannot be selected.
+const LOCKED_MARK_FILL: Color32 = Color32::from_rgb(0x34, 0x32, 0x2f);
+const LOCKED_MARK_OUTLINE: Color32 = Color32::from_rgb(0x5c, 0x59, 0x55);
+
+/// The box of a row that cannot be selected, drawn like a disabled checkbox of Windows: flat, a thin grey outline around a fill
+/// just lighter than the row, no tick, and it does not react to the pointer.
+fn locked_mark(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let rect = rect.shrink(0.5);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, LOCKED_MARK_FILL);
+    painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0_f32, LOCKED_MARK_OUTLINE));
+}
+
 /// What the person did with the rows of a table: the row clicked and the row double-clicked, by index.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RowClicks {
@@ -775,15 +789,35 @@ pub fn next_selection<K: Clone + PartialEq>(current: Option<K>, clicks: RowClick
 /// `data_table` whose rows can be selected: a column of boxes in front shows the `selected` row with a tick
 /// (its text is bold too), and the clicks of this frame are returned.
 pub fn data_table_rows(ui: &mut egui::Ui, id: &str, columns: &[TableColumn], rows: &[Vec<TableCell>], selected: Option<usize>) -> RowClicks {
-    table(ui, id, columns, rows, true, selected)
+    table(ui, id, columns, rows, true, selected, &[])
+}
+
+/// `data_table_rows` in which the rows `locked` cannot be selected: their box is greyed out and a click on them is not returned.
+pub fn data_table_rows_locked(
+    ui: &mut egui::Ui,
+    id: &str,
+    columns: &[TableColumn],
+    rows: &[Vec<TableCell>],
+    selected: Option<usize>,
+    locked: &[usize],
+) -> RowClicks {
+    table(ui, id, columns, rows, true, selected, locked)
 }
 
 /// How far the text of a table stays from the ends of its row strips.
 const TABLE_INSET: f32 = 10.0;
 
 /// The table behind `data_table` and `data_table_rows`; `selectable` adds the column of boxes in front,
-/// with a tick at the `selected` row.
-fn table(ui: &mut egui::Ui, id: &str, columns: &[TableColumn], rows: &[Vec<TableCell>], selectable: bool, selected: Option<usize>) -> RowClicks {
+/// with a tick at the `selected` row; the rows `locked` cannot be selected.
+fn table(
+    ui: &mut egui::Ui,
+    id: &str,
+    columns: &[TableColumn],
+    rows: &[Vec<TableCell>],
+    selectable: bool,
+    selected: Option<usize>,
+    locked: &[usize],
+) -> RowClicks {
     let mut clicks = RowClicks::default();
     let font = grid_font_size();
     let compact = COMPACT_GRID.load(Ordering::Relaxed);
@@ -817,8 +851,13 @@ fn table(ui: &mut egui::Ui, id: &str, columns: &[TableColumn], rows: &[Vec<Table
                 ui.end_row();
                 for (row_index, row) in rows.iter().enumerate() {
                     plastic.row(ui, false);
+                    let row_locked = locked.contains(&row_index);
                     if selectable {
                         table_cell_frame(ui, font * 1.2, row_height, false, |ui| {
+                            if row_locked {
+                                locked_mark(ui, font);
+                                return;
+                            }
                             let mark = selection_mark(ui, selected == Some(row_index), font);
                             if mark.double_clicked() {
                                 clicks.double_clicked = Some(row_index);
@@ -840,10 +879,11 @@ fn table(ui: &mut egui::Ui, id: &str, columns: &[TableColumn], rows: &[Vec<Table
                                     if cell.strong || selected == Some(row_index) {
                                         text = text.strong();
                                     }
-                                    let label = ui.add(egui::Label::new(text).truncate().sense(egui::Sense::click()));
-                                    if label.double_clicked() {
+                                    let sense = if row_locked { egui::Sense::hover() } else { egui::Sense::click() };
+                                    let label = ui.add(egui::Label::new(text).truncate().sense(sense));
+                                    if !row_locked && label.double_clicked() {
                                         clicks.double_clicked = Some(row_index);
-                                    } else if label.clicked() {
+                                    } else if !row_locked && label.clicked() {
                                         clicks.clicked = Some(row_index);
                                     }
                                 })
@@ -958,7 +998,9 @@ pub fn trade_table(ui: &mut egui::Ui, rows: &[TradeRowView], titles: [&str; 12],
         })
         .collect();
     let position = selected.and_then(|index| rows.iter().position(|r| r.index == index));
-    let clicks = data_table_rows(ui, "trade_table", &columns, &cells, position);
+    // Only an open trade can be selected (its buttons are under the list); a closed one has nothing to act on.
+    let locked: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.status != crate::trade_summary::TradeStatus::Open.as_str()).map(|(i, _)| i).collect();
+    let clicks = data_table_rows_locked(ui, "trade_table", &columns, &cells, position, &locked);
     let index_of = |row: Option<usize>| row.and_then(|row| rows.get(row)).map(|r| r.index);
     RowClicks { clicked: index_of(clicks.clicked), double_clicked: index_of(clicks.double_clicked) }
 }
@@ -1259,12 +1301,13 @@ pub fn market_badge(ui: &mut egui::Ui, text: &str, open: bool) {
     ui.painter().set(glow, crate::metal_tex::glow_along(ui.ctx(), left, right, response.rect.height() * 1.6, color.gamma_multiply(0.18)));
 }
 
-/// The points of a curve inside `rect`, oldest first, the highest value at the top, and the height of `base` (a reference
-/// line such as the prior close) on the same scale. The scale takes in `base`, so the line is always inside the box; a flat
+/// The points of a curve inside `rect`, oldest first, and the height of `base` (a reference line such as the prior close) on the
+/// same scale. The scale is the curve's own low to high, so even small moves fill the height of the box; `base` gets a height only
+/// when it lies within that range (a reference far away, after a gap at the open, would squeeze the curve into a thin band). A flat
 /// curve runs through the middle.
 #[must_use]
 pub fn sparkline_points(values: &[f64], base: Option<f64>, rect: egui::Rect) -> (Vec<egui::Pos2>, Option<f32>) {
-    let (min, max) = values.iter().copied().chain(base).fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), v| (low.min(v), high.max(v)));
+    let (min, max) = values.iter().copied().fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), v| (low.min(v), high.max(v)));
     if values.is_empty() || !min.is_finite() || !max.is_finite() {
         return (Vec::new(), None);
     }
@@ -1279,7 +1322,7 @@ pub fn sparkline_points(values: &[f64], base: Option<f64>, rect: egui::Rect) -> 
         .enumerate()
         .map(|(index, value)| egui::pos2(rect.left() + rect.width() * (index.to_f32().unwrap_or(0.0) / steps), y_of(*value)))
         .collect();
-    (points, base.map(y_of))
+    (points, base.filter(|base| (min..=max).contains(base)).map(y_of))
 }
 
 /// The colour of a good (green) or bad (red) day, for the fill of the curve and the change chip.
@@ -1653,6 +1696,40 @@ impl PlasticRows {
     }
 }
 
+/// The light text of a price in `price_readout` that has no direction.
+pub const READOUT_TEXT: Color32 = Color32::from_rgb(0xf2, 0xef, 0xea);
+
+/// How much darker the plate of a `price_readout` is than the light steel of the bar it sits on.
+const READOUT_PLATE_TINT: Color32 = Color32::from_gray(168);
+
+/// The radius of the rivets at the ends of a `price_readout` plate, and how far their centres sit from its ends.
+const READOUT_RIVET_RADIUS: f32 = 2.2;
+const READOUT_RIVET_INSET: f32 = 5.5;
+
+/// A price in the top bar as a small raised plate of darker steel, riveted onto the bar at both ends like a name plate: the figures in
+/// `color` (`READOUT_TEXT`, or the green, red or orange of its state) with a dark shadow below them, so they stay easy to read on the
+/// metal.
+pub fn price_readout(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), egui::FontId::monospace(15.0), color);
+    // Room at the ends for the rivets.
+    let margin = egui::vec2(2.0 * READOUT_RIVET_INSET + 3.0, 3.0);
+    let (rect, response) = ui.allocate_exact_size(galley.size() + 2.0 * margin, egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.add(crate::metal_tex::tinted_plate(ui.ctx(), rect, 4.0, READOUT_PLATE_TINT));
+        for x in [rect.left() + READOUT_RIVET_INSET, rect.right() - READOUT_RIVET_INSET] {
+            painter.add(crate::metal_tex::knob(ui.ctx(), egui::pos2(x, rect.center().y), READOUT_RIVET_RADIUS, Color32::from_gray(200)));
+        }
+        let pos = rect.center() - galley.size() / 2.0;
+        painter.galley_with_override_text_color(pos + egui::vec2(0.0, 1.3), galley.clone(), Color32::from_black_alpha(200));
+        painter.galley_with_override_text_color(pos + egui::vec2(0.6, 0.6), galley.clone(), Color32::from_black_alpha(90));
+        painter.galley(pos, galley.clone(), color);
+        // Bold like the other figures of the bar: the text once more, a hair to the right.
+        painter.galley(pos + egui::vec2(0.5, 0.0), galley, color);
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1692,9 +1769,10 @@ mod tests {
         // A flat curve runs through the middle, and nothing is drawn without values.
         assert!((sparkline_points(&[5.0, 5.0], None, rect).0[0].y - 10.0).abs() < 1e-3);
         assert_eq!(sparkline_points(&[], None, rect).0.len(), 0);
-        // The reference widens the scale: a curve below it stays inside the box.
-        let (below, _) = sparkline_points(&[1.0, 2.0], Some(10.0), rect);
-        assert!(below.iter().all(|p| p.y > 0.0 && p.y <= 20.0), "{below:?}");
+        // A reference far away does not squeeze the curve: a move of 2 points still fills the whole height, and the line is left out.
+        let (below, base_y) = sparkline_points(&[7250.0, 7252.0], Some(7300.0), rect);
+        assert!((below[0].y - 20.0).abs() < 1e-3 && below[1].y.abs() < 1e-3, "{below:?}");
+        assert_eq!(base_y, None);
     }
 
     fn button(button: egui::PointerButton, pressed: bool) -> egui::Event {

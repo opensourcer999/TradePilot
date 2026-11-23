@@ -33,6 +33,35 @@ impl App {
             self.check_beyond_stop(now);
             self.check_missing_quotes(now);
             self.check_open_short_positions();
+            self.check_positions_of_open_trades(now);
+        }
+    }
+
+    /// "Trade Position Missing": an open trade one of whose options TWS no longer holds on its account (closed in TWS by hand, say). Its
+    /// stop and target still work there and would open a new position, so it is reported once that lasts a minute (a fill of its own exit
+    /// order changes the positions a moment before TWS reports the order filled). Nothing is cancelled or booked on this alone.
+    fn check_positions_of_open_trades(&mut self, now: Instant) {
+        if !self.loaded.positions_loaded {
+            return;
+        }
+        let trades: Vec<StoredTrade> = self.trades_stored.iter().filter(|t| t.is_open() && !t.entry_unknown).cloned().collect();
+        let mut problems = Vec::new();
+        for trade in &trades {
+            let held = |con_id: i32| {
+                self.positions.iter().any(|p| p.account == trade.account && p.contract_id.trim().parse::<i32>().ok() == Some(con_id) && p.quantity != 0.0)
+            };
+            let missing: Vec<i32> = super::trade_exit::close_legs(trade).iter().map(|leg| leg.con_id).filter(|con_id| !held(*con_id)).collect();
+            if self.watch.sustained.fire(&format!("position:{}", trade.key()), !missing.is_empty(), now, BEYOND_STOP_HOLD, REPEAT_PAUSE) {
+                problems.push(format!(
+                    "{} ({}): TWS holds no position in contract(s) {missing:?} - its stop and target still work",
+                    trade.label(),
+                    mask_account(&trade.account)
+                ));
+            }
+        }
+        if !problems.is_empty() {
+            self.log(&format!("WARNING: Trade Position Missing: {}", problems.join("; ")));
+            self.notify_trade_mail(&trade_mail::position_gone(&problems), true, true);
         }
     }
 

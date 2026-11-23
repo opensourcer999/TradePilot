@@ -29,6 +29,32 @@ fn a_waiting_run_shows_the_time_to_its_start_as_hours_minutes_seconds() {
 }
 
 #[test]
+fn the_top_bar_shows_the_waiting_run_that_starts_within_five_minutes() {
+    let (app, _commands) = connected_app();
+    let now = app.clock.utc();
+    let run = |id: u32, secs: i64, status: RunStatus| ScheduleRun {
+        id,
+        schedule_id: 1,
+        day: app.clock.new_york().date(),
+        window_start: now + chrono::Duration::seconds(secs),
+        window_end: now + chrono::Duration::hours(5),
+        status,
+        attempts: 0,
+        started: None,
+        finished: None,
+        notes: String::new(),
+        reentry: None,
+        trigger: None,
+    };
+    let soon = |runs: &[ScheduleRun]| App::run_starting_soon(runs, now).map(|(run, left)| (run.id, left));
+    assert_eq!(soon(&[run(1, 301, RunStatus::Waiting)]), None, "more than five minutes ahead");
+    assert_eq!(soon(&[run(1, 300, RunStatus::Waiting)]), Some((1, 300)));
+    assert_eq!(soon(&[run(1, 0, RunStatus::Waiting)]), None, "it starts now: the run itself takes over");
+    assert_eq!(soon(&[run(1, 60, RunStatus::Paused)]), None, "a paused run does not start");
+    assert_eq!(soon(&[run(1, 240, RunStatus::Waiting), run(2, 90, RunStatus::Waiting)]), Some((2, 90)), "the next one");
+}
+
+#[test]
 fn the_profit_target_is_cancelled_at_the_time_of_its_template_and_the_stop_stays() {
     let (mut app, commands) = app_with_a_sent_template_order(true);
     {

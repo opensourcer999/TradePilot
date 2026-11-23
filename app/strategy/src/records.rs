@@ -104,10 +104,11 @@ pub struct StoredTrade {
     /// TWS order id of a close order sent by hand (`OrderIDClose`).
     #[serde(default)]
     pub close_order_id: Option<i32>,
-    /// The stop price per contract, as placed.
+    /// The stop price per contract, as placed. Kept also in `adjustments.stop`: written only through `set_stop`, read through `stop_now`.
     #[serde(default)]
     pub stop_price: Option<rust_decimal::Decimal>,
-    /// The profit-target price per contract, as placed.
+    /// The profit-target price per contract, as placed; with levels the price of the first one (the others are in
+    /// `exit_levels.prices`). Read through `target_now`, which picks the level that works now.
     #[serde(default)]
     pub profit_price: Option<rust_decimal::Decimal>,
     /// A trade rebuilt from the expiry bookings alone: its entry price is not known (`price_open`
@@ -244,7 +245,8 @@ pub struct StopAdjustments {
     pub level: u8,
     /// The stop's order type now: "`Market stop`", "`Limit stop`", "`Limit stop with OCO`", "Trailing" or "None".
     pub order_type: String,
-    /// The stop price now (`PriceStopTarget`), as text.
+    /// The stop price now (`PriceStopTarget`), as text. A copy of `StoredTrade::stop_price`: written only through
+    /// `StoredTrade::set_stop` once the trade holds this record.
     pub stop: Option<String>,
     /// The trailing amount of a Trailing stop (`stop_offset`).
     pub trailing_offset: Option<String>,
@@ -319,6 +321,29 @@ impl StoredTrade {
     #[must_use]
     pub fn stop_now(&self) -> Option<rust_decimal::Decimal> {
         self.adjustments.as_ref().and_then(|a| a.stop.as_deref()).and_then(|stop| stop.parse().ok()).or(self.stop_price)
+    }
+
+    /// Sets the stop as it stands now. The price is kept twice, in `stop_price` and in the stop of the adjustments (which reads it as
+    /// the stop to adjust from); this is the one place that writes it, so the two never differ.
+    pub fn set_stop(&mut self, price: Option<rust_decimal::Decimal>) {
+        let price = price.map(|p| p.normalize());
+        self.stop_price = price;
+        if let Some(adjustments) = self.adjustments.as_mut() {
+            adjustments.stop = price.map(|p| p.to_string());
+        }
+    }
+
+    /// The profit target as it stands: with levels the price of the level whose order works now (the price of the first level until the
+    /// fill, the next one after each hit), else the one target placed; `None` without a working target.
+    #[must_use]
+    pub fn target_now(&self) -> Option<rust_decimal::Decimal> {
+        let Some(levels) = &self.exit_levels else { return self.profit_price };
+        let slot = usize::from(levels.level);
+        match (levels.order_ids.get(slot).copied().flatten(), levels.prices.get(slot).and_then(|p| p.as_deref())) {
+            (Some(_), Some(price)) => price.parse().ok(),
+            (Some(_), None) => self.profit_price,
+            (None, _) => None,
+        }
     }
 
     /// Where the trade stands; `None` for a status text that is no known status.
@@ -427,4 +452,53 @@ pub struct StoredExecution {
     pub quantity: f64,
     /// The price per contract of the fill.
     pub price: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+
+    fn trade() -> StoredTrade {
+        serde_json::from_str(
+            r#"{"day":"2026-11-23","opened":"","account":"DU1","symbol":"SPX","trade_type":"PutSpread","strikes":"7210/7200 P",
+                "order_id":10,"qty":3,"multiplier":100,"price_open":"0.9","delta":0.0}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_stop_is_written_to_both_places_it_is_kept_in_and_read_back_from_either() {
+        let mut t = trade();
+        t.set_stop(Some(Decimal::new(270, 2)));
+        assert_eq!((t.stop_price, t.adjustments.as_ref().map(|a| a.stop.clone())), (Some(Decimal::new(27, 1)), None), "no record of adjustments yet");
+        t.adjustments = Some(StopAdjustments { stop: Some("2.7".into()), ..StopAdjustments::default() });
+        t.set_stop(Some(Decimal::new(3, 0)));
+        assert_eq!((t.stop_price, t.adjustments.as_ref().and_then(|a| a.stop.as_deref())), (Some(Decimal::new(3, 0)), Some("3")));
+        assert_eq!(t.stop_now(), Some(Decimal::new(3, 0)));
+        t.set_stop(None);
+        assert_eq!((t.stop_price, t.stop_now()), (None, None), "no stop shown once it is gone");
+    }
+
+    #[test]
+    fn the_target_now_is_the_one_of_the_level_whose_order_works() {
+        let mut t = trade();
+        t.profit_price = Some(Decimal::new(45, 2));
+        assert_eq!(t.target_now(), Some(Decimal::new(45, 2)), "one target for everything");
+        t.exit_levels = Some(ExitLevels {
+            qty: [1, 1, 1, 0],
+            order_ids: [Some(12), None, None, None],
+            prices: [Some("0.45".into()), Some("0.3".into()), Some("0.15".into()), None],
+            ..ExitLevels::default()
+        });
+        assert_eq!(t.target_now(), Some(Decimal::new(45, 2)));
+        // Level 1 hit, level 2 placed: the target is level 2's.
+        let levels = t.exit_levels.as_mut().unwrap();
+        levels.level = 1;
+        levels.order_ids[1] = Some(13);
+        assert_eq!(t.target_now(), Some(Decimal::new(3, 1)));
+        // Its order is gone: no target works.
+        t.exit_levels.as_mut().unwrap().order_ids[1] = None;
+        assert_eq!(t.target_now(), None);
+    }
 }

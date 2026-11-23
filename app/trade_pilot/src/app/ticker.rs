@@ -6,7 +6,7 @@
 //! regular session; before the first one of a run, from the two closes of the day before. The estimate is shown only, never used for an
 //! order or a condition.
 
-use super::{bar_separator, muted_text, quote_contract, send_counted, text_primary, App, QuoteRow, RichText, TwsCommand, ORANGE_WARN};
+use super::{bar_separator, muted_text, quote_contract, send_counted, App, QuoteRow, RichText, TwsCommand, ORANGE_WARN};
 use eframe::egui;
 
 /// The ETF the SPX estimate follows.
@@ -87,8 +87,8 @@ impl App {
                 ui.scope(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     ui.label(RichText::new(symbol).color(muted_text()).size(13.0));
-                    let color = if frozen { ORANGE_WARN } else { text_primary() };
-                    ui.label(RichText::new(format!("{price:.2}")).color(color).strong().size(13.0));
+                    let color = if frozen { ORANGE_WARN } else { crate::widgets::READOUT_TEXT };
+                    crate::widgets::price_readout(ui, &format!("{price:.2}"), color);
                 });
             }
             return true;
@@ -98,7 +98,8 @@ impl App {
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(RichText::new("SPX").color(muted_text()).size(13.0));
-            ui.label(RichText::new(format!("≈ {estimate:.2}")).color(text_primary()).strong().size(13.0)).on_hover_text(self.tr(
+            ui.label(RichText::new("≈").color(muted_text()).size(13.0));
+            crate::widgets::price_readout(ui, &format!("{estimate:.2}"), crate::widgets::READOUT_TEXT).on_hover_text(self.tr(
                 "Estimated from SPY outside the regular hours - shown only, never used for an order",
                 "Außerhalb der Handelszeit aus SPY geschätzt - nur angezeigt, nie für eine Order verwendet",
             ));

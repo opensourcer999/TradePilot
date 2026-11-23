@@ -176,6 +176,25 @@ fn deleting_the_target_after_a_level_filled_cancels_only_the_working_level() {
     assert_eq!(attach::missing_exits(trade), (false, true), "the stop is there, the target is gone: Stop / target can attach a new one");
     assert!(app.watch.user_cancelled.is_empty(), "no id is kept");
     assert!(!app.log_lines.iter().any(|l| l.contains("WARNING")), "{:?}", app.log_lines);
+
+    // A new target for the 2 contracts still open becomes the next level: the trade has a target again and the list shows it.
+    app.request_exits(0);
+    let pending = app.exits_pending.as_mut().expect("the target can be attached");
+    pending.target = "0.05".to_string();
+    pending.target_unit = Some(attach::ExitUnit::Price);
+    let target_id = app.next_order_id.unwrap() + 1;
+    app.confirm_exits();
+    let placed = placed_orders(&drain(&commands));
+    assert_eq!(placed.iter().map(|(id, o)| (*id, o.total_quantity)).collect::<Vec<_>>(), [(target_id, 2.0)]);
+    let trade = app.trades_stored.first().unwrap();
+    assert_eq!(attach::missing_exits(trade), (false, false), "no second target can be attached");
+    assert_eq!(trade.target_now(), Some(Decimal::new(5, 2)));
+    assert_eq!(app.trade_row_views()[0].target, "0.05");
+    // Its fill ends the trade at the average of both: (2 * 0.15 + 2 * 0.05) / 4 = 0.10.
+    fill(&mut app, target_id, 2.0, 0.05);
+    let trade = app.trades_stored.first().unwrap();
+    assert_eq!((trade.status.as_str(), trade.price_close.map(|p| p.normalize().to_string()).as_deref()), ("Closed", Some("-0.1")));
+    assert!(placed_orders(&drain(&commands)).is_empty(), "no further level");
 }
 
 #[test]
@@ -480,6 +499,78 @@ fn after_a_reconnect_exit_orders_that_are_gone_are_reported_and_taken_off_the_tr
     let trade = app.trades_stored.first().unwrap();
     assert_eq!((trade.stop_order_id, trade.stop_price, trade.profit_order_id), (None, None, Some(12)));
     assert!(app.instant.template_status.as_deref().is_some_and(|s| s.contains("1 open trade(s) need attention")));
+}
+
+#[test]
+fn after_a_reconnect_a_profit_target_that_filled_meanwhile_closes_the_trade_at_its_fill_price() {
+    let leg = |exec_id: &str, con_id: i32, side: &str, quantity: f64, price: f64| StoredExecution {
+        exec_id: exec_id.into(),
+        time: "20261113 15:00:00 US/Eastern".into(),
+        account: "DU1".into(),
+        symbol: "SPX".into(),
+        con_id,
+        order_id: 12,
+        order_ref: "TraPi-12 (TP)".into(),
+        sec_type: "OPT".into(),
+        expiry: String::new(),
+        right: "P".into(),
+        strike: 6690.0,
+        side: side.into(),
+        quantity,
+        price,
+    };
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    filled_trade_with_exits(&mut app, &commands);
+    let qty = app.trades_stored.first().unwrap().qty;
+    // Bought back while TradePilot was not running: the short put at 0.30, the long put sold at 0.10 - 0.20 paid per contract.
+    let contracts = f64::from(qty);
+    app.exec_history.extend([leg("e-a", 100, "BOT", contracts, 0.3), leg("e-b", 101, "SLD", contracts, 0.1)]);
+    // TWS cancelled the stop of the same OCA group: neither order is working any more.
+    let sent = reconnect_with_working_orders(&mut app, &commands, &[]);
+    assert!(placed_orders(&sent).is_empty());
+    let trade = app.trades_stored.first().unwrap();
+    assert_eq!((trade.status.as_str(), trade.price_close), ("Closed", Some(Decimal::new(-2, 1))), "{:?}", app.log_lines);
+    assert!(!app.log_lines.iter().any(|l| l.contains("NO stop") || l.contains("Mark closed")), "{:?}", app.log_lines);
+    assert!(app.log_lines.iter().any(|l| l.contains("the profit target 12 filled while TradePilot was not running")), "{:?}", app.log_lines);
+
+    // Filled for fewer contracts than the trade holds: the trade stays open and is reported.
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    filled_trade_with_exits(&mut app, &commands);
+    let mut held = app.trades_stored.first().unwrap().clone();
+    held.qty = 2;
+    app.trades_stored[0] = held;
+    app.exec_history.extend([leg("e-a", 100, "BOT", 1.0, 0.3), leg("e-b", 101, "SLD", 1.0, 0.1)]);
+    let _sent = reconnect_with_working_orders(&mut app, &commands, &[11]);
+    assert!(app.trades_stored.first().unwrap().is_open());
+    assert!(app.log_lines.iter().any(|l| l.contains("filled only 1 of 2 contract(s)")), "{:?}", app.log_lines);
+}
+
+#[test]
+fn a_dialog_acts_on_its_own_trade_also_when_the_list_moved_while_it_was_open() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    filled_trade_with_exits(&mut app, &commands);
+    let mut other = app.trades_stored.first().unwrap().clone();
+    other.order_id = 99;
+    other.strikes = "6600/6590 P".into();
+    let own = app.trades_stored.first().unwrap().key();
+    // "Mark closed" is opened for the trade at the top; then the list is loaded again with another trade in its place.
+    app.request_close(0, CloseKind::Mark);
+    app.close_pending.as_mut().unwrap().price = "0.1".into();
+    app.trades_stored.insert(0, other.clone());
+    app.confirm_close();
+    let by_key = |key: &str| app.trades_stored.iter().find(|t| t.key() == key).unwrap().clone();
+    assert!(!by_key(&own).is_open(), "the trade the dialog was opened for is closed");
+    assert!(by_key(&other.key()).is_open(), "the trade that moved into its place is left alone");
+
+    // The same for "Stop / target": the window was opened for a trade that is gone from the list now - nothing is sent.
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    filled_trade_with_exits(&mut app, &commands);
+    app.request_exits(0);
+    let pending = app.exits_pending.as_mut().unwrap();
+    pending.stop = "1.5".into();
+    app.trades_stored[0] = other;
+    app.confirm_exits();
+    assert!(placed_orders(&drain(&commands)).is_empty());
 }
 
 #[test]

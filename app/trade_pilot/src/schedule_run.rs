@@ -69,6 +69,18 @@ pub struct ScheduleRun {
     pub trigger: Option<TriggerRun>,
 }
 
+/// How long after the start of its window a run can still begin, however short the window is: a window of 0 minutes is a
+/// single moment, which the app, checking a few times a second, would otherwise always miss.
+const START_GRACE_SECONDS: i64 = 5;
+
+impl ScheduleRun {
+    /// The last moment the run can begin: the end of its window, but no earlier than `START_GRACE_SECONDS` after its start.
+    #[must_use]
+    pub fn last_moment(&self) -> DateTime<Utc> {
+        self.window_end.max(self.window_start + Duration::seconds(START_GRACE_SECONDS))
+    }
+}
+
 /// The entry of a trigger: what it enters (the schedule part of the trigger) and under which strategy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TriggerRun {
@@ -206,7 +218,7 @@ pub fn setup_runs(runs: &mut Vec<ScheduleRun>, schedules: &[Schedule], today: Na
 pub fn next_run(runs: &[ScheduleRun], now: DateTime<Utc>) -> Option<usize> {
     runs.iter()
         .enumerate()
-        .filter(|(_, run)| run.status == RunStatus::Waiting && run.window_start <= now && now <= run.window_end)
+        .filter(|(_, run)| run.status == RunStatus::Waiting && run.window_start <= now && now <= run.last_moment())
         .filter(|(_, run)| run.started.is_none_or(|started| started + Duration::seconds(RETRY_AFTER_SECONDS) < now))
         .min_by_key(|(_, run)| (run.started, run.attempts))
         .map(|(index, _)| index)
@@ -247,11 +259,11 @@ pub fn choose_template(schedule: &Schedule, attempts: u32) -> TemplateChoice {
 pub fn linked_done(runs: &[ScheduleRun], schedule: &Schedule, day: NaiveDate) -> bool {
     schedule.linked_schedule_id == 0 || run_of(runs, schedule.linked_schedule_id, day).is_some_and(|run| run.status == RunStatus::Complete)
 }
-/// Ends every waiting or paused run whose window is over: it becomes `Expired`. The ids of the runs that
+/// Ends every waiting or paused run whose window is over (`ScheduleRun::last_moment`): it becomes `Expired`. The ids of the runs that
 /// expired now, so the caller can log and report them.
 pub fn expire_runs(runs: &mut [ScheduleRun], now: DateTime<Utc>) -> Vec<u32> {
     let mut expired = Vec::new();
-    for run in runs.iter_mut().filter(|run| run.status.is_open() && run.window_end < now) {
+    for run in runs.iter_mut().filter(|run| run.status.is_open() && run.last_moment() < now) {
         run.status = RunStatus::Expired;
         run.finished = Some(now);
         expired.push(run.id);
@@ -395,6 +407,19 @@ mod tests {
         setup_runs(&mut recent, &[schedule(1)], day("2026-11-10"), utc("2026-11-10 13:00:00"));
         assert!(!setup_runs(&mut recent, &[], day("2026-11-17"), utc("2026-11-17 13:00:00")) || recent.len() == 1);
         assert_eq!(recent.len(), 1, "seven days later it is still there");
+    }
+
+    #[test]
+    fn a_window_of_zero_minutes_still_starts_in_the_moments_after_its_time_and_only_then_expires() {
+        let mut runs = Vec::new();
+        let at_once = Schedule { expiration_minutes: 0, ..schedule(1) };
+        setup_runs(&mut runs, &[at_once], day(MONDAY), utc("2026-11-16 13:00:00"));
+        // The app looks a few times a second: its first look comes a fraction after the start.
+        let first_look = utc("2026-11-16 14:35:00") + Duration::milliseconds(318);
+        assert!(expire_runs(&mut runs, first_look).is_empty(), "not over before it could start");
+        assert_eq!(next_run(&runs, first_look), Some(0));
+        assert_eq!(expire_runs(&mut runs, utc("2026-11-16 14:35:05")), Vec::<u32>::new(), "still inside the five seconds");
+        assert_eq!(expire_runs(&mut runs, utc("2026-11-16 14:35:06")), [1], "a few seconds later it has expired");
     }
 
     #[test]

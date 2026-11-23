@@ -31,19 +31,46 @@ fn a_row_of_the_trade_list_knows_its_stored_trade_so_a_click_can_select_it_for_c
     let (mut app, _commands) = connected_app();
     let open = |strikes: &str, status: &str| StoredTrade { strikes: strikes.into(), status: status.into(), ..stored_put_spread() };
     app.trades_stored = vec![open("7000/6990 P", "Open"), open("7100/7090 P", "Expired"), open("7200/7190 P", "Open")];
+    assert_eq!(app.ui_state.trade_filter, "Open", "the list starts with the open trades");
+    assert_eq!(app.trade_filter_counts(), (2, 1), "the choices name how many trades they show");
     // Newest first; the index is the position in the stored list, whatever the filter hides.
+    app.ui_state.trade_filter = "All".into();
     let all: Vec<(usize, String)> = app.trade_row_views().iter().map(|r| (r.index, r.strikes.clone())).collect();
     assert_eq!(all, [(2, "7200/7190 P".to_string()), (1, "7100/7090 P".to_string()), (0, "7000/6990 P".to_string())]);
     app.ui_state.trade_filter = "Open".into();
     assert_eq!(app.trade_row_views().iter().map(|r| r.index).collect::<Vec<_>>(), [2, 0]);
     // The selected trade is the one that the close request then names.
-    app.ui_state.selected_trade = Some(2);
+    let click = |row: usize| crate::widgets::RowClicks { clicked: Some(row), double_clicked: None };
+    app.apply_trade_clicks(click(2));
+    assert_eq!(app.selected_open_index(), Some(2));
     app.request_close(2, CloseKind::Market);
     assert_eq!(app.close_pending.as_ref().map(|p| p.index), Some(2));
     // A trade that is no longer open cannot be closed.
     app.close_pending = None;
     app.request_close(1, CloseKind::Market);
     assert!(app.close_pending.is_none());
+}
+
+#[test]
+fn a_closed_trade_cannot_be_selected_and_a_trade_that_closes_is_no_longer_selected() {
+    let (mut app, _commands) = connected_app();
+    let trade = |strikes: &str, status: &str| StoredTrade { strikes: strikes.into(), status: status.into(), ..stored_put_spread() };
+    app.trades_stored = vec![trade("7000/6990 P", "Open"), trade("7100/7090 P", "Closed")];
+    let click = |row: usize| crate::widgets::RowClicks { clicked: Some(row), double_clicked: None };
+    app.apply_trade_clicks(click(1));
+    assert_eq!((app.ui_state.selected_trade.as_deref(), app.selected_open_index()), (None, None), "a click on a closed trade selects nothing");
+    app.apply_trade_clicks(click(0));
+    assert_eq!(app.selected_open_index(), Some(0));
+    // Neither a click on the closed one nor a double-click takes the selection to it.
+    app.apply_trade_clicks(click(1));
+    app.apply_trade_clicks(crate::widgets::RowClicks { clicked: None, double_clicked: Some(1) });
+    assert_eq!(app.selected_open_index(), Some(0));
+    // The list moves (a trade comes in front): the selection stays with its trade.
+    app.trades_stored.insert(0, trade("6900/6890 P", "Open"));
+    assert_eq!(app.selected_open_index(), Some(1));
+    // The selected trade closes: nothing is selected any more, so no buttons are offered for it.
+    app.trades_stored[1].status = "Closed".into();
+    assert_eq!(app.selected_open_index(), None);
 }
 
 #[test]
