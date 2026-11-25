@@ -66,6 +66,27 @@ pub const OUT_REQ_CONTRACT_DETAILS: i32 = 9;
 /// `IBApi.OutgoingMessages` id: req historical data.
 pub const OUT_REQ_HISTORICAL_DATA: i32 = 20;
 
+/// `IBApi.OutgoingMessages` id: request the current time of TWS (`reqCurrentTime`, plain fields up to server version 212).
+pub const OUT_REQ_CURRENT_TIME: i32 = 49;
+
+/// `IBApi.IncomingMessage` id: the current time of TWS (`currentTime`): version, then the time in seconds since 1970.
+pub const IN_CURRENT_TIME: i32 = 49;
+
+/// `IBApi.OutgoingMessages` id: request account updates (`reqAccountUpdates`): the account's values and its portfolio.
+pub const OUT_REQ_ACCOUNT_UPDATES: i32 = 6;
+
+/// `IBApi.IncomingMessage` id: a value of the account (`updateAccountValue`), sent with the account updates; not used.
+pub const IN_ACCOUNT_VALUE: i32 = 6;
+
+/// `IBApi.IncomingMessage` id: one position with its market price, market value and profit (`updatePortfolio`).
+pub const IN_PORTFOLIO_VALUE: i32 = 7;
+
+/// `IBApi.IncomingMessage` id: the time of the account updates (`updateAccountTime`); not used.
+pub const IN_ACCOUNT_UPDATE_TIME: i32 = 8;
+
+/// `IBApi.IncomingMessage` id: the first round of account updates is complete (`accountDownloadEnd`); not used.
+pub const IN_ACCOUNT_DOWNLOAD_END: i32 = 54;
+
 // Incoming message type IDs (IBApi.IncomingMessage).
 /// `IBApi.IncomingMessage` id: price.
 pub const IN_TICK_PRICE: i32 = 1;

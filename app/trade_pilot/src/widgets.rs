@@ -695,7 +695,7 @@ fn grid_font_size() -> f32 {
 /// ellipsis. Column widths are shares of the available width. The text size and row height follow
 /// the grid font size of the settings.
 pub fn data_table(ui: &mut egui::Ui, id: &str, columns: &[TableColumn], rows: &[Vec<TableCell>]) {
-    table(ui, id, columns, rows, false, None, &[]);
+    let _ = table_core(ui, id, columns, rows, (false, None, &[]), false);
 }
 
 /// The box in front of a row of a list that can be selected: empty, or filled with a tick for the
@@ -789,36 +789,144 @@ pub fn next_selection<K: Clone + PartialEq>(current: Option<K>, clicks: RowClick
 /// `data_table` whose rows can be selected: a column of boxes in front shows the `selected` row with a tick
 /// (its text is bold too), and the clicks of this frame are returned.
 pub fn data_table_rows(ui: &mut egui::Ui, id: &str, columns: &[TableColumn], rows: &[Vec<TableCell>], selected: Option<usize>) -> RowClicks {
-    table(ui, id, columns, rows, true, selected, &[])
-}
-
-/// `data_table_rows` in which the rows `locked` cannot be selected: their box is greyed out and a click on them is not returned.
-pub fn data_table_rows_locked(
-    ui: &mut egui::Ui,
-    id: &str,
-    columns: &[TableColumn],
-    rows: &[Vec<TableCell>],
-    selected: Option<usize>,
-    locked: &[usize],
-) -> RowClicks {
-    table(ui, id, columns, rows, true, selected, locked)
+    table_core(ui, id, columns, rows, (true, selected, &[]), false).0
 }
 
 /// How far the text of a table stays from the ends of its row strips.
 const TABLE_INSET: f32 = 10.0;
 
-/// The table behind `data_table` and `data_table_rows`; `selectable` adds the column of boxes in front,
-/// with a tick at the `selected` row; the rows `locked` cannot be selected.
-fn table(
+/// How the rows of an `arranged_table` can be selected: the selected row (with a tick) and the rows that cannot be selected
+/// (their box greyed out, a click on them not returned).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RowSelection<'a> {
+    pub selected: Option<usize>,
+    pub locked: &'a [usize],
+}
+
+/// A table the person arranges, the one function for every such table: a column header dragged onto another one moves the
+/// column there, the border between two headers dragged sideways sizes the two columns (a double click on it gives the table its
+/// own widths back). Order and widths are remembered per table (`column_order`, under `id`) by the columns' `keys`, which stay
+/// the same in every language. `keys`, `columns` and the cells of each row are given in the table's own order. With `selection`
+/// the rows can be selected (a column of boxes in front); the clicks of this frame are returned.
+pub fn arranged_table(
+    ui: &mut egui::Ui,
+    id: &str,
+    keys: &[&str],
+    columns: &[TableColumn],
+    rows: &[Vec<TableCell>],
+    selection: Option<RowSelection<'_>>,
+) -> RowClicks {
+    let defaults: Vec<f32> = columns.iter().map(|c| c.weight).collect();
+    let (order, widths) = crate::column_order::layout(id, keys, &defaults);
+    let arranged: Vec<TableColumn> =
+        order.iter().filter_map(|i| columns.get(*i).map(|c| TableColumn { weight: widths.get(*i).copied().unwrap_or(c.weight), ..c.clone() })).collect();
+    let rows: Vec<Vec<TableCell>> = rows.iter().map(|row| order.iter().filter_map(|i| row.get(*i).cloned()).collect()).collect();
+    let select = selection.unwrap_or_default();
+    let (clicks, edit) = table_core(ui, id, &arranged, &rows, (selection.is_some(), select.selected, select.locked), true);
+    if let Some((from, to)) = edit.moved {
+        crate::column_order::move_column(id, keys, from, to);
+        ui.ctx().request_repaint();
+    }
+    // The places of the two columns at the border, as indexes into `keys`.
+    let column_at = |place: usize| order.get(place).copied();
+    if let Some((left, right, delta, done)) = edit.resized {
+        if let (Some(l), Some(r)) = (column_at(left), column_at(right)) {
+            let (l_width, r_width) = (widths.get(l).copied().unwrap_or(1.0), widths.get(r).copied().unwrap_or(1.0));
+            let (new_l, new_r) = crate::column_order::resized(l_width, r_width, delta);
+            if let (Some(l_key), Some(r_key)) = (keys.get(l), keys.get(r)) {
+                crate::column_order::set_widths(id, &[(l_key, new_l), (r_key, new_r)], done);
+            }
+        }
+    }
+    if edit.widths_reset {
+        crate::column_order::reset_widths(id);
+        ui.ctx().request_repaint();
+    }
+    clicks
+}
+
+/// What the person did to the columns of an arranged table in this frame (see `arranged_table`); places are in the columns
+/// given to `table_core`.
+#[derive(Clone, Copy, Debug, Default)]
+struct TableEdit {
+    /// A column dragged onto another one: its place and the place it was dropped on.
+    moved: Option<(usize, usize)>,
+    /// The border between two columns dragged: their places, the change in weights (positive to the right), and whether the
+    /// mouse was let go (then the widths are kept in the file).
+    resized: Option<(usize, usize, f32, bool)>,
+    /// A border was double-clicked: the table's own widths again.
+    widths_reset: bool,
+}
+
+/// How wide the grip on the border between two column headers is.
+const RESIZE_GRIP: f32 = 8.0;
+/// The fine line that marks the border between two column headers of an arranged table.
+const COLUMN_BORDER: Color32 = Color32::from_rgb(0x6a, 0x66, 0x61);
+
+/// What is dragged when a column header is moved: the table and the place of the column in it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ColumnDrag {
+    table: egui::Id,
+    column: usize,
+}
+
+/// The colour of the header a dragged column would be dropped on.
+const COLUMN_DROP_MARK: Color32 = Color32::from_rgb(0x6f, 0x9f, 0xe8);
+
+/// The header of the column at `place` of the table `table_id` that can be dragged onto another header: the whole cell takes the
+/// drag and the drop, the header it would land on is outlined. Returns the move (the place of the dragged column, `place`) when a
+/// header of the same table is dropped on it.
+fn movable_header(ui: &mut egui::Ui, title: RichText, table_id: egui::Id, place: usize) -> Option<(usize, usize)> {
+    let payload = ColumnDrag { table: table_id, column: place };
+    let header = ui
+        .dnd_drag_source(table_id.with(place), payload, |ui| {
+            ui.set_min_size(ui.available_size());
+            ui.label(title);
+        })
+        .response
+        .on_hover_cursor(egui::CursorIcon::Grab);
+    let ours = |drag: &ColumnDrag| drag.table == table_id;
+    if header.dnd_hover_payload::<ColumnDrag>().is_some_and(|drag| ours(&drag) && drag.column != place) {
+        ui.painter().rect_stroke(header.rect.expand(2.0), 4.0, egui::Stroke::new(1.5_f32, COLUMN_DROP_MARK));
+    }
+    header.dnd_release_payload::<ColumnDrag>().filter(|drag| ours(drag)).map(|drag| (drag.column, place))
+}
+
+/// The grip on the border right of `cell` (the header of the column at `place`, its right neighbour at `next`): dragging it sizes
+/// the two columns, a double click gives the table its own widths back. `unit` is the width of one weight in points.
+fn resize_grip(ui: &egui::Ui, cell: egui::Rect, spacing_x: f32, table_id: egui::Id, (place, next): (usize, usize), unit: f32, edit: &mut TableEdit) {
+    let center = egui::pos2(cell.right() + spacing_x / 2.0, cell.center().y);
+    let rect = egui::Rect::from_center_size(center, egui::vec2(RESIZE_GRIP, cell.height()));
+    let grip = ui.interact(rect, table_id.with(("resize", place)), egui::Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    // The border is always shown as a fine line, so the extent of every column can be seen; lit while it is hovered or dragged.
+    let line = [egui::pos2(center.x, rect.top() + 4.0), egui::pos2(center.x, rect.bottom() - 4.0)];
+    let active = grip.hovered() || grip.dragged();
+    let stroke = if active { egui::Stroke::new(2.0_f32, COLUMN_DROP_MARK) } else { egui::Stroke::new(1.0_f32, COLUMN_BORDER) };
+    ui.painter().line_segment(line, stroke);
+    if grip.double_clicked() {
+        edit.widths_reset = true;
+    } else if grip.dragged() && unit > 0.0 {
+        edit.resized = Some((place, next, grip.drag_delta().x / unit, false));
+    } else if grip.drag_stopped() {
+        edit.resized = Some((place, next, 0.0, true));
+    }
+}
+
+/// The one table behind `data_table`, `data_table_rows` and `arranged_table`: `selection` (selectable, selected row, locked
+/// rows) adds the column of boxes in front; when `arranged` the headers can be dragged onto each other and their borders sized,
+/// and what the person did is returned (see `TableEdit`, places in `columns`).
+fn table_core(
     ui: &mut egui::Ui,
     id: &str,
     columns: &[TableColumn],
     rows: &[Vec<TableCell>],
-    selectable: bool,
-    selected: Option<usize>,
-    locked: &[usize],
-) -> RowClicks {
+    selection: (bool, Option<usize>, &[usize]),
+    arranged: bool,
+) -> (RowClicks, TableEdit) {
+    let (selectable, selected, locked) = selection;
     let mut clicks = RowClicks::default();
+    let mut edit = TableEdit::default();
+    let table_id = egui::Id::new(("table_columns", id));
     let font = grid_font_size();
     let compact = COMPACT_GRID.load(Ordering::Relaxed);
     let (header_height, row_height, spacing_x) = if compact { (font * 1.5, font * 1.6, 6.0) } else { (font * 1.9, font * 2.0, 12.0) };
@@ -844,9 +952,24 @@ fn table(
                     table_cell_frame(ui, font * 1.2, header_height, false, |_| {});
                 }
                 for (i, column) in columns.iter().enumerate() {
+                    // The place of the column among all columns (a compact table leaves some out).
+                    let place = shown.get(i).copied().unwrap_or(i);
+                    let mut cell = egui::Rect::NOTHING;
                     table_cell_frame(ui, width(i), header_height, column.right, |ui| {
-                        ui.label(RichText::new(&column.title).size(font * 0.85).color(muted_text()));
+                        cell = ui.max_rect();
+                        let title = RichText::new(&column.title).size(font * 0.85).color(muted_text());
+                        if arranged {
+                            if let Some(drop) = movable_header(ui, title, table_id, place) {
+                                edit.moved = Some(drop);
+                            }
+                        } else {
+                            ui.label(title);
+                        }
                     });
+                    // Every border but the one after the last column can be dragged.
+                    if let (true, Some(next)) = (arranged, shown.get(i + 1)) {
+                        resize_grip(ui, cell, spacing_x, table_id, (place, *next), unit, &mut edit);
+                    }
                 }
                 ui.end_row();
                 for (row_index, row) in rows.iter().enumerate() {
@@ -899,7 +1022,7 @@ fn table(
         })
         .inner;
     plastic.paint(ui, grid.response.rect, 2.0);
-    clicks
+    (clicks, edit)
 }
 
 /// A centred, muted message for an empty list: a short title and a hint what fills it.
@@ -1000,7 +1123,8 @@ pub fn trade_table(ui: &mut egui::Ui, rows: &[TradeRowView], titles: [&str; 12],
     let position = selected.and_then(|index| rows.iter().position(|r| r.index == index));
     // Only an open trade can be selected (its buttons are under the list); a closed one has nothing to act on.
     let locked: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.status != crate::trade_summary::TradeStatus::Open.as_str()).map(|(i, _)| i).collect();
-    let clicks = data_table_rows_locked(ui, "trade_table", &columns, &cells, position, &locked);
+    let keys = ["trade", "order_ref", "strikes", "expiry", "qty", "open", "stop", "target", "bid", "mid", "ask", "profit"];
+    let clicks = arranged_table(ui, "trade_table", &keys, &columns, &cells, Some(RowSelection { selected: position, locked: &locked }));
     let index_of = |row: Option<usize>| row.and_then(|row| rows.get(row)).map(|r| r.index);
     RowClicks { clicked: index_of(clicks.clicked), double_clicked: index_of(clicks.double_clicked) }
 }
@@ -1091,6 +1215,13 @@ pub fn form_combo(ui: &mut egui::Ui, id: impl std::hash::Hash, value: &mut Strin
 /// entry; a number typed there is kept in the list from then on (see `number_lists::remember`). Without a list it is a
 /// plain text field.
 pub fn form_number(ui: &mut egui::Ui, value: &mut String, width: f32, list: &[&str]) {
+    form_number_offering(ui, value, width, list, &|_| true);
+}
+
+/// `form_number` that offers only the values `offer` accepts, of the list and of those the person added (a width that fits the
+/// strikes of the symbol, say). What is typed after "Custom..." is taken as it is; the check on saving reports a value that does
+/// not fit.
+pub fn form_number_offering(ui: &mut egui::Ui, value: &mut String, width: f32, list: &[&str], offer: &dyn Fn(&str) -> bool) {
     if list.is_empty() {
         form_text(ui, value, width);
         return;
@@ -1124,7 +1255,7 @@ pub fn form_number(ui: &mut egui::Ui, value: &mut String, width: f32, list: &[&s
     let mut start_typing = false;
     crate::widgets::metal_combo(ui, |ui| {
         egui::ComboBox::from_id_salt(id).width(width).selected_text(shown).show_ui(ui, |ui| {
-            for item in list.iter().copied().chain(own.iter().map(String::as_str)) {
+            for item in list.iter().copied().chain(own.iter().map(String::as_str)).filter(|item| offer(item)) {
                 if ui.selectable_label(value.as_str() == item, item).clicked() {
                     *value = item.to_string();
                 }
@@ -1773,6 +1904,49 @@ mod tests {
         let (below, base_y) = sparkline_points(&[7250.0, 7252.0], Some(7300.0), rect);
         assert!((below[0].y - 20.0).abs() < 1e-3 && below[1].y.abs() < 1e-3, "{below:?}");
         assert_eq!(base_y, None);
+    }
+
+    /// The whole way through egui with the mouse, on a table with selection boxes like those of the Dashboard: the border between
+    /// two headers shows the sizing cursor, dragging it widens the left column by what the right one gives up, and the widths are
+    /// kept once the button is let go.
+    #[test]
+    fn the_border_between_two_headers_is_dragged_with_the_mouse_to_size_the_columns() {
+        let ctx = egui::Context::default();
+        let id = "test_mouse_resize_table";
+        let keys = ["a", "b", "c"];
+        let columns = vec![TableColumn::new("Alpha", 1.0, false), TableColumn::new("Beta", 1.0, false), TableColumn::new("Gamma", 1.0, false)];
+        let rows = vec![vec![TableCell::new("1"), TableCell::new("2"), TableCell::new("3")]];
+        let frame = |events: Vec<egui::Event>| {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 300.0));
+            let input = egui::RawInput { events, screen_rect: Some(screen), ..egui::RawInput::default() };
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = arranged_table(ui, id, &keys, &columns, &rows, Some(RowSelection::default()));
+                });
+            })
+        };
+        let cursor_at = |pos: egui::Pos2| frame(vec![egui::Event::PointerMoved(pos)]).platform_output.cursor_icon;
+        let _ = frame(Vec::new());
+        // The header row: where the first column shows the cursor that moves it.
+        let header_y = (0_u16..80).step_by(2).map(f32::from).find(|y| cursor_at(egui::pos2(150.0, *y)) == egui::CursorIcon::Grab).expect("the header row");
+        // The border after the first column: where the sizing cursor shows.
+        let grip_x = (0_u16..900).map(f32::from).find(|x| cursor_at(egui::pos2(*x, header_y)) == egui::CursorIcon::ResizeHorizontal).expect("a border");
+        let grip = egui::pos2(grip_x, header_y);
+        let press = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = frame(vec![press(grip, true)]);
+        for step in 1_u16..=6 {
+            let _ = frame(vec![egui::Event::PointerMoved(grip + egui::vec2(10.0 * f32::from(step), 0.0))]);
+        }
+        let _ = frame(vec![press(grip + egui::vec2(60.0, 0.0), false)]);
+        let _ = frame(Vec::new());
+        let (_, widths) = crate::column_order::layout(id, &keys, &[1.0, 1.0, 1.0]);
+        assert!(widths[0] > 1.1 && widths[1] < 0.9, "the first column grew, the second gave it up: {widths:?}");
+        assert!((widths[0] + widths[1] - 2.0).abs() < 1e-3 && (widths[2] - 1.0).abs() < 1e-6, "the table keeps its width: {widths:?}");
     }
 
     fn button(button: egui::PointerButton, pressed: bool) -> egui::Event {

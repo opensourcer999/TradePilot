@@ -334,8 +334,8 @@ impl App {
                 ui,
                 self.tr("UI mode", "Oberflächenmodus"),
                 self.tr(
-                    "Light shows only the most important pages: Dashboard, Instant Order, Trade Templates, Schedules, News and Settings.",
-                    "Light zeigt nur die wichtigsten Seiten: Übersicht, Sofortorder, Trade-Vorlagen, Zeitpläne, Nachrichten und Einstellungen.",
+                    "Light shows only the most important pages: Dashboard, Instant Order, Trade Templates, Schedules, News, Logs and Settings.",
+                    "Light zeigt nur die wichtigsten Seiten: Übersicht, Sofortorder, Trade-Vorlagen, Zeitpläne, Nachrichten, Protokolle und Einstellungen.",
                 ),
                 |ui| {
                     let light = self.settings.light_mode;

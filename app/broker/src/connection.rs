@@ -1,6 +1,10 @@
 //! The TWS session: the connection thread, the handshake, sending commands and handling what TWS sends back.
 
 use crate::{
+    classify_tws_code, encode_req_account_updates, parse_portfolio_value, TwsCodeKind, IN_ACCOUNT_DOWNLOAD_END, IN_ACCOUNT_UPDATE_TIME, IN_ACCOUNT_VALUE,
+    IN_PORTFOLIO_VALUE, OUT_REQ_ACCOUNT_UPDATES,
+};
+use crate::{
     encode_cancel_order, encode_place_order, encode_req_bars, encode_req_contract_details, encode_req_daily_bars, encode_req_executions, encode_req_mkt_data,
     encode_req_open_orders, encode_req_sec_def_opt_params, market_data_farm_status, parse_account_summary, parse_commission_report, parse_contract_data,
     parse_execution_data, parse_historical_bars, parse_historical_update, parse_incoming_message, parse_managed_accounts, parse_market_data_ack,
@@ -13,6 +17,7 @@ use crate::{
     MARKET_DATA_REQUEST_SPACING_MS, OUT_CANCEL_MKT_DATA, OUT_CANCEL_ORDER, OUT_PLACE_ORDER, OUT_REQ_CONTRACT_DETAILS, OUT_REQ_EXECUTIONS,
     OUT_REQ_HISTORICAL_DATA, OUT_REQ_MKT_DATA, OUT_REQ_OPEN_ORDERS, OUT_REQ_SEC_DEF_OPT_PARAMS,
 };
+use crate::{IN_CURRENT_TIME, OUT_REQ_CURRENT_TIME};
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,7 +119,7 @@ fn start_api_session(stream: &mut TcpStream, server_version: u32, client_id: i32
             Some("4") => {
                 let (id, code, detail) = tws_error_message(&message_fields, server_version_num)?;
                 let _ = sender.send(TwsEvent::Log(format!("TWS {code} (reqId {id}): {detail}")));
-                if matches!(code, 326 | 502 | 504 | 1300) {
+                if classify_tws_code(code) == TwsCodeKind::SessionEnd {
                     return Err(format!("TWS rejected API session ({code}): {detail}"));
                 }
             }
@@ -170,6 +175,16 @@ fn send_command(stream: &mut TcpStream, server_version_num: i32, command: TwsCom
             send_outgoing_message(stream, server_version_num, OUT_CANCEL_ORDER, &encode_cancel_order(server_version_num, order_id))
         }
         TwsCommand::RequestOpenOrders => send_outgoing_message(stream, server_version_num, OUT_REQ_OPEN_ORDERS, &encode_req_open_orders()),
+        TwsCommand::RequestCurrentTime => send_outgoing_message(stream, server_version_num, OUT_REQ_CURRENT_TIME, &["1".to_string()]),
+        TwsCommand::RequestExecutions => send_outgoing_message(
+            stream,
+            server_version_num,
+            OUT_REQ_EXECUTIONS,
+            &encode_req_executions(server_version_num, IB_EXECUTIONS_REQUEST_ID, &IbExecutionFilter::default()),
+        ),
+        TwsCommand::SubscribePortfolio { account } => {
+            send_outgoing_message(stream, server_version_num, OUT_REQ_ACCOUNT_UPDATES, &encode_req_account_updates(true, &account))
+        }
         TwsCommand::RequestContractDetails { req_id, contract } => {
             send_outgoing_message(stream, server_version_num, OUT_REQ_CONTRACT_DETAILS, &encode_req_contract_details(server_version_num, req_id, &contract))
         }
@@ -197,8 +212,20 @@ fn send_command(stream: &mut TcpStream, server_version_num: i32, command: TwsCom
     }
 }
 
+/// Whether the first `openOrder` and the first `updatePortfolio` message of the session were written to the log as TWS sent them:
+/// with them the place of every field the app reads can be checked against a real message.
+pub(crate) static RAW_OPEN_ORDER_LOGGED: AtomicBool = AtomicBool::new(false);
+pub(crate) static RAW_PORTFOLIO_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Writes `fields` of a `kind` of message to the log as TWS sent them, the first time in the session (`logged`).
+fn log_raw_once(logged: &AtomicBool, kind: &str, fields: &[String], sender: &mpsc::Sender<TwsEvent>) {
+    if !logged.swap(true, Ordering::Relaxed) {
+        let _ = sender.send(TwsEvent::Log(format!("TWS raw {kind} message (to check the fields TradePilot reads): {}", fields.join("|"))));
+    }
+}
+
 /// Handles one message TWS sent: what the app needs of it goes on as events; an error ends the session.
-fn handle_incoming_message(message_fields: &[String], server_version_num: i32, sender: &mpsc::Sender<TwsEvent>) -> Result<(), String> {
+pub(crate) fn handle_incoming_message(message_fields: &[String], server_version_num: i32, sender: &mpsc::Sender<TwsEvent>) -> Result<(), String> {
     match message_fields.first().map(String::as_str) {
         Some("4") => {
             let (id, code, detail) = tws_error_message(message_fields, server_version_num)?;
@@ -208,8 +235,22 @@ fn handle_incoming_message(message_fields: &[String], server_version_num: i32, s
             } else if let Some((farm, ok)) = market_data_farm_status(code, &detail) {
                 let _ = sender.send(TwsEvent::FarmStatus { farm, ok });
             }
-            if matches!(code, 1100 | 1300 | 502 | 504) {
-                return Err(format!("TWS connection lost ({code}): {detail}"));
+            // What the code means (`classify_tws_code`, from IB's message code tables). 1100-1102 are about TWS's own link to IB: the
+            // session with TWS stays, TWS says when the link is back.
+            match classify_tws_code(code) {
+                TwsCodeKind::SessionEnd => return Err(format!("TWS connection lost ({code}): {detail}")),
+                TwsCodeKind::IbLinkLost => {
+                    let _ = sender.send(TwsEvent::IbConnectivity { connected: false, data_lost: false });
+                }
+                TwsCodeKind::IbLinkRestored { data_lost } => {
+                    let _ = sender.send(TwsEvent::IbConnectivity { connected: true, data_lost });
+                }
+                TwsCodeKind::FarmUp | TwsCodeKind::FarmIdle => {}
+                // A notice about a request is handled by what made the request (`RequestError`); the others are reported.
+                TwsCodeKind::Unclassified if id > 0 => {}
+                kind => {
+                    let _ = sender.send(TwsEvent::TwsNotice { code, kind, message: detail.clone() });
+                }
             }
         }
         Some("63") => {
@@ -232,6 +273,25 @@ fn handle_incoming_message(message_fields: &[String], server_version_num: i32, s
         Some("62") => {
             let _ = sender.send(TwsEvent::PositionsEnd);
         }
+        Some(id) if id.parse::<i32>() == Ok(IN_PORTFOLIO_VALUE) => {
+            log_raw_once(&RAW_PORTFOLIO_LOGGED, "updatePortfolio", message_fields, sender);
+            match parse_portfolio_value(message_fields) {
+                Some(row) => {
+                    let _ = sender.send(TwsEvent::Portfolio(row));
+                }
+                None => {
+                    let _ = sender.send(TwsEvent::Log(format!("TWS: portfolio message not read, fields: {}", message_fields.join("|"))));
+                }
+            }
+        }
+        // `currentTime`: 49, version, the time in seconds since 1970.
+        Some(id) if id.parse::<i32>() == Ok(IN_CURRENT_TIME) => {
+            if let Some(time) = message_fields.get(2).and_then(|t| t.trim().parse::<i64>().ok()) {
+                let _ = sender.send(TwsEvent::CurrentTime(time));
+            }
+        }
+        // The account values and times that come with the portfolio: the app takes its account figures from the account summary.
+        Some(id) if matches!(id.parse::<i32>(), Ok(IN_ACCOUNT_VALUE | IN_ACCOUNT_UPDATE_TIME | IN_ACCOUNT_DOWNLOAD_END)) => {}
         Some(id) if id.parse::<i32>() == Ok(IN_TICK_PRICE) => {
             if let Some(event) = parse_tick_price(message_fields) {
                 let _ = sender.send(event);
@@ -271,6 +331,7 @@ fn handle_order_and_chain_message(message_fields: &[String], server_version_num:
         }
         Some(id) if id.parse::<i32>() == Ok(IN_OPEN_ORDER) => match parse_open_order_id(message_fields, server_version_num) {
             Some(order_id) => {
+                log_raw_once(&RAW_OPEN_ORDER_LOGGED, "openOrder", message_fields, sender);
                 let details = parse_open_order(message_fields, server_version_num).filter(|d| d.order_id == order_id).map(Box::new);
                 let _ = sender.send(TwsEvent::OpenOrder { order_id, details });
             }
@@ -354,6 +415,9 @@ pub fn tws_session_at(
     stop: &AtomicBool,
 ) -> Result<(), String> {
     let (mut stream, server_version) = open_tws_stream(host, port, sender)?;
+    // A new session writes its first raw messages again.
+    RAW_OPEN_ORDER_LOGGED.store(false, Ordering::Relaxed);
+    RAW_PORTFOLIO_LOGGED.store(false, Ordering::Relaxed);
     let server_version_num = i32::try_from(server_version).unwrap_or(i32::MAX);
 
     start_api_session(&mut stream, server_version, client_id, stop, sender)?;

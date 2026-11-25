@@ -96,8 +96,8 @@ impl App {
             self.end_schedule_run(index, RunStatus::Cancelled, &format!("template {template_id} does not exist (or is deleted)"));
             return;
         }
-        if self.tws_cmd_sender.is_none() || self.next_order_id.is_none() {
-            self.note_schedule_run(index, "waiting: not connected to TWS");
+        if let Some(reason) = self.schedule_connection_wait() {
+            self.note_schedule_run(index, reason);
             return;
         }
         let Some(template_id) = self.schedule_condition_step(index, &schedule, run.id, template_id) else {
@@ -163,6 +163,15 @@ impl App {
             }
             None => self.end_schedule_run(index, RunStatus::Cancelled, "the order was not sent (see the log)"),
         }
+    }
+
+    /// Why a run cannot send its order now and waits, within its window: no connection to TWS, or TWS without its connection to IB
+    /// (no order may go out then). `None` when nothing stands in the way.
+    fn schedule_connection_wait(&self) -> Option<&'static str> {
+        if self.tws_cmd_sender.is_none() || self.next_order_id.is_none() {
+            return Some("waiting: not connected to TWS");
+        }
+        self.session.ib_link_lost.then_some("waiting: TWS has no connection to IB (1100)")
     }
 
     /// The condition step of an attempt: a schedule with a condition enters its trade only if the condition is

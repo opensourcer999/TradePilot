@@ -1,8 +1,8 @@
 //! Closing a trade by hand: the close dialog, the close order, Mark Closed, and the actions under the list of open trades.
 
 use super::{
-    attach, check_order_quantity, fix_price, muted_text, trade_exit, App, CloseKind, Color32, Decimal, Duration, IbContract, IbOrder, OrderHandling,
-    PendingClose, RichText, StoredTrade, TradeStatus, ACCENT_BLUE, GREEN_TXT, NOTICE_SECONDS, RED, STATUS_ERROR,
+    attach, check_order_quantity, fix_price, muted_text, trade_exit, App, CloseKind, Decimal, Duration, IbContract, IbOrder, OrderHandling, PendingClose,
+    RichText, StoredTrade, TradeStatus, ACCENT_BLUE, NOTICE_SECONDS, RED, STATUS_ERROR,
 };
 use eframe::egui;
 use rust_decimal::prelude::ToPrimitive;
@@ -198,6 +198,7 @@ impl App {
         };
         pending.index = index;
         let de = self.german();
+        let blocked = self.order_block_note();
         let title = match (pending.kind, de) {
             (CloseKind::Limit, true) => "Trade mit Limit schließen?",
             (CloseKind::Limit, false) => "Close this trade with a limit order?",
@@ -243,21 +244,15 @@ impl App {
                 (_, false) => "The order closes every leg. The stop and profit target stay active until it fills, then they are reduced.",
             };
             ui.label(note);
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let label = match (pending.kind, de) {
-                    (CloseKind::Mark, true) => "Als geschlossen markieren",
-                    (CloseKind::Mark, false) => "Mark closed",
-                    (_, true) => "Jetzt übertragen",
-                    (_, false) => "Send now",
-                };
-                if ui.add(crate::widgets::MetalButton::new(RichText::new(label).color(Color32::WHITE).strong()).fill(GREEN_TXT)).clicked() {
-                    send = true;
-                }
-                if ui.add(crate::widgets::MetalButton::new(if de { "Abbrechen" } else { "Cancel" })).clicked() {
-                    cancel = true;
-                }
-            });
+            let label = match (pending.kind, de) {
+                (CloseKind::Mark, true) => "Als geschlossen markieren",
+                (CloseKind::Mark, false) => "Mark closed",
+                (_, true) => "Jetzt übertragen",
+                (_, false) => "Send now",
+            };
+            // Marking closed sends no order (it only cancels), so it stays possible while orders are blocked.
+            let blocked = if pending.kind == CloseKind::Mark { None } else { blocked };
+            (send, cancel) = super::send_or_cancel(ui, de, label, blocked);
         });
         if send {
             self.close_pending = Some(pending);

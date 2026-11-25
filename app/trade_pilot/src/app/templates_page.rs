@@ -365,11 +365,20 @@ impl App {
         }
     }
 
+    /// The distance between the strikes of `symbol` as TWS reported them in this session: from the options of the chains the app
+    /// loaded (each contract belongs to its symbol). `None` when TWS reported no strikes of the symbol.
+    pub(super) fn reported_strike_step(&self, symbol: &str) -> Option<super::Decimal> {
+        let strikes: Vec<super::Decimal> = self.chains.contracts.iter().filter(|c| c.symbol == symbol).filter_map(|c| crate::pricing::dec(c.strike)).collect();
+        crate::strikes::strike_step_of(&strikes)
+    }
+
     /// The Add/Edit Trade Template form. Labels, sections and
     /// which parts show for which selections are defined in `template_form`;
     /// the labels are English-only. The cards are in `template_editor`.
     fn template_editor_page(&mut self, ui: &mut egui::Ui, form: &mut TemplateForm) -> TemplateEditorOutcome {
         let mut outcome = TemplateEditorOutcome::Keep;
+        // Widths are checked against the strikes TWS reported for this symbol in the current session.
+        form.strike_step = self.reported_strike_step(&form.symbol);
         let layout = form.layout();
         // The last save's errors outline every faulty field in red (and scroll to the first one).
         let errors = self.template.error.clone();

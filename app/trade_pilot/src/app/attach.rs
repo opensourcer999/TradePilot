@@ -5,8 +5,8 @@
 
 use super::alerts::is_order_failure;
 use super::{
-    fix_price, live_legs, mask_account, muted_text, order_is_final, trade_exit, App, Color32, Decimal, IbOrder, OrderHandling, RichText, StoredTrade,
-    ToPrimitive, ACCENT_BLUE, GREEN_TXT, ORANGE_WARN,
+    fix_price, live_legs, mask_account, muted_text, order_is_final, trade_exit, App, Decimal, IbOrder, OrderHandling, RichText, StoredTrade, ToPrimitive,
+    ACCENT_BLUE, ORANGE_WARN,
 };
 use eframe::egui;
 
@@ -172,6 +172,7 @@ impl App {
         let de = self.german();
         let (needs_stop, needs_target) = editable_exits(&trade);
         let ask = self.closing_price(&trade);
+        let blocked = self.order_block_note();
         let (mut send, mut cancel) = (false, false);
         egui::Window::new(if de { "Stop / Ziel setzen oder ändern?" } else { "Attach or change a stop / target?" })
             .collapsible(false)
@@ -211,15 +212,7 @@ impl App {
                 if !needs_stop || !needs_target {
                     ui.label(RichText::new(locked_note(de)).small().color(muted_text()));
                 }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.add(crate::widgets::MetalButton::new(RichText::new(if de { "Jetzt übertragen" } else { "Send now" }).color(Color32::WHITE).strong()).fill(GREEN_TXT)).clicked() {
-                        send = true;
-                    }
-                    if ui.add(crate::widgets::MetalButton::new(if de { "Abbrechen" } else { "Cancel" })).clicked() {
-                        cancel = true;
-                    }
-                });
+                (send, cancel) = super::send_or_cancel(ui, de, if de { "Jetzt übertragen" } else { "Send now" }, blocked);
             });
         if send {
             self.exits_pending = Some(pending);
@@ -387,7 +380,9 @@ impl App {
             }
         }
         if !placed {
-            self.block_exits("TWS did not take the orders - see the log");
+            // The reason the person can act on: the orders are blocked (TWS without IB), else the log has the details.
+            let reason = self.order_block_note().unwrap_or("TWS did not take the orders - see the log");
+            self.block_exits(reason);
             return;
         }
         self.save_trade(index, updated);

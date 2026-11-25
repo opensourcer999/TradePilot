@@ -7,11 +7,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing))]
 
 use strategy::{
-    bars, fees, legacy_names, market_calendar, pricing, reconcile, reports, template_form, trade_entry, trade_exit, trade_live, trade_rebuild, trade_summary,
+    bars, fees, legacy_names, market_calendar, position_value, pricing, reconcile, reports, strikes, template_form, trade_entry, trade_exit, trade_live,
+    trade_rebuild, trade_summary,
 };
 mod app;
 mod calendar;
 mod clock;
+mod column_order;
 mod condition;
 mod condition_editor;
 mod condition_form;

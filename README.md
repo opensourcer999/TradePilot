@@ -25,16 +25,18 @@ use it at your own risk.
 
 - **Connection** to TWS only: account data, positions, market data and option chains.
 - **Trade templates:** create, edit, duplicate, import and export; stored safely (see
-  "Data").
+  "Data"). Strike widths are checked against the strike distance of the option chain TWS delivered; without a chain for the symbol the editor says that they are not checked.
 - **Instant Order:** a template trade (preview from the live option chain, confirmation,
   one combo order for multi-leg trades, fill attempts) or a single option, stock or
   future entered by hand.
 - **Stops and profit targets:** placed once a template trade is filled (stop types,
   REL stops, guardrails, several profit target levels, stop adjustments), closing trades
-  by hand, reconciliation with TWS after a connect.
+  by hand, reconciliation with TWS after a connect and after every gap (see "Messages of TWS and what TradePilot does"). A stop or target of a running trade is attached or changed as a price or as a percentage; the unit has to be chosen. Changes made in TWS are taken over.
 - **Dashboard and reports:** live P/L, premium sold and captured, PCR, win rate, delta,
   today's trades, reports with equity curve, daily view and CSV export; trade history
-  rebuilt from TWS executions.
+  rebuilt from TWS executions. This includes trades opened or closed elsewhere (another computer, by hand in TWS); a warning is raised when TWS no longer holds the options of an open trade.
+- **Live data:** index quotes with the VIX9D/VIX ratio, and the open positions with price, market value and profit or loss (amount and percent) as TWS values them.
+- **Tables:** in the Dashboard tables and the live positions, columns are moved by dragging a header and sized by dragging the border between two headers (a double click on a border restores the widths); both are remembered.
 - **Automatic entries:** a template trade can be entered at a set time on set days without
   anyone present, optionally only when a market condition holds. It goes through the same
   safety checks and the same order path as a trade entered by hand. Several schedules can
@@ -55,7 +57,7 @@ use it at your own risk.
   metal buttons, inset input fields, analogue dial instruments with glowing needles, LED status lights. Tables can be switched
   to a compact form for narrow windows.
 - **Light and Advanced page sets:** Light shows only the most important pages (Dashboard, Instant Order, Trade Templates,
-  Schedules, News and Settings), Advanced all of them; switchable in the sidebar. This is the choice of pages, not a colour scheme.
+  Schedules, News, Logs and Settings), Advanced all of them; switchable in the sidebar. This is the choice of pages, not a colour scheme.
 
 
 ## Safety
@@ -70,6 +72,7 @@ use it at your own risk.
   rest of the day once today's loss has reached a set amount (default $1,000), and at most a
   set number of new orders per minute (default 10). Orders that close or protect a position
   are never held up.
+- While TWS has no connection to IB (message 1100) nothing is sent: the windows that send an order say why and grey out their send button.
 - Immediate transmission is off by default; a confirmation window shows account, legs,
   limit and quantity before anything is sent. An order held in TWS for review is never
   changed or cancelled by TradePilot.
@@ -235,6 +238,30 @@ close (display only, never used as a trading price). With "Estimate SPX Extended
 switched on, the bar shows an estimate of SPX from SPY instead, marked as one. If no prices arrive although the
 connection is up, the same user is often logged in elsewhere (IBKR Mobile, Client Portal,
 a second TWS; error 10197): log out there and reconnect.
+
+### Messages of TWS and what TradePilot does
+
+TWS reports problems as numbered codes. TradePilot acts only on codes whose meaning IB documents
+(the IB TWS API "Message Codes" page); every other code of a message that belongs to no request is
+logged as a warning ("unknown TWS notice, not handled") and otherwise ignored.
+
+| Code | What it means (IB) | What TradePilot does |
+|---|---|---|
+| 326, 502, 503, 504, 507, 1300 | The API session is over or cannot start (client id in use, cannot connect, TWS out of date, not connected, socket ended, socket port reset) | Ends the session. "Maintain Connection" reconnects if it is switched on. |
+| 1100 | TWS lost its connection to the IB servers (internet, nightly reset of the servers, a competing session) | Stays connected to TWS. Top bar: "TWS without IB connection - orders blocked". **No new or changed order is sent** (cancels still are): every window that sends an order shows why and greys out its send button, and a refused order is also said on the screen. Scheduled entries wait within their window. TradePilot asks TWS for its time right away and every minute and logs whether TWS answers, the proof that the API socket is still open (IB does not state it). After 2 minutes a warning mail, repeated every 15 minutes while it lasts. |
+| 1101 | Connection to IB back, market data requests lost | Requests every price and the option chain again, then the executions of the day, then compares the working orders (a stop or target may have filled meanwhile). |
+| 1102 | Connection to IB back, market data requests kept | Requests the executions of the day, then compares the working orders. |
+| 2110 | Connection between TWS and the server broken, restored automatically | Warning in the log. |
+| 2103, 2105 | A market data or historical data farm is disconnected | Warning in the log. When the last broken live farm is back (2104), every price is requested again. |
+| 2104, 2106, 2158 / 2107, 2108 | A farm is connected / idle but available | Nothing (informational). |
+| 2100, 2101 | The account updates of this client stopped or cannot start | Warning; the portfolio values of TWS are dropped, live positions are valued from option quotes where available. |
+| 100, 10197 | Message rate exceeded / no market data during a competing session | Warning in the log. |
+
+After every gap in which TradePilot heard nothing from TWS (a restart, a lost session, TWS without
+IB connection) it compares its trades with TWS: executions, positions and working orders. TWS is
+the source of truth; trades opened or closed elsewhere (another computer running TradePilot, by hand
+in TWS) are recognised from the executions. A stop or target of TradePilot that TWS still reports as
+working for a trade that is closed is cancelled, as it would open a new position.
 
 ## Passing the app on
 

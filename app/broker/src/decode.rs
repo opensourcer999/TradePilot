@@ -1,8 +1,8 @@
 //! Decoders: what a message from TWS says, as events and values.
 
 use crate::{
-    ContractData, ExecutionRow, OpenOrderInfo, Position, TwsEvent, IB_ACCOUNT_SUMMARY_REQUEST_ID, IN_MARKET_DATA_TYPE, IN_TICK_GENERIC, IN_TICK_REQ_PARAMS,
-    IN_TICK_STRING,
+    ContractData, ExecutionRow, OpenOrderInfo, PortfolioRow, Position, TwsEvent, IB_ACCOUNT_SUMMARY_REQUEST_ID, IN_MARKET_DATA_TYPE, IN_TICK_GENERIC,
+    IN_TICK_REQ_PARAMS, IN_TICK_STRING,
 };
 
 /// IB's documented convention for paper-trading account identifiers (e.g. "DU1234567"), used only
@@ -274,6 +274,32 @@ pub fn parse_account_summary(fields: &[String]) -> Result<Option<(String, String
     }
 }
 
+/// The message version of `updatePortfolio` from which all of its fields are sent (conId, multiplier and primary exchange, local
+/// symbol, trading class, the cost and the profits, the account).
+const PORTFOLIO_FULL_VERSION: i32 = 8;
+
+/// An `updatePortfolio` message (`IBApi.EDecoder.PortfolioValueEvent`): version, conId, the contract (symbol, secType, expiry,
+/// strike, right, multiplier, primary exchange, currency, local symbol, trading class), then position, market price, market
+/// value, average cost, unrealized and realized profit, account. `None` for an older version, which leaves fields out, or for a
+/// field that cannot be read.
+#[must_use]
+pub fn parse_portfolio_value(fields: &[String]) -> Option<PortfolioRow> {
+    let version: i32 = fields.get(1)?.trim().parse().ok()?;
+    if version < PORTFOLIO_FULL_VERSION {
+        return None;
+    }
+    let number = |index: usize| -> Option<f64> { fields.get(index)?.trim().parse::<f64>().ok().filter(|n| n.is_finite()) };
+    Some(PortfolioRow {
+        con_id: fields.get(2)?.trim().parse().ok()?,
+        quantity: number(13)?,
+        market_price: number(14)?,
+        market_value: number(15)?,
+        average_cost: number(16)?,
+        unrealized_pnl: number(17)?,
+        account: fields.get(19)?.trim().to_string(),
+    })
+}
+
 /// A `position` message; an error for a missing field or a quantity or cost that is no finite number.
 ///
 /// # Errors
@@ -294,11 +320,19 @@ pub fn parse_position(fields: &[String]) -> Result<Option<Position>, String> {
     let Some([account, contract_id, symbol, security_type]) = fields.get(2..6) else {
         return Err("Malformed TWS position message".to_string());
     };
+    // Then the rest of the contract: expiry, strike, right, multiplier (empty for a stock).
+    let text = |index: usize| fields.get(index).map_or_else(String::new, |value| value.trim().to_string());
+    let strike = text(7).parse::<f64>().ok().filter(|value| value.is_finite()).unwrap_or(0.0);
+    let multiplier = text(9).parse::<f64>().ok().filter(|value| value.is_finite() && *value > 0.0);
     Ok(Some(Position {
         account: account.clone(),
         contract_id: contract_id.clone(),
         symbol: symbol.clone(),
         security_type: security_type.clone(),
+        expiry: text(6),
+        strike,
+        right: text(8),
+        multiplier,
         quantity,
         average_cost,
     }))
@@ -364,6 +398,57 @@ pub fn english_tws_message(code: i32, text: &str) -> String {
         10167 => "Requested market data is not subscribed. Displaying delayed market data.".to_string(),
         10197 => "No market data during competing live session.".to_string(),
         _ => text.to_string(),
+    }
+}
+
+/// What a code TWS sends in an error message means for the session. Source: IB's "Message Codes" page
+/// (<https://interactivebrokers.github.io/tws-api/message_codes.html>): the tables "System Message Codes", "Warning Message Codes",
+/// "Client Error Codes" and "TWS Error Codes". Codes not listed there are `Unclassified` and only logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TwsCodeKind {
+    /// The API session is over or cannot start: 326 (client id in use), 502 (could not connect), 503 (TWS out of date), 504 (not
+    /// connected), 507 (bad message length: end of the socket), 1300 (socket port reset, the connection is dropped).
+    SessionEnd,
+    /// 1100: TWS lost its connection to the IB servers (internet, the nightly server reset or a competing session). We keep the
+    /// session: IB's own client only disconnects on socket errors, and if TWS does close the socket the next read fails anyway.
+    IbLinkLost,
+    /// 1101 (market data requests lost) and 1102 (kept): the connection to IB is back.
+    IbLinkRestored {
+        /// 1101: the market data requests were lost and have to be sent again.
+        data_lost: bool,
+    },
+    /// 2110: "Connectivity between TWS and server is broken. It will be restored automatically."
+    ServerLinkBroken,
+    /// 2103 (market data farm) or 2105 (historical data farm) disconnected.
+    FarmDown,
+    /// 2104, 2106, 2158: a farm connection is OK (informational).
+    FarmUp,
+    /// 2107, 2108: a farm connection became inactive but is available on demand (a normal state).
+    FarmIdle,
+    /// 2100 (the account updates of this client were replaced by another request) and 2101 (another client is subscribed to a
+    /// different account): the portfolio values of this app no longer come.
+    AccountUpdatesStopped,
+    /// 100 (the limit of messages per second exceeded, TWS may disconnect), 10197 (no market data during a competing session).
+    Warning,
+    /// Not on the page with a meaning this app could act on.
+    Unclassified,
+}
+
+/// The kind of `code` (see `TwsCodeKind`).
+#[must_use]
+pub fn classify_tws_code(code: i32) -> TwsCodeKind {
+    match code {
+        326 | 502 | 503 | 504 | 507 | 1300 => TwsCodeKind::SessionEnd,
+        1100 => TwsCodeKind::IbLinkLost,
+        1101 => TwsCodeKind::IbLinkRestored { data_lost: true },
+        1102 => TwsCodeKind::IbLinkRestored { data_lost: false },
+        2110 => TwsCodeKind::ServerLinkBroken,
+        2103 | 2105 => TwsCodeKind::FarmDown,
+        2104 | 2106 | 2158 => TwsCodeKind::FarmUp,
+        2107 | 2108 => TwsCodeKind::FarmIdle,
+        2100 | 2101 => TwsCodeKind::AccountUpdatesStopped,
+        100 | 10197 => TwsCodeKind::Warning,
+        _ => TwsCodeKind::Unclassified,
     }
 }
 

@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 pub struct Rebuilt {
     /// Trades the executions show that were not stored yet.
     pub new: Vec<StoredTrade>,
-    /// Known open trades that expired in the meantime.
+    /// Known open trades that expired or were closed by another order in the meantime.
     pub updated: Vec<StoredTrade>,
     /// Known open trades whose opening order was filled for more contracts since they were recorded (see `grown_trades`).
     pub grown: Vec<StoredTrade>,
@@ -285,6 +285,71 @@ fn expire_if_booked(trade: &mut StoredTrade, bookings: &[&StoredExecution]) -> b
     false
 }
 
+/// The options of `trade` with the side that closes each (BOT for a sold leg, SLD for a bought one) and how many contracts that
+/// takes: its quantity times the leg's ratio.
+fn closing_sides(trade: &StoredTrade) -> Vec<(i32, &'static str, Decimal)> {
+    let qty = Decimal::from(trade.qty);
+    if let Some(custom) = &trade.custom_legs {
+        return custom
+            .iter()
+            .filter_map(|leg| {
+                let side = if leg.ratio < 0 { "BOT" } else { "SLD" };
+                Some((leg.con_id, side, qty.checked_mul(Decimal::from(leg.ratio.unsigned_abs()))?))
+            })
+            .collect();
+    }
+    let (put, call) = (Decimal::from(trade.put_ratio.max(1)), Decimal::from(trade.call_ratio.max(1)));
+    [(&trade.short_put, "BOT", put), (&trade.long_put, "SLD", put), (&trade.short_call, "BOT", call), (&trade.long_call, "SLD", call)]
+        .into_iter()
+        .filter_map(|(leg, side, ratio)| Some((leg.as_ref()?.con_id, side, qty.checked_mul(ratio)?)))
+        .collect()
+}
+
+/// The order that closed the open `trade` outside this session (another computer, TWS by hand): one order, not the trade's own exit
+/// orders, whose option fills on or after the trade's day take every option of the trade the other way round, for all its contracts. Its id and its price per
+/// contract (the sign of `price_close`).
+fn closing_order(trade: &StoredTrade, execs: &[StoredExecution]) -> Option<(i32, Decimal)> {
+    let legs = closing_sides(trade);
+    if legs.is_empty() || legs.iter().any(|(con_id, _, _)| *con_id == 0) {
+        return None;
+    }
+    let from_day = trade.day.replace('-', "");
+    // The trade's own stop, target or close order is left to the reconciliation, which books it as what it is (stopped, closed).
+    let own = trade.exit_order_ids();
+    let mut orders: Vec<i32> = execs
+        .iter()
+        .filter(|e| e.sec_type == "OPT" && e.order_id > 0 && e.order_id != trade.order_id && !own.contains(&e.order_id))
+        .filter(|e| e.time.get(0..8).is_some_and(|day| day >= from_day.as_str()))
+        .filter(|e| legs.iter().any(|(con_id, side, _)| e.con_id == *con_id && e.side == *side))
+        .map(|e| e.order_id)
+        .collect();
+    orders.sort_unstable();
+    orders.dedup();
+    orders.into_iter().find_map(|order_id| {
+        let filled = |con_id: i32, side: &str| {
+            execs
+                .iter()
+                .filter(|e| e.order_id == order_id && e.con_id == con_id && e.side == side)
+                .filter_map(|e| dec(e.quantity))
+                .fold(Decimal::ZERO, |sum, qty| sum.checked_add(qty).unwrap_or(sum))
+        };
+        let complete = legs.iter().all(|(con_id, side, qty)| filled(*con_id, side) >= *qty);
+        let (_, price) = crate::reconcile::fill_of_order(execs, order_id)?;
+        complete.then_some((order_id, price))
+    })
+}
+
+/// Marks an open trade as closed when one order of the executions closed every one of its options (see `closing_order`).
+fn close_if_closed_by_order(trade: &mut StoredTrade, execs: &[StoredExecution]) -> bool {
+    if !trade.is_open() || trade.entry_unknown {
+        return false;
+    }
+    let Some((_, price)) = closing_order(trade, execs) else { return false };
+    trade.status = crate::trade_summary::TradeStatus::Closed.as_str().to_string();
+    trade.price_close = Some(price);
+    true
+}
+
 /// Trades for expiry bookings that belong to no known trade: shorts (BOT) are paired with the
 /// nearest long (SLD) of the same right on the same expiry; the entry price stays unknown.
 fn orphan_trades(bookings: &[&StoredExecution], known: &[StoredTrade]) -> Vec<StoredTrade> {
@@ -425,7 +490,7 @@ pub fn grown_trades(execs: &[StoredExecution], known: &[StoredTrade]) -> Vec<Sto
 }
 
 /// The trades the stored executions show that `known` (every stored trade) does not have yet,
-/// and the known open trades that expired in the meantime.
+/// and the known open trades that expired or were closed by another order in the meantime.
 #[must_use]
 pub fn rebuild(execs: &[StoredExecution], known: &[StoredTrade]) -> Rebuilt {
     let mut groups: BTreeMap<i32, Vec<&StoredExecution>> = BTreeMap::new();
@@ -453,15 +518,16 @@ pub fn rebuild(execs: &[StoredExecution], known: &[StoredTrade]) -> Rebuilt {
             .filter(|(id, group)| !known.iter().any(|t| t.order_id == **id && !t.entry_unknown) && !closes_a_known_short(group, known))
             .filter_map(|(id, group)| opening_trade(*id, group, false)),
     );
+    // A known or recovered trade that is over: expired (bookings), or closed by an order that bought or sold back every option.
     let mut updated = Vec::new();
     for trade in known.iter().filter(|t| !t.entry_unknown) {
         let mut copy = trade.clone();
-        if expire_if_booked(&mut copy, &bookings) {
+        if expire_if_booked(&mut copy, &bookings) || close_if_closed_by_order(&mut copy, execs) {
             updated.push(copy);
         }
     }
     for trade in &mut new {
-        expire_if_booked(trade, &bookings);
+        let _ = expire_if_booked(trade, &bookings) || close_if_closed_by_order(trade, execs);
     }
     let all: Vec<StoredTrade> = known.iter().cloned().chain(new.iter().cloned()).collect();
     for orphan in orphan_trades(&bookings, &all) {
@@ -503,6 +569,32 @@ mod tests {
 
     fn put_spread_entry() -> Vec<StoredExecution> {
         vec![exec("a", T, 7, OPEN, 11, "P", 7535.0, "SLD", 1.0, 1.4), exec("b", T, 7, OPEN, 12, "P", 7530.0, "BOT", 1.0, 0.65)]
+    }
+
+    #[test]
+    fn a_trade_closed_by_an_order_of_another_computer_is_rebuilt_as_closed_at_its_fill() {
+        // Opened by order 7 and closed by the profit target 8 that another computer placed: the short bought back at 0.30, the
+        // long sold at 0.05.
+        let mut execs = put_spread_entry();
+        let close = "20261113 21:31:00 Europe/Berlin";
+        execs.push(exec("c", close, 8, "TraPi-8 (TP)", 11, "P", 7535.0, "BOT", 1.0, 0.30));
+        execs.push(exec("d", close, 8, "TraPi-8 (TP)", 12, "P", 7530.0, "SLD", 1.0, 0.05));
+        let rebuilt = rebuild(&execs, &[]);
+        let [trade] = rebuilt.new.as_slice() else { panic!("one trade expected: {rebuilt:?}") };
+        assert_eq!((trade.status.as_str(), trade.price_close), ("Closed", Some(Decimal::new(-25, 2))), "{trade:?}");
+
+        // The same trade known as open is reported closed.
+        let open = rebuild(&put_spread_entry(), &[]).new.remove(0);
+        let rebuilt = rebuild(&execs, std::slice::from_ref(&open));
+        assert_eq!(rebuilt.updated.iter().map(|t| (t.status.as_str(), t.price_close)).collect::<Vec<_>>(), [("Closed", Some(Decimal::new(-25, 2)))]);
+
+        // Only the short bought back: the trade still holds its long and stays open.
+        let short_only = [put_spread_entry(), vec![exec("c", close, 8, "TraPi-8 (TP)", 11, "P", 7535.0, "BOT", 1.0, 0.30)]].concat();
+        assert_eq!(rebuild(&short_only, std::slice::from_ref(&open)).updated.len(), 0);
+
+        // The trade's own stop or target is left to the reconciliation, which books it as stopped or closed.
+        let own = StoredTrade { profit_order_id: Some(8), ..open };
+        assert_eq!(rebuild(&execs, &[own]).updated.len(), 0);
     }
 
     #[test]

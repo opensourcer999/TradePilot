@@ -212,6 +212,18 @@ pub fn quotes_missing(problems: &[String]) -> TradeMail {
     )
 }
 
+/// "ALERT: TWS without connection to IB": TWS has reported 1100 and not yet 1101/1102 for `minutes`.
+#[must_use]
+pub fn ib_link_lost(minutes: u64) -> TradeMail {
+    let problem = format!("TWS has had no connection to the IB servers for {minutes} minute(s) (TWS message 1100).");
+    alert(
+        "ALERT: TWS without connection to IB",
+        "TWS Connection To IB Lost",
+        &[problem],
+        "TradePilot stays connected to TWS but sends no new or changed order until TWS reports the connection back. Causes named by IB: the internet connection, the nightly reset of the IB servers, or a competing session (the same user logged in elsewhere). Check TWS.",
+    )
+}
+
 /// "ALERT: Open trade not in the TWS positions": an open trade whose options TWS no longer holds.
 #[must_use]
 pub fn position_gone(problems: &[String]) -> TradeMail {

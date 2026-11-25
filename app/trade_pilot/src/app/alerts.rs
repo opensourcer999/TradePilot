@@ -18,6 +18,10 @@ const ORDER_REJECTED: i32 = 201;
 const CLOSE_REPEAT_PAUSE: Duration = Duration::from_mins(5);
 /// Quotes must be missing this long, and the session must be this old, before it is reported.
 const QUOTES_HOLD: Duration = Duration::from_secs(120);
+/// How often the API socket is checked again while TWS is without its connection to IB.
+const IB_LINK_PROBE_INTERVAL: Duration = Duration::from_mins(1);
+/// How long TWS may be without its connection to IB (1100) before it is reported by mail.
+const IB_LINK_HOLD: Duration = Duration::from_mins(2);
 /// Underlyings that settle in cash: their short options carry no assignment risk.
 const CASH_SETTLED: [&str; 4] = ["SPX", "XSP", "RUT", "NDX"];
 
@@ -29,6 +33,7 @@ impl App {
             return;
         }
         self.check_daily_profit_target(now);
+        self.check_ib_link(now);
         if self.market_is_open() {
             self.check_beyond_stop(now);
             self.check_missing_quotes(now);
@@ -62,6 +67,22 @@ impl App {
         if !problems.is_empty() {
             self.log(&format!("WARNING: Trade Position Missing: {}", problems.join("; ")));
             self.notify_trade_mail(&trade_mail::position_gone(&problems), true, true);
+        }
+    }
+
+    /// "TWS without connection to IB": TWS reported 1100 and has not reported the connection back for `IB_LINK_HOLD`. A short gap (the
+    /// nightly reset) says nothing; a long one (a competing session, say) may never end by itself, so it is mailed, and again after the
+    /// pause while it lasts.
+    fn check_ib_link(&mut self, now: Instant) {
+        // While it lasts, the API socket is checked again every minute.
+        let probe_due = self.session.ib_link_probe_at.is_none_or(|at| now.saturating_duration_since(at) >= IB_LINK_PROBE_INTERVAL);
+        if self.session.ib_link_lost && probe_due {
+            self.probe_api_socket();
+        }
+        if self.watch.sustained.fire("ib-link", self.session.ib_link_lost, now, IB_LINK_HOLD, REPEAT_PAUSE) {
+            let minutes = IB_LINK_HOLD.as_secs() / 60;
+            self.log(&format!("WARNING: TWS has had no connection to IB for {minutes} minute(s) or more - no order is sent until it is back"));
+            self.notify_trade_mail(&trade_mail::ib_link_lost(minutes), true, true);
         }
     }
 

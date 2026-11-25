@@ -1051,6 +1051,7 @@ impl App {
         };
         let de = self.german();
         let rows = self.template_confirm_rows(pending, de);
+        let blocked = self.order_block_note();
         let mut send = false;
         let mut cancel = false;
         egui::Window::new(if de { "Template-Trade übertragen?" } else { "Send this template trade?" })
@@ -1065,7 +1066,7 @@ impl App {
                         ui.end_row();
                     }
                 });
-                (send, cancel) = confirm_buttons(ui, de);
+                (send, cancel) = confirm_buttons(ui, de, blocked);
             });
         if send {
             self.confirm_template_order();
@@ -1269,6 +1270,7 @@ impl App {
         };
         let de = self.german();
         let rows = Self::instant_confirm_rows(pending, de);
+        let blocked = self.order_block_note();
         let mut send = false;
         let mut cancel = false;
         egui::Window::new(if de { "Trade übertragen?" } else { "Send this trade?" })
@@ -1287,7 +1289,7 @@ impl App {
                         ui.end_row();
                     }
                 });
-                (send, cancel) = confirm_buttons(ui, de);
+                (send, cancel) = confirm_buttons(ui, de, blocked);
             });
         if send {
             self.confirm_instant_order();

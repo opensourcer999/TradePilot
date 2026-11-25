@@ -630,6 +630,13 @@ pub fn encode_cancel_order(server_version: i32, order_id: i32) -> Vec<String> {
     f
 }
 
+/// `IBApi.EClient.reqAccountUpdates`'s fields: version 2, subscribe (1) or stop (0), and the account. TWS then sends the account's
+/// values and an `updatePortfolio` for each of its positions, and again whenever one changes.
+#[must_use]
+pub fn encode_req_account_updates(subscribe: bool, account: &str) -> Vec<String> {
+    vec!["2".to_string(), if subscribe { "1" } else { "0" }.to_string(), account.to_string()]
+}
+
 /// `IBApi.EClient.reqOpenOrders`'s real fields: only its version, 1. TWS answers with an
 /// `openOrder` (and an `orderStatus`) for every order of this client that is still working, then
 /// `openOrderEnd`.

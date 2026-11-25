@@ -12,8 +12,7 @@ use crate::trade_type::TradeType;
 
 // Dropdown items, in the order they are shown in the editor. Items already used earlier in the page
 // (e.g. "Delta", "None") are listed in each dropdown that offers them.
-pub const SYMBOLS: [&str; 17] =
-    ["AAPL", "AMZN", "ES", "GLD", "GOOGL", "IBIT", "IWM", "META", "MSFT", "NVDA", "QQQ", "RUT", "SPCX", "SPX", "SPY", "TSLA", "XSP"];
+pub const SYMBOLS: [&str; 16] = ["AAPL", "AMZN", "GLD", "GOOGL", "IBIT", "IWM", "META", "MSFT", "NVDA", "QQQ", "RUT", "SPCX", "SPX", "SPY", "TSLA", "XSP"];
 pub const TRADE_TYPES: [&str; 17] = [
     "CallCalendar",
     "CallSpread",
@@ -209,6 +208,7 @@ pub enum Field {
     MinOtm(Side),
     Ratio(Side),
     LongWidth(Side),
+    LongMaxWidth(Side),
     LongMaxPremium(Side),
     DteAll,
     MinEntryPrice,
@@ -297,6 +297,9 @@ pub struct TemplateForm {
     pub base: TradeTemplate,
     pub name: String,
     pub symbol: String,
+    /// The distance between the strikes of `symbol` as TWS reported them in this session (`strikes::strike_step_of`); `None` when
+    /// TWS has reported none, then the widths are not checked against it (the editor says so). Not part of the template.
+    pub strike_step: Option<rust_decimal::Decimal>,
     pub trade_type: String,
     pub short_put: CalendarLegForm,
     pub long_put: CalendarLegForm,
@@ -1091,6 +1094,37 @@ impl TemplateForm {
         Ok(())
     }
 
+    /// Plausibility of every distance in points that has to land on a strike, against the distance between the strikes TWS reported
+    /// (`strike_step`): the long widths and the max width of each visible long side, and the spread width of the long calendar legs.
+    /// A distance off that grid (a width of 1 on SPX, whose strikes are 5 apart) could never find its long, so it is refused here.
+    /// Without a reported distance nothing is checked.
+    fn check_strike_distances(&self, layout: &TemplateLayout, errors: &mut Errors) {
+        let (symbol, step) = (self.symbol.as_str(), self.strike_step);
+        if layout.shows(Part::LongStrikeSelection) {
+            for (visible, side, which) in
+                [(layout.shows(Part::LongPut), &self.long_put_side, Side::Put), (layout.shows(Part::LongCall), &self.long_call_side, Side::Call)]
+            {
+                let checks = match side.long_type.as_str() {
+                    "Width" if visible => Some((Field::LongWidth(which), &side.width)),
+                    "Premium cap" if visible => Some((Field::LongMaxWidth(which), &side.max_width)),
+                    _ => None,
+                };
+                if let Some(message) = checks.and_then(|(field, text)| crate::strikes::strike_step_problem(symbol, step, text).map(|m| (field, m))) {
+                    errors.add(message.0, "Invalid Data", &message.1);
+                }
+            }
+        }
+        if is_calendar(&self.trade_type) {
+            for (leg, which) in [(&self.long_put, CalendarLeg::LongPut), (&self.long_call, CalendarLeg::LongCall)] {
+                if leg.target_type == "Spread width" {
+                    if let Some(message) = crate::strikes::strike_step_problem(symbol, step, &leg.target) {
+                        errors.add(Field::CalendarTarget(which), "Invalid Data", &message);
+                    }
+                }
+            }
+        }
+    }
+
     /// One calendar-grid row: its strike target and DTE, each reported on its own field.
     fn calendar_leg(leg: &CalendarLegForm, which: CalendarLeg, errors: &mut Errors) -> (f64, i32) {
         let target = errors.take(required(parse_dec(&leg.target), Field::CalendarTarget(which))).unwrap_or(0.0);
@@ -1122,6 +1156,7 @@ impl TemplateForm {
         self.apply_ratios(&mut t, &mut errors);
         self.apply_entry_prices(&mut t, &mut errors);
         self.apply_legs(&layout, &mut t, &mut errors);
+        self.check_strike_distances(&layout, &mut errors);
         if let (Some(limit), Some(market)) = (t.stop_limit_offset, t.stop_limit_market_offset) {
             if market <= limit {
                 errors.add(Field::StopLimitMarketOffset, "Invalid Data ", "Stop Market Offset must be greater than Limit Offset.");
@@ -1735,6 +1770,39 @@ mod tests {
             leg.dte = dte.into();
         }
         form
+    }
+
+    #[test]
+    fn a_width_that_no_strike_tws_reported_is_at_is_refused_on_saving() {
+        let mut form = filled("CallSpread");
+        form.symbol = "SPX".into();
+        // TWS reported the SPX strikes 5 apart.
+        form.strike_step = Some(rust_decimal::Decimal::new(5, 0));
+        form.long_call_side.width = "1".into();
+        let message = "SPX strikes are 5 apart: every width must be a multiple of 5 (not 1).".to_string();
+        assert_eq!(error_of(&form), (Field::LongWidth(Side::Call), message));
+        form.long_call_side.width = "10".into();
+        assert!(form.save().is_ok(), "{:?}", form.save().err());
+        // Strikes 1 apart: a width of 1 is fine.
+        form.strike_step = Some(rust_decimal::Decimal::ONE);
+        form.long_call_side.width = "1".into();
+        assert!(form.save().is_ok(), "{:?}", form.save().err());
+        // No strikes reported for the symbol: the width is not checked.
+        form.strike_step = None;
+        assert!(form.save().is_ok(), "{:?}", form.save().err());
+        // The max width of a premium cap is checked the same way.
+        form.strike_step = Some(rust_decimal::Decimal::new(5, 0));
+        form.long_call_side.long_type = "Premium cap".into();
+        form.long_call_side.max_premium = "0.5".into();
+        form.long_call_side.max_width = "12".into();
+        assert_eq!(error_of(&form).0, Field::LongMaxWidth(Side::Call));
+        form.long_call_side.max_width = "15".into();
+        assert!(form.save().is_ok(), "{:?}", form.save().err());
+    }
+
+    #[test]
+    fn es_is_no_longer_offered_as_a_symbol_of_a_template() {
+        assert!(!SYMBOLS.contains(&"ES"));
     }
 
     /// The first reported failure of a form that must not save.

@@ -1,12 +1,12 @@
 //! The Dashboard: the figures and gauges of the day, today's trades with their actions and the scheduled tasks.
 
 use super::{
-    credit_summary, data_table, data_table_rows, delta_total, display_currency, display_percent, empty_state, execution_time_text, format_date, gauge_card,
-    gauge_card_height, group_name, kpi_card, mask_account, money_text, muted_text, newest_first, next_selection, profit_summary, segmented, show_date,
-    sign_color_of, stat_tile, text_primary, trade_table, App, DashboardFigures, Decimal, GaugeSpec, Lang, Page, ProfitSummary, RichText, RunStatus,
-    ScheduleForm, ScheduleRun, StoredTrade, TableCell, TableColumn, ACCENT_BLUE, GROUPS, PCR_TICKS, STATUS_ERROR, WIN_TICKS,
+    credit_summary, delta_total, display_currency, display_percent, empty_state, execution_time_text, format_date, gauge_card, gauge_card_height, group_name,
+    kpi_card, mask_account, money_text, muted_text, newest_first, next_selection, profit_summary, segmented, show_date, sign_color_of, stat_tile, text_primary,
+    trade_table, App, DashboardFigures, Decimal, GaugeSpec, Lang, Page, ProfitSummary, RichText, RunStatus, ScheduleForm, ScheduleRun, StoredTrade, TableCell,
+    TableColumn, ACCENT_BLUE, GROUPS, PCR_TICKS, STATUS_ERROR, WIN_TICKS,
 };
-use crate::widgets::{framed_card, plate_label};
+use crate::widgets::{arranged_table, framed_card, plate_label, RowSelection};
 use eframe::egui;
 use rust_decimal::prelude::ToPrimitive;
 
@@ -233,7 +233,8 @@ impl App {
                     ]
                 })
                 .collect();
-            data_table(ui, "tws_executions_table", &columns, &rows);
+            let keys = ["time", "account", "expiry", "type", "strike", "qty", "price"];
+            let _ = arranged_table(ui, "tws_executions_table", &keys, &columns, &rows, None);
         });
     }
 
@@ -406,7 +407,8 @@ impl App {
                 })
                 .collect();
             let selected = self.schedule.selected_run.and_then(|id| runs.iter().position(|run| run.id == id));
-            let clicks = data_table_rows(ui, "scheduled_tasks_table", &columns, &rows, selected);
+            let keys = ["time_ny", "local_time", "type", "status", "template"];
+            let clicks = arranged_table(ui, "scheduled_tasks_table", &keys, &columns, &rows, Some(RowSelection { selected, locked: &[] }));
             self.schedule.selected_run = next_selection(self.schedule.selected_run, clicks, |index| runs.get(index).map(|run| run.id));
             if let Some(run) = clicks.double_clicked.and_then(|index| runs.get(index)).filter(|run| run.schedule_id > 0) {
                 self.edit_schedule(run.schedule_id);
@@ -580,6 +582,7 @@ impl App {
                 ]
             })
             .collect();
-        data_table(ui, "task_log_table", &columns, &rows);
+        let keys = ["date", "time_ny", "template", "status", "tries", "what_happened"];
+        let _ = arranged_table(ui, "task_log_table", &keys, &columns, &rows, None);
     }
 }

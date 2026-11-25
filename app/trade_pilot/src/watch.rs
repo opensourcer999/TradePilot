@@ -89,6 +89,9 @@ pub struct WatchState {
     pub short_day: String,
     /// When the watchers last looked.
     pub checked: Option<Instant>,
+    /// TWS messages whose values did not match what the app knows for sure (by what they were about, e.g. "portfolio 123"): each is
+    /// reported once, its values are not used.
+    pub mismatch_reported: HashSet<String>,
     /// Trades (by `StoredTrade::key`) whose timed exit uses a market order: the limit order did not fill in time.
     pub timed_market: HashSet<String>,
     /// When a timed exit last tried to place its order, by trade (`StoredTrade::key`).

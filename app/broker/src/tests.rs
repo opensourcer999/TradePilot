@@ -38,6 +38,13 @@ fn parses_real_account_summary_and_position_messages() {
     assert_eq!(parsed.security_type, "STK");
     assert_eq!(parsed.quantity, 10.0);
     assert_eq!(parsed.average_cost, Some(150.5));
+    assert_eq!((parsed.expiry.as_str(), parsed.strike, parsed.right.as_str(), parsed.multiplier), ("", 0.0, "", None), "a stock has no option fields");
+    // A short SPX put: its contract with the multiplier; TWS gives the average cost per contract (price x multiplier).
+    let option = ["61", "3", "DU123", "945737094", "SPX", "OPT", "20261123", "7155", "P", "100", "", "USD", "SPXW  261123P07155000", "SPXW", "-1", "185.5"]
+        .map(str::to_string);
+    let parsed = parse_position(&option).unwrap().unwrap();
+    assert_eq!((parsed.expiry.as_str(), parsed.strike, parsed.right.as_str(), parsed.multiplier), ("20261123", 7155.0, "P", Some(100.0)));
+    assert_eq!((parsed.quantity, parsed.average_cost), (-1.0, Some(185.5)));
 }
 
 #[test]
@@ -219,6 +226,10 @@ fn framed_handshake_and_informational_message_before_ready() {
             TwsEvent::AccountSummary { .. }
             | TwsEvent::AccountSummaryEnd
             | TwsEvent::Position(_)
+            | TwsEvent::Portfolio(_)
+            | TwsEvent::IbConnectivity { .. }
+            | TwsEvent::TwsNotice { .. }
+            | TwsEvent::CurrentTime(_)
             | TwsEvent::PositionsEnd
             | TwsEvent::Execution(_)
             | TwsEvent::ExecutionsEnd => panic!("unexpected account data from mock TWS"),
@@ -1112,6 +1123,150 @@ fn open_orders_are_requested_with_version_1_and_their_ids_read_for_every_server_
     // A truncated or garbled message gives no id instead of a wrong one.
     assert_eq!(parse_open_order_id(&fields(&["5"]), 200), None);
     assert_eq!(parse_open_order_id(&fields(&["5", "x"]), 200), None);
+}
+
+#[test]
+fn every_code_of_ibs_message_code_tables_the_app_acts_on_is_classified_as_the_page_says() {
+    // IB's "Message Codes" page: System, Warning, Client and TWS error codes about the session, the link to IB and the farms.
+    for code in [326, 502, 503, 504, 507, 1300] {
+        assert_eq!(classify_tws_code(code), TwsCodeKind::SessionEnd, "{code}");
+    }
+    assert_eq!(classify_tws_code(1100), TwsCodeKind::IbLinkLost);
+    assert_eq!(classify_tws_code(1101), TwsCodeKind::IbLinkRestored { data_lost: true });
+    assert_eq!(classify_tws_code(1102), TwsCodeKind::IbLinkRestored { data_lost: false });
+    assert_eq!(classify_tws_code(2110), TwsCodeKind::ServerLinkBroken);
+    for (code, kind) in [
+        (2103, TwsCodeKind::FarmDown),
+        (2105, TwsCodeKind::FarmDown),
+        (2104, TwsCodeKind::FarmUp),
+        (2106, TwsCodeKind::FarmUp),
+        (2158, TwsCodeKind::FarmUp),
+        (2107, TwsCodeKind::FarmIdle),
+        (2108, TwsCodeKind::FarmIdle),
+        (2100, TwsCodeKind::AccountUpdatesStopped),
+        (2101, TwsCodeKind::AccountUpdatesStopped),
+        (100, TwsCodeKind::Warning),
+        (10197, TwsCodeKind::Warning),
+    ] {
+        assert_eq!(classify_tws_code(code), kind, "{code}");
+    }
+    assert_eq!(classify_tws_code(9999), TwsCodeKind::Unclassified, "not in IB's tables");
+}
+
+#[test]
+fn the_first_open_order_and_portfolio_message_of_a_session_are_logged_as_tws_sent_them() {
+    use std::sync::atomic::Ordering;
+    crate::connection::RAW_OPEN_ORDER_LOGGED.store(false, Ordering::Relaxed);
+    crate::connection::RAW_PORTFOLIO_LOGGED.store(false, Ordering::Relaxed);
+    let (sender, receiver) = mpsc::channel();
+    let open_order = ["5", "11", "0", "SPX", "BAG"].map(String::from).to_vec();
+    let portfolio = ["7", "8", "1234", "MU"].map(String::from).to_vec();
+    for _ in 0..2 {
+        crate::connection::handle_incoming_message(&open_order, 200, &sender).unwrap();
+        crate::connection::handle_incoming_message(&portfolio, 200, &sender).unwrap();
+    }
+    let raw: Vec<String> =
+        receiver.try_iter().filter_map(|e| if let TwsEvent::Log(line) = e { Some(line) } else { None }).filter(|l| l.contains("TWS raw")).collect();
+    assert_eq!(
+        raw,
+        [
+            "TWS raw openOrder message (to check the fields TradePilot reads): 5|11|0|SPX|BAG",
+            "TWS raw updatePortfolio message (to check the fields TradePilot reads): 7|8|1234|MU"
+        ]
+    );
+}
+
+#[test]
+fn the_current_time_of_tws_is_read_as_the_ib_client_reads_it() {
+    // IB's client: `currentTime` is 49, version, then the time in seconds since 1970 (`CurrentTimeEvent`).
+    assert_eq!((OUT_REQ_CURRENT_TIME, IN_CURRENT_TIME), (49, 49));
+    let (sender, receiver) = mpsc::channel();
+    let fields = ["49", "1", "1795635718"].map(String::from).to_vec();
+    assert!(crate::connection::handle_incoming_message(&fields, 200, &sender).is_ok());
+    let times: Vec<i64> = receiver.try_iter().filter_map(|e| if let TwsEvent::CurrentTime(t) = e { Some(t) } else { None }).collect();
+    assert_eq!(times, [1_795_635_718]);
+}
+
+#[test]
+fn a_notice_without_a_request_is_passed_on_and_one_about_a_request_is_left_to_that_request() {
+    let (sender, receiver) = mpsc::channel();
+    let error = |id: &str, code: &str| ["4", id, code, "text", ""].map(String::from).to_vec();
+    let notices = |receiver: &mpsc::Receiver<TwsEvent>| {
+        receiver.try_iter().filter_map(|e| if let TwsEvent::TwsNotice { code, kind, .. } = e { Some((code, kind)) } else { None }).collect::<Vec<_>>()
+    };
+    assert!(crate::connection::handle_incoming_message(&error("-1", "2110"), 200, &sender).is_ok(), "2110 keeps the session");
+    assert_eq!(notices(&receiver), [(2110, TwsCodeKind::ServerLinkBroken)]);
+    assert!(crate::connection::handle_incoming_message(&error("-1", "9999"), 200, &sender).is_ok());
+    assert_eq!(notices(&receiver), [(9999, TwsCodeKind::Unclassified)], "an unknown system notice is reported, not dropped");
+    assert!(crate::connection::handle_incoming_message(&error("42", "9999"), 200, &sender).is_ok());
+    assert_eq!(notices(&receiver), [], "about request 42: left to that request");
+    assert!(crate::connection::handle_incoming_message(&error("-1", "2104"), 200, &sender).is_ok());
+    assert_eq!(notices(&receiver), [], "a farm that is OK is no notice");
+    assert!(crate::connection::handle_incoming_message(&error("-1", "507"), 200, &sender).is_err(), "507 ends the session");
+}
+
+#[test]
+fn a_lost_link_between_tws_and_ib_keeps_the_session_and_is_reported_until_tws_restores_it() {
+    let (sender, receiver) = mpsc::channel();
+    // From server version 194 on an error message has no version field: 4, id, code, text.
+    let error = |code: &str| ["4", "-1", code, "text", ""].map(String::from).to_vec();
+    let connectivity = |receiver: &mpsc::Receiver<TwsEvent>| {
+        receiver.try_iter().find_map(|event| if let TwsEvent::IbConnectivity { connected, data_lost } = event { Some((connected, data_lost)) } else { None })
+    };
+    assert!(crate::connection::handle_incoming_message(&error("1100"), 200, &sender).is_ok(), "1100 does not end the session");
+    assert_eq!(connectivity(&receiver), Some((false, false)));
+    assert!(crate::connection::handle_incoming_message(&error("1101"), 200, &sender).is_ok());
+    assert_eq!(connectivity(&receiver), Some((true, true)), "back, the market data is gone");
+    assert!(crate::connection::handle_incoming_message(&error("1102"), 200, &sender).is_ok());
+    assert_eq!(connectivity(&receiver), Some((true, false)), "back with everything kept");
+    // A real loss of the session still ends it.
+    assert!(crate::connection::handle_incoming_message(&error("1300"), 200, &sender).is_err());
+}
+
+#[test]
+fn the_portfolio_is_asked_for_by_account_and_each_position_read_with_the_values_tws_gives_it() {
+    assert_eq!((OUT_REQ_ACCOUNT_UPDATES, IN_PORTFOLIO_VALUE), (6, 7), "OutgoingMessages.RequestAccountData, IncomingMessage.PortfolioValue");
+    assert_eq!(encode_req_account_updates(true, "DU1234567"), ["2", "1", "DU1234567"]);
+    assert_eq!(encode_req_account_updates(false, "DU1234567"), ["2", "0", "DU1234567"]);
+    let fields = |values: &[&str]| values.iter().map(std::string::ToString::to_string).collect::<Vec<String>>();
+    // A short SPX put (message version 8): contract, then position, market price, market value, average cost, unrealized and
+    // realized profit, account.
+    let put = [
+        "7",
+        "8",
+        "945737094",
+        "SPX",
+        "OPT",
+        "20261218",
+        "6950",
+        "P",
+        "100",
+        "",
+        "USD",
+        "SPXW  261218P06950000",
+        "SPXW",
+        "-1",
+        "61.2",
+        "-6120",
+        "7556.37",
+        "1436.37",
+        "0",
+        "DU1234567",
+    ];
+    let row = parse_portfolio_value(&fields(&put)).expect("a full message");
+    assert_eq!((row.account.as_str(), row.con_id, row.quantity), ("DU1234567", 945_737_094, -1.0));
+    assert_eq!((row.market_price, row.market_value, row.average_cost, row.unrealized_pnl), (61.2, -6120.0, 7556.37, 1436.37));
+    // A treasury bill: no option fields, the same places.
+    let bill =
+        ["7", "8", "1234", "US-T", "BILL", "20270115", "0", "", "", "", "USD", "912797XX1", "", "10", "99.1", "991", "980.43", "10.57", "0", "DU1234567"];
+    assert_eq!(parse_portfolio_value(&fields(&bill)).map(|r| (r.market_value, r.unrealized_pnl)), Some((991.0, 10.57)));
+    // An older version leaves fields out; a garbled number is not read: nothing rather than shifted values.
+    let mut old = put;
+    old[1] = "7";
+    assert_eq!(parse_portfolio_value(&fields(&old)), None);
+    let mut garbled = put;
+    garbled[15] = "x";
+    assert_eq!(parse_portfolio_value(&fields(&garbled)), None);
 }
 
 #[test]

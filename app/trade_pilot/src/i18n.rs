@@ -38,7 +38,7 @@ pub const PAGES: [Page; 12] = [
 ];
 
 /// The pages of the Light mode: the most important ones. Advanced shows all of `PAGES`.
-pub const LIGHT_PAGES: [Page; 6] = [Page::Dashboard, Page::InstantOrder, Page::Templates, Page::Schedules, Page::News, Page::Settings];
+pub const LIGHT_PAGES: [Page; 7] = [Page::Dashboard, Page::InstantOrder, Page::Templates, Page::Schedules, Page::News, Page::Logs, Page::Settings];
 
 /// Whether `page` is in the sidebar in the given mode.
 #[must_use]
@@ -144,13 +144,14 @@ mod mode_tests {
     use super::*;
 
     #[test]
-    fn the_light_mode_shows_only_the_six_important_pages_and_advanced_shows_all() {
+    fn the_light_mode_shows_only_the_seven_important_pages_and_advanced_shows_all() {
         let light: Vec<Page> = PAGES.into_iter().filter(|page| page_is_shown(*page, true)).collect();
         assert!(light == LIGHT_PAGES, "the pages keep the order of the sidebar");
         assert!(PAGES.into_iter().all(|page| page_is_shown(page, false)));
         for page in LIGHT_PAGES {
             assert!(PAGES.contains(&page), "every page of the Light mode is a page of the sidebar");
         }
-        assert!(!page_is_shown(Page::Logs, true) && !page_is_shown(Page::Reports, true) && !page_is_shown(Page::Conditions, true));
+        assert!(page_is_shown(Page::Logs, true), "the log is in the Light mode too");
+        assert!(!page_is_shown(Page::Reports, true) && !page_is_shown(Page::Conditions, true));
     }
 }

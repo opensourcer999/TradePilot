@@ -106,6 +106,143 @@ fn ticks_for_each_symbol_land_in_that_symbols_row() {
 }
 
 #[test]
+fn the_positions_are_valued_as_tws_values_them_also_stocks_and_options_outside_the_chain() {
+    let (mut app, commands) = connected_app();
+    drain(&commands);
+    let position = |con_id: i32, kind: &str, quantity: f64, average_cost: f64| broker::Position {
+        account: "U1234567".into(),
+        contract_id: con_id.to_string(),
+        symbol: "MU".into(),
+        security_type: kind.into(),
+        expiry: String::new(),
+        strike: 0.0,
+        right: String::new(),
+        multiplier: None,
+        quantity,
+        average_cost: Some(average_cost),
+    };
+    app.tws_sender.send(TwsEvent::Position(position(11, "STK", 2.0, 854.36))).unwrap();
+    app.tws_sender.send(TwsEvent::PositionsEnd).unwrap();
+    app.poll_tws();
+    let asked: Vec<String> =
+        drain(&commands).into_iter().filter_map(|c| if let TwsCommand::SubscribePortfolio { account } = c { Some(account) } else { None }).collect();
+    assert_eq!(asked, ["U1234567"], "the portfolio of the account the positions are on, asked for once");
+    let stock = app.positions.first().unwrap().clone();
+    assert_eq!(app.position_figures(&stock), (None, None), "no value before TWS gives one");
+
+    // TWS values the stock: 2 shares at 900 = 1800, 91.28 made on the cost of 1708.72.
+    let row = broker::PortfolioRow {
+        account: "U1234567".into(),
+        con_id: 11,
+        quantity: 2.0,
+        market_price: 900.0,
+        market_value: 1800.0,
+        average_cost: 854.36,
+        unrealized_pnl: 91.28,
+    };
+    app.tws_sender.send(TwsEvent::Portfolio(row.clone())).unwrap();
+    app.tws_sender.send(TwsEvent::PositionsEnd).unwrap();
+    app.poll_tws();
+    let (price, value) = app.position_figures(&stock);
+    let value = value.unwrap();
+    assert_eq!((price, value.market_value, value.profit), (Some(900.0), Decimal::from(1800), Decimal::new(9128, 2)));
+    assert_eq!(value.percent.map(|p| p.round_dp(2)), Some(Decimal::new(534, 2)));
+    assert!(!drain(&commands).iter().any(|c| matches!(c, TwsCommand::SubscribePortfolio { .. })), "not asked for again");
+    // The position is closed: TWS reports it with quantity 0 and it is forgotten.
+    app.tws_sender.send(TwsEvent::Portfolio(broker::PortfolioRow { quantity: 0.0, ..row })).unwrap();
+    app.poll_tws();
+    assert_eq!(app.portfolio.len(), 0);
+}
+
+#[test]
+fn a_portfolio_value_that_does_not_match_its_position_is_not_used_and_reported_once() {
+    let (mut app, _commands) = connected_app();
+    let position = broker::Position {
+        account: "U1234567".into(),
+        contract_id: "11".into(),
+        symbol: "MU".into(),
+        security_type: "STK".into(),
+        expiry: String::new(),
+        strike: 0.0,
+        right: String::new(),
+        multiplier: None,
+        quantity: 2.0,
+        average_cost: Some(854.36),
+    };
+    app.tws_sender.send(TwsEvent::Position(position.clone())).unwrap();
+    app.tws_sender.send(TwsEvent::PositionsEnd).unwrap();
+    // Another quantity than the position: the fields were not read where they are.
+    let row = broker::PortfolioRow {
+        account: "U1234567".into(),
+        con_id: 11,
+        quantity: 3.0,
+        market_price: 900.0,
+        market_value: 2700.0,
+        average_cost: 854.36,
+        unrealized_pnl: 136.92,
+    };
+    for _ in 0..2 {
+        app.tws_sender.send(TwsEvent::Portfolio(row.clone())).unwrap();
+    }
+    app.poll_tws();
+    assert_eq!(app.position_figures(&position), (None, None), "its values are not used");
+    assert_eq!(app.log_lines.iter().filter(|l| l.contains("portfolio value of contract 11 does not match its position")).count(), 1, "reported once");
+}
+
+#[test]
+fn a_tws_notice_is_reported_with_its_meaning_and_stopped_account_updates_drop_the_portfolio_values() {
+    let (mut app, _commands) = connected_app();
+    app.tws_sender
+        .send(TwsEvent::Portfolio(broker::PortfolioRow {
+            account: "U1".into(),
+            con_id: 11,
+            quantity: 2.0,
+            market_price: 900.0,
+            market_value: 1800.0,
+            average_cost: 854.36,
+            unrealized_pnl: 91.28,
+        }))
+        .unwrap();
+    app.poll_tws();
+    assert_eq!(app.portfolio.len(), 1);
+    let notice = |code: i32, kind: broker::TwsCodeKind| TwsEvent::TwsNotice { code, kind, message: "text".into() };
+    app.tws_sender.send(notice(2101, broker::TwsCodeKind::AccountUpdatesStopped)).unwrap();
+    app.tws_sender.send(notice(2110, broker::TwsCodeKind::ServerLinkBroken)).unwrap();
+    app.tws_sender.send(notice(9999, broker::TwsCodeKind::Unclassified)).unwrap();
+    app.poll_tws();
+    assert_eq!(app.portfolio.len(), 0, "no stale portfolio value is shown");
+    let warning = |part: &str| app.log_lines.iter().any(|l| l.contains("WARNING: TWS") && l.contains(part));
+    assert!(warning("2101: text - the portfolio values of TWS no longer come"), "{:?}", app.log_lines);
+    assert!(warning("2110: text - TWS reports its connection to the server broken"));
+    assert!(warning("9999: text - unknown TWS notice, not handled"));
+}
+
+#[test]
+fn the_strike_distance_comes_only_from_strikes_tws_reported_for_the_symbol() {
+    let (dte, expiry) = next_expiry();
+    let (app, _commands) = app_with_a_chain_and_a_template(&expiry, dte);
+    // The chain TWS gave holds the SPX puts 6690 and 6680.
+    assert_eq!(app.reported_strike_step("SPX"), Some(Decimal::from(10)));
+    assert_eq!(app.reported_strike_step("AAPL"), None, "no AAPL strikes reported");
+}
+
+#[test]
+fn live_data_shows_vix9d_over_vix_as_the_conditions_compute_it() {
+    let (mut app, _commands) = connected_app();
+    app.request_live_data_once();
+    assert_eq!(app.vix9d_over_vix(), None, "nothing before both are quoted");
+    let tws = app.tws_sender.clone();
+    for (label, price) in [("VIX", 17.12), ("VIX9D", 17.59)] {
+        tws.send(TwsEvent::TickPrice { ticker_id: quote(&app, label).req_id, tick_type: TICK_LAST, price }).unwrap();
+    }
+    app.poll_tws();
+    // 17.59 / 17.12 = 1.0274...: above 1, the curve is inverted.
+    let ratio = app.vix9d_over_vix().unwrap();
+    assert_eq!(ratio.round_dp(2), Decimal::new(103, 2));
+    assert_eq!(Some(ratio), app.condition_snapshot().value_with(crate::condition::Input::Vix9dOverVix, 1), "the same value the conditions use");
+}
+
+#[test]
 fn a_symbol_without_any_tick_shows_its_last_daily_close_until_a_real_tick_arrives() {
     let (mut app, commands) = connected_app();
     app.request_live_data_once();

@@ -531,7 +531,7 @@ fn after_a_reconnect_a_profit_target_that_filled_meanwhile_closes_the_trade_at_i
     let trade = app.trades_stored.first().unwrap();
     assert_eq!((trade.status.as_str(), trade.price_close), ("Closed", Some(Decimal::new(-2, 1))), "{:?}", app.log_lines);
     assert!(!app.log_lines.iter().any(|l| l.contains("NO stop") || l.contains("Mark closed")), "{:?}", app.log_lines);
-    assert!(app.log_lines.iter().any(|l| l.contains("the profit target 12 filled while TradePilot was not running")), "{:?}", app.log_lines);
+    assert!(app.log_lines.iter().any(|l| l.contains("the profit target 12 filled while TradePilot was not connected to TWS")), "{:?}", app.log_lines);
 
     // Filled for fewer contracts than the trade holds: the trade stays open and is reported.
     let (mut app, commands) = app_with_a_sent_template_order(true);

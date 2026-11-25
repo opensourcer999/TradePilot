@@ -33,6 +33,18 @@ pub enum TwsCommand {
     /// Which orders of this client are still working (`reqOpenOrders`): answered by
     /// `TwsEvent::OpenOrder` for each, then `TwsEvent::OpenOrderEnd`.
     RequestOpenOrders,
+    /// The current time of TWS (`reqCurrentTime`), answered by `TwsEvent::CurrentTime`: an answer proves that the API connection
+    /// carries messages both ways.
+    RequestCurrentTime,
+    /// The executions of the day again (`reqExecutions`, as at the start of a session): answered by `TwsEvent::Execution` for each,
+    /// then `TwsEvent::ExecutionsEnd`.
+    RequestExecutions,
+    /// The portfolio of `account` with its market prices and profits (`reqAccountUpdates`): answered by a
+    /// `TwsEvent::Portfolio` for each position, again whenever a value changes (about every three minutes).
+    SubscribePortfolio {
+        /// The account; TWS sends the updates of one account at a time.
+        account: String,
+    },
     /// Look up the contracts matching `contract` (`reqContractDetails`).
     RequestContractDetails {
         /// The request (or ticker) id it belongs to.
@@ -121,6 +133,25 @@ pub struct OpenOrderInfo {
     pub order_ref: String,
 }
 
+/// One position of the portfolio as TWS values it (`updatePortfolio`): the figures TWS shows for it itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PortfolioRow {
+    /// The account.
+    pub account: String,
+    /// The contract id.
+    pub con_id: i32,
+    /// The quantity (negative = short); 0 once the position is closed.
+    pub quantity: f64,
+    /// The price per unit TWS values the position at.
+    pub market_price: f64,
+    /// Quantity x price x multiplier (negative for a short position).
+    pub market_value: f64,
+    /// The average cost per contract (for an option the price times the multiplier).
+    pub average_cost: f64,
+    /// The profit or loss not yet realized.
+    pub unrealized_pnl: f64,
+}
+
 /// One position TWS reports (`position`).
 #[derive(Clone)]
 pub struct Position {
@@ -132,6 +163,14 @@ pub struct Position {
     pub symbol: String,
     /// The security type (OPT, STK ...).
     pub security_type: String,
+    /// The expiry (yyyyMMdd) of an option or future; empty otherwise.
+    pub expiry: String,
+    /// The strike of an option (0 otherwise).
+    pub strike: f64,
+    /// "P" or "C" for an option; empty otherwise.
+    pub right: String,
+    /// How many units one contract stands for (100 for an SPX option, 50 for an ES option); `None` when TWS sends none (a stock).
+    pub multiplier: Option<f64>,
     /// The quantity (negative = short).
     pub quantity: f64,
     /// The average cost, when TWS sends it (message version 3+).
@@ -278,6 +317,27 @@ pub enum TwsEvent {
     },
     /// The list of working orders (`OpenOrder`) is complete (`openOrderEnd`).
     OpenOrderEnd,
+    /// One position of the account with what TWS values it at (`updatePortfolio`, see `TwsCommand::SubscribePortfolio`).
+    Portfolio(PortfolioRow),
+    /// The current time of TWS in seconds since 1970 (`currentTime`, the answer to `TwsCommand::RequestCurrentTime`).
+    CurrentTime(i64),
+    /// A code TWS sent that the app has to report (see `TwsCodeKind`): a broken link to the server or a data farm, stopped account
+    /// updates, a warning, or a code without a request that is not classified.
+    TwsNotice {
+        /// The code.
+        code: i32,
+        /// What it means.
+        kind: crate::TwsCodeKind,
+        /// TWS's text.
+        message: String,
+    },
+    /// TWS's own connection to the IB servers changed (codes 1100, 1101, 1102); the API session with TWS goes on.
+    IbConnectivity {
+        /// The connection is up again (1101, 1102) or lost (1100).
+        connected: bool,
+        /// Back, but TWS dropped its market data subscriptions (1101): they have to be asked for again.
+        data_lost: bool,
+    },
     /// One contract matching a `TwsCommand::RequestContractDetails` lookup (see
     /// `parse_contract_data`). TWS sends one per matching contract - e.g. every strike of an
     /// option expiration - followed by `ContractDetailsEnd`.

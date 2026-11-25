@@ -263,6 +263,9 @@ enum OrderBlocked {
     SafetyGate,
     /// No connection to TWS.
     NotConnected,
+    /// TWS has no connection to IB (1100) and has not said it is back: what TWS would do with an order now is not known, so none
+    /// is sent (cancels still are).
+    IbLinkLost,
     /// The pre-trade risk check refused the order.
     Risk(String),
     /// The connection thread is gone: the command could not be handed over.
@@ -274,6 +277,7 @@ impl std::fmt::Display for OrderBlocked {
         match self {
             Self::SafetyGate => write!(f, "paper-account safety gate not satisfied"),
             Self::NotConnected => write!(f, "not connected to TWS"),
+            Self::IbLinkLost => write!(f, "TWS has no connection to IB (1100) - no new or changed order until TWS is connected again"),
             Self::Risk(reason) => write!(f, "risk check failed: {reason}"),
             Self::ConnectionLost => write!(f, "the connection to TWS is gone"),
         }
@@ -354,6 +358,12 @@ struct TwsSession {
     market_data_error: Option<String>,
     /// TWS refused the quotes of the ETF of the SPX estimate (no permission, say): the estimate is off for this session.
     estimate_refused: bool,
+    /// TWS has lost its own connection to IB (1100) and has not said yet that it is back (1101/1102).
+    ib_link_lost: bool,
+    /// When TWS reported 1100, and when we last asked TWS for its time since then (`reqCurrentTime`). An answer shows that the API
+    /// socket is still open during 1100; IB's docs don't say either way.
+    ib_link_lost_at: Option<Instant>,
+    ib_link_probe_at: Option<Instant>,
     /// Live-price farms TWS reported as broken (2103) and not yet OK again (2104).
     broken_data_farms: Vec<String>,
     /// Option lines TWS refused with 101 ("Max number of tickers has been reached"): TWS's own
@@ -380,6 +390,9 @@ impl TwsSession {
             last_price_tick_at: None,
             market_data_error: None,
             estimate_refused: false,
+            ib_link_lost: false,
+            ib_link_lost_at: None,
+            ib_link_probe_at: None,
             broken_data_farms: Vec::new(),
             market_data_lines_refused: 0,
             account_is_paper: None,
@@ -838,6 +851,10 @@ pub struct App {
     tws_receiver: mpsc::Receiver<TwsEvent>,
     account_summary: Vec<(String, String, String, String)>,
     positions: Vec<Position>,
+    /// The positions of `portfolio_account` as TWS values them (market price, market value, profit), kept up to date by TWS.
+    portfolio: Vec<broker::PortfolioRow>,
+    /// The account whose portfolio values were asked for in this session (TWS sends them for one account at a time).
+    portfolio_account: Option<String>,
     today_trades: Vec<ExecutionRow>,
     /// Every execution seen so far (loaded from disk at start): TWS itself only keeps the
     /// current trading day, the trades are rebuilt from this history (`trade_rebuild`).
@@ -1198,16 +1215,28 @@ struct DashboardFigures {
     sweep: Option<f64>,
 }
 
-/// The question under a confirmation and its two buttons: whether "Send now" or "Cancel" was clicked.
-fn confirm_buttons(ui: &mut egui::Ui, de: bool) -> (bool, bool) {
-    let mut send = false;
-    let mut cancel = false;
+/// The question under the confirmation of a trade and its two buttons: whether "Send now" or "Cancel" was clicked. `blocked` is
+/// why no order may be sent now (see `send_or_cancel`).
+fn confirm_buttons(ui: &mut egui::Ui, de: bool, blocked: Option<&str>) -> (bool, bool) {
     ui.add_space(10.0);
     ui.label(if de { "Möchtest du diesen Trade jetzt so an die TWS übertragen?" } else { "Do you want to send this trade to TWS now?" });
+    send_or_cancel(ui, de, if de { "Jetzt übertragen" } else { "Send now" }, blocked)
+}
+
+/// The buttons of every window that sends an order: `send_label` and "Cancel"; whether one was clicked. While `blocked` names why no
+/// order may be sent now (TWS without its connection to IB, say), it is shown above them in orange and the send button is greyed
+/// out, so the person sees it before clicking, not only in the log.
+fn send_or_cancel(ui: &mut egui::Ui, de: bool, send_label: &str, blocked: Option<&str>) -> (bool, bool) {
+    let mut send = false;
+    let mut cancel = false;
     ui.add_space(8.0);
+    if let Some(reason) = blocked {
+        ui.label(RichText::new(reason).color(ORANGE_WARN).strong());
+        ui.add_space(4.0);
+    }
     ui.horizontal(|ui| {
-        let send_label = RichText::new(if de { "Jetzt übertragen" } else { "Send now" }).color(Color32::WHITE).strong();
-        if ui.add(crate::widgets::MetalButton::new(send_label).fill(GREEN_TXT)).clicked() {
+        let label = RichText::new(send_label).color(Color32::WHITE).strong();
+        if ui.add_enabled(blocked.is_none(), crate::widgets::MetalButton::new(label).fill(GREEN_TXT)).clicked() {
             send = true;
         }
         if ui.add(crate::widgets::MetalButton::new(if de { "Abbrechen" } else { "Cancel" })).clicked() {
@@ -1637,6 +1666,8 @@ impl App {
             account_summary: Vec::new(),
             loaded: LoadedFlags { account_summary_loaded: false, positions_loaded: false, today_trades_loaded: false },
             positions: Vec::new(),
+            portfolio: Vec::new(),
+            portfolio_account: None,
             today_trades: Vec::new(),
             exec_history: if cfg!(test) { Vec::new() } else { executions_path(trading_live).map(|p| load_executions(&p)).unwrap_or_default() },
             fee_index: std::cell::RefCell::default(),
@@ -2074,6 +2105,117 @@ impl App {
         }
     }
 
+    /// Why no order may be sent now, for the windows that send one (`send_or_cancel`) and the screen notice of a refused order:
+    /// TWS without its connection to IB. `None` when nothing stands in the way of sending (the other checks run on sending).
+    pub(super) fn order_block_note(&self) -> Option<&'static str> {
+        self.session.ib_link_lost.then(|| {
+            self.tr(
+                "Orders blocked: TWS has no connection to IB (1100). Nothing can be sent until TWS reports the connection back.",
+                "Orders gesperrt: Die TWS hat keine Verbindung zu IB (1100). Senden ist erst wieder möglich, wenn die TWS die Verbindung zurückmeldet.",
+            )
+        })
+    }
+
+    /// The session with TWS ended (`failed`: lost, else ended by the person): said in the status and the log, and what the session
+    /// loaded is forgotten. During 1100 this is the other result of the socket check: the socket did end, so many seconds after 1100.
+    fn on_session_end(&mut self, status: String, failed: bool) {
+        if failed && self.session.ib_link_lost {
+            self.log(&format!("The TWS session ended {} s after 1100: {status}", self.seconds_since_ib_link_lost()));
+        }
+        self.log(&status);
+        self.session.status = status;
+        self.reset_session();
+    }
+
+    /// TWS is not (or no longer) without its connection to IB: the state of 1100 and its socket check are cleared.
+    fn forget_ib_link(&mut self) {
+        self.session.ib_link_lost = false;
+        self.session.ib_link_lost_at = None;
+        self.session.ib_link_probe_at = None;
+    }
+
+    /// How long ago TWS reported 1100, in seconds (0 without one).
+    fn seconds_since_ib_link_lost(&self) -> u64 {
+        self.session.ib_link_lost_at.map_or(0, |at| self.clock.instant().saturating_duration_since(at).as_secs())
+    }
+
+    /// Sends `reqCurrentTime` while TWS is in 1100, to see whether the API socket still works. The answer (`on_current_time`) or the
+    /// end of the session goes to the log with the seconds since 1100.
+    pub(super) fn probe_api_socket(&mut self) {
+        let sent = self.tws_cmd_sender.as_ref().is_some_and(|sender| sender.send(TwsCommand::RequestCurrentTime).is_ok());
+        self.session.ib_link_probe_at = Some(self.clock.instant());
+        let after = self.seconds_since_ib_link_lost();
+        if sent {
+            self.log(&format!("Checking the API connection {after} s after 1100: asked TWS for its current time"));
+        } else {
+            self.log(&format!("The API connection could not be checked {after} s after 1100: the request could not be handed to the connection"));
+        }
+    }
+
+    /// TWS's current time. During 1100 it means the socket still works in both directions, which is logged.
+    fn on_current_time(&mut self, time: i64) {
+        if self.session.ib_link_lost {
+            let after = self.seconds_since_ib_link_lost();
+            self.log(&format!("TWS answered on the API connection {after} s after 1100 (its time {time}): the socket is open"));
+        } else {
+            self.debug(&format!("TWS current time {time}"));
+        }
+    }
+
+    /// Logs a TWS notice as a warning, with a short note on what it means (`broker::TwsCodeKind`). When the account updates stop,
+    /// the portfolio values we have are dropped so the positions page doesn't show stale numbers.
+    fn on_tws_notice(&mut self, code: i32, kind: broker::TwsCodeKind, message: &str) {
+        let meaning = match kind {
+            broker::TwsCodeKind::ServerLinkBroken => "TWS reports its connection to the server broken; IB says it is restored automatically",
+            broker::TwsCodeKind::FarmDown => "a data farm of TWS is disconnected: prices or bars may stop until it is back",
+            broker::TwsCodeKind::AccountUpdatesStopped => {
+                self.portfolio.clear();
+                "the portfolio values of TWS no longer come: the live positions are valued from the option quotes where the app has them"
+            }
+            broker::TwsCodeKind::Warning => "a warning of TWS",
+            broker::TwsCodeKind::Unclassified => "unknown TWS notice, not handled",
+            // Handled where they are sent (the end of the session, the link to IB), or nothing to say (a farm that is fine).
+            broker::TwsCodeKind::SessionEnd
+            | broker::TwsCodeKind::IbLinkLost
+            | broker::TwsCodeKind::IbLinkRestored { .. }
+            | broker::TwsCodeKind::FarmUp
+            | broker::TwsCodeKind::FarmIdle => return,
+        };
+        self.log(&format!("WARNING: TWS {code}: {message} - {meaning}"));
+    }
+
+    /// TWS lost or got back its own connection to IB (1100, 1101, 1102). The session with TWS stays: while the link is down no price
+    /// and no order status arrives, so once it is back the working orders are compared again (a stop or target may have filled
+    /// meanwhile), and when TWS dropped its subscriptions (1101) every quote is asked for again.
+    fn on_ib_connectivity(&mut self, connected: bool, data_lost: bool) {
+        if !connected {
+            if !self.session.ib_link_lost {
+                self.session.ib_link_lost = true;
+                self.session.ib_link_lost_at = Some(self.clock.instant());
+                self.log(
+                    "WARNING: TWS has lost its connection to IB - no prices and no order updates until TWS restores it; TradePilot stays connected to TWS",
+                );
+                self.probe_api_socket();
+            }
+            return;
+        }
+        self.forget_ib_link();
+        if data_lost {
+            self.log("TWS is connected to IB again; its market data was dropped and is requested again");
+            self.resubscribe_all_quotes();
+        } else {
+            self.log("TWS is connected to IB again (market data kept)");
+        }
+        // The executions of the day first (a stop or target may have filled meanwhile): their end rebuilds the trades and then asks
+        // for the working orders to compare (see `TwsEvent::ExecutionsEnd`), as at the start of a session.
+        self.pending.open_orders_requested = false;
+        self.loaded.today_trades_loaded = false;
+        let sent = self.tws_cmd_sender.as_ref().is_some_and(|sender| sender.send(TwsCommand::RequestExecutions).is_ok());
+        if !sent {
+            self.log("WARNING: the executions could not be requested again after the IB connection came back - the trades are not compared");
+        }
+    }
+
     fn resubscribe_all_quotes(&mut self) {
         let Some(sender) = self.tws_cmd_sender.clone() else {
             return;
@@ -2153,7 +2295,11 @@ impl App {
                         self.positions.push(position);
                     }
                 }
-                TwsEvent::PositionsEnd => self.loaded.positions_loaded = true,
+                TwsEvent::PositionsEnd => {
+                    self.loaded.positions_loaded = true;
+                    self.subscribe_portfolio();
+                }
+                TwsEvent::Portfolio(row) => self.on_portfolio(row),
                 TwsEvent::Execution(row) => self.on_execution(row),
                 TwsEvent::Commission { exec_id, commission, currency } => self.on_commission(&exec_id, commission, &currency),
                 TwsEvent::ExecutionsEnd => {
@@ -2206,20 +2352,15 @@ impl App {
                 }
                 TwsEvent::OptionDelta { ticker_id, tick_type, delta } => self.chains.on_delta(ticker_id, tick_type, delta),
                 TwsEvent::FarmStatus { farm, ok } => self.on_farm_status(farm, ok),
+                TwsEvent::IbConnectivity { connected, data_lost } => self.on_ib_connectivity(connected, data_lost),
+                TwsEvent::TwsNotice { code, kind, message } => self.on_tws_notice(code, kind, &message),
                 TwsEvent::RequestError { req_id, code, message } => self.on_request_error(req_id, code, &message),
                 TwsEvent::ContractDetailsEnd { req_id } => self.on_contract_details_end(req_id),
                 TwsEvent::OptionParams { req_id, expirations, strikes, .. } => self.on_option_params(req_id, expirations, strikes),
                 TwsEvent::OptionParamsEnd { req_id } => self.on_option_params_end(req_id),
-                TwsEvent::Failed(error) => {
-                    self.session.status = format!("Connection failed: {error}");
-                    self.log(&self.session.status.clone());
-                    self.reset_session();
-                }
-                TwsEvent::Disconnected(message) => {
-                    self.log(&message);
-                    self.session.status = message;
-                    self.reset_session();
-                }
+                TwsEvent::CurrentTime(time) => self.on_current_time(time),
+                TwsEvent::Failed(error) => self.on_session_end(format!("Connection failed: {error}"), true),
+                TwsEvent::Disconnected(message) => self.on_session_end(message, false),
             }
         }
     }
@@ -2259,14 +2400,23 @@ impl App {
         self.session.market_data_error = None;
         self.session.broken_data_farms.clear();
         self.session.estimate_refused = false;
+        self.forget_ib_link();
+        self.forget_account_data();
+        self.open_orders_snapshot = None;
+        self.pending.open_orders_requested = false;
+    }
+
+    /// Forgets what TWS reported about the account (summary, positions, portfolio, today's executions), so a new session loads it
+    /// afresh.
+    fn forget_account_data(&mut self) {
         self.account_summary.clear();
         self.loaded.account_summary_loaded = false;
         self.positions.clear();
         self.loaded.positions_loaded = false;
+        self.portfolio.clear();
+        self.portfolio_account = None;
         self.today_trades.clear();
         self.loaded.today_trades_loaded = false;
-        self.open_orders_snapshot = None;
-        self.pending.open_orders_requested = false;
     }
 
     /// One value of the account summary; the first one tells whether the account is a paper account.
@@ -2340,7 +2490,10 @@ impl App {
             if known { "already known" } else { "new" }
         ));
         self.store_execution(&row);
-        self.today_trades.push(row);
+        // The executions of the day can come again (asked for once more after a gap): each is listed once.
+        if !self.today_trades.iter().any(|e| e.exec_id == row.exec_id) {
+            self.today_trades.push(row);
+        }
         // After the trades were built from the executions of the day, a new fill may belong to one of them.
         if !known && self.loaded.today_trades_loaded {
             self.grow_trades_from_executions();
@@ -2489,12 +2642,8 @@ impl App {
     /// Forgets what the session loaded: account, positions, executions, quotes and chains.
     fn reset_session(&mut self) {
         self.session.server_version = None;
-        self.account_summary.clear();
-        self.loaded.account_summary_loaded = false;
-        self.positions.clear();
-        self.loaded.positions_loaded = false;
-        self.today_trades.clear();
-        self.loaded.today_trades_loaded = false;
+        self.forget_ib_link();
+        self.forget_account_data();
         self.session.stop = None;
         self.tws_cmd_sender = None;
         self.session.account_is_paper = None;
@@ -2620,12 +2769,7 @@ impl App {
         self.session.status = format!("Connecting to {host}:{port}...");
         self.log(&format!("{source}: {}", self.session.status));
         self.session.server_version = None;
-        self.account_summary.clear();
-        self.loaded.account_summary_loaded = false;
-        self.positions.clear();
-        self.loaded.positions_loaded = false;
-        self.today_trades.clear();
-        self.loaded.today_trades_loaded = false;
+        self.forget_account_data();
         self.session.account_is_paper = None;
         self.next_order_id = None;
         self.link.live_data_requested = false;
@@ -3188,6 +3332,30 @@ impl App {
         }
     }
 
+    /// The connection part of the top bar: a quiet status (colour only in the dot) and the one action that fits the state; "Connect"
+    /// is filled blue (the step the user has to take), "Disconnect" red. Connected to TWS while TWS itself has no link to IB is shown
+    /// as such. Returns the action clicked.
+    fn connection_item(&self, ui: &mut egui::Ui) -> Option<&'static str> {
+        if self.session.server_version.is_some() {
+            if self.session.ib_link_lost {
+                // Connected to TWS, but TWS itself has no connection to IB: nothing moves until it is back.
+                status_item(ui, STATUS_PENDING, self.tr("TWS without IB connection - orders blocked", "TWS ohne IB-Verbindung - Orders gesperrt")).on_hover_text(self.tr(
+                    "TWS has lost its connection to the IB servers (1100). TradePilot stays connected and compares the orders again once TWS is back.",
+                    "Die TWS hat die Verbindung zu den IB-Servern verloren (1100). TradePilot bleibt verbunden und gleicht die Orders erneut ab, sobald die TWS wieder verbunden ist.",
+                ));
+            } else {
+                status_item(ui, STATUS_OK, self.tr("TWS connected", "TWS verbunden"));
+            }
+            return bar_button_danger(ui, self.tr("Disconnect", "Trennen")).clicked().then_some("Disconnect");
+        }
+        if self.session.stop.is_some() {
+            status_item(ui, STATUS_PENDING, self.tr("Connecting...", "Verbinde..."));
+            return bar_button(ui, self.tr("Cancel", "Abbrechen"), false).clicked().then_some("Disconnect");
+        }
+        status_item(ui, STATUS_ERROR, self.tr("Disconnected", "Getrennt"));
+        bar_button(ui, self.tr("Connect to TWS", "Mit der TWS verbinden"), true).clicked().then_some("Connect")
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) -> Option<&'static str> {
         let mut action = None;
         let warning = self.market_data_warning(self.clock.instant(), self.market_is_open());
@@ -3195,23 +3363,8 @@ impl App {
             ui.spacing_mut().item_spacing.x = 10.0;
             ui.add_space(4.0);
 
-            // 1. Connection: a quiet status (colour only in the dot) and the one action that fits
-            // the state; "Connect" is filled blue (the step the user has to take), "Disconnect" red.
-            if self.session.server_version.is_some() {
-                status_item(ui, STATUS_OK, self.tr("TWS connected", "TWS verbunden"));
-                if bar_button_danger(ui, self.tr("Disconnect", "Trennen")).clicked() {
-                    action = Some("Disconnect");
-                }
-            } else if self.session.stop.is_some() {
-                status_item(ui, STATUS_PENDING, self.tr("Connecting...", "Verbinde..."));
-                if bar_button(ui, self.tr("Cancel", "Abbrechen"), false).clicked() {
-                    action = Some("Disconnect");
-                }
-            } else {
-                status_item(ui, STATUS_ERROR, self.tr("Disconnected", "Getrennt"));
-                if bar_button(ui, self.tr("Connect to TWS", "Mit der TWS verbinden"), true).clicked() {
-                    action = Some("Connect");
-                }
+            if let Some(clicked) = self.connection_item(ui) {
+                action = Some(clicked);
             }
 
             if self.session.server_version.is_some() {
@@ -3505,7 +3658,15 @@ impl App {
             return;
         }
         for trade in &found.updated {
-            self.log(&format!("Trade expired (from TWS bookings): {} x{}", trade.label(), trade.qty));
+            let how = if trade.status == TradeStatus::Expired.as_str() {
+                "expired (from TWS bookings)".to_string()
+            } else {
+                format!(
+                    "closed by an order outside this session (from TWS executions) at {}",
+                    trade.price_close.map_or_else(|| "-".to_string(), |p| p.normalize().to_string())
+                )
+            };
+            self.log(&format!("Trade {how}: {} x{}", trade.label(), trade.qty));
             self.replace_trade(trade, &mut known);
         }
         self.apply_grown_trades(&found.grown, &mut known);
@@ -3667,6 +3828,9 @@ impl eframe::App for App {
         self.news_tick(ctx);
         for problem in crate::number_lists::take_problems() {
             self.log(&format!("WARNING: added list values: {problem}"));
+        }
+        for problem in crate::column_order::take_problems() {
+            self.log(&format!("WARNING: column order of the tables: {problem}"));
         }
         self.poll_webhook();
         self.update_schedule_runs();

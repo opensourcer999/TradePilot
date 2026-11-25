@@ -3,7 +3,8 @@
 use super::{
     card_bg, format_date, format_delta, format_strike, header_text, muted_text, navy_bar, App, ChainSymbol, Color32, OptionContract, RichText, Session,
 };
-use crate::widgets::PlasticRows;
+use super::{mask_account, TwsCommand, GREEN_TXT, RED};
+use crate::widgets::{PlasticRows, TableCell, TableColumn};
 use eframe::egui;
 
 impl App {
@@ -55,6 +56,8 @@ impl App {
             });
             plastic.paint(ui, grid.response.rect, 10.0);
         });
+        ui.add_space(8.0);
+        self.vix_term_ratio_line(ui);
         ui.add_space(18.0);
         ui.strong(self.tr("Live Positions (from TWS)", "Live-Positionen (von der TWS)"));
         ui.add_space(6.0);
@@ -68,27 +71,160 @@ impl App {
         } else if self.positions.is_empty() {
             ui.colored_label(muted_text(), self.tr("TWS reports no open positions.", "Die TWS meldet keine offenen Positionen."));
         } else {
-            egui::Frame::none().fill(card_bg()).show(ui, |ui| {
-                let mut plastic = PlasticRows::default();
-                let grid = egui::Grid::new("live_positions_grid").min_col_width(90.0).show(ui, |ui| {
-                    plastic.row(ui, true);
-                    for h in ["Account", "Symbol", "Type", "Quantity", "Average cost"] {
-                        ui.label(RichText::new(h).strong().color(header_text()));
-                    }
-                    ui.end_row();
-                    for position in &self.positions {
-                        plastic.row(ui, false);
-                        ui.label(&position.account);
-                        ui.label(&position.symbol);
-                        ui.label(&position.security_type);
-                        ui.monospace(format!("{}", position.quantity));
-                        ui.monospace(position.average_cost.map_or_else(|| "Not provided".to_string(), |cost| format!("{cost:.2}")));
-                        ui.end_row();
-                    }
-                });
-                plastic.paint(ui, grid.response.rect, 4.0);
-            });
+            self.live_positions_table(ui);
         }
+    }
+
+    /// Asks TWS once per session for the portfolio values of the account (`reqAccountUpdates`): of the account the positions are on,
+    /// else the first account TWS manages. TWS then values every position itself, stocks and bills included.
+    pub(super) fn subscribe_portfolio(&mut self) {
+        if self.portfolio_account.is_some() {
+            return;
+        }
+        let account = self.positions.first().map(|p| p.account.clone()).or_else(|| self.session.managed_accounts.first().cloned());
+        let (Some(account), Some(sender)) = (account.filter(|a| !a.trim().is_empty()), self.tws_cmd_sender.as_ref()) else { return };
+        if sender.send(TwsCommand::SubscribePortfolio { account: account.clone() }).is_ok() {
+            self.debug(&format!("Asked TWS for the portfolio values of {}", mask_account(&account)));
+            self.portfolio_account = Some(account);
+        }
+    }
+
+    /// One position as TWS values it: it replaces what was known of it; a position that is closed (quantity 0) is dropped. A row that
+    /// does not match the position TWS reported for the same contract (quantity or average cost) is reported once: its values are
+    /// then not used (see `portfolio_row_of`), as the fields of the message may not be where the app reads them.
+    pub(super) fn on_portfolio(&mut self, row: broker::PortfolioRow) {
+        let position = self.positions.iter().find(|p| p.account == row.account && p.contract_id.trim().parse::<i32>().ok() == Some(row.con_id));
+        if let Some(position) = position.filter(|p| !portfolio_matches(p, &row)) {
+            let key = format!("portfolio {}", row.con_id);
+            if self.watch.mismatch_reported.insert(key) {
+                self.log(&format!(
+                    "WARNING: TWS portfolio value of contract {} does not match its position (quantity {} vs {}, average cost {} vs {}) - values ignored",
+                    row.con_id,
+                    row.quantity,
+                    position.quantity,
+                    row.average_cost,
+                    position.average_cost.map_or_else(|| "-".to_string(), |c| c.to_string())
+                ));
+            }
+        }
+        self.portfolio.retain(|known| known.account != row.account || known.con_id != row.con_id);
+        if row.quantity != 0.0 {
+            self.portfolio.push(row);
+        }
+    }
+
+    /// The portfolio row TWS gave for `position`, only when it matches the position (`portfolio_matches`).
+    fn portfolio_row_of(&self, position: &broker::Position) -> Option<&broker::PortfolioRow> {
+        let con_id: i32 = position.contract_id.trim().parse().ok()?;
+        self.portfolio.iter().find(|row| row.con_id == con_id && row.account == position.account).filter(|row| portfolio_matches(position, row))
+    }
+
+    /// The price, market value and profit of a position: as TWS values it when it has (the portfolio), else worked out from the quote
+    /// of its option while the app has one; `None` for the parts nothing is known of.
+    pub(super) fn position_figures(&self, position: &broker::Position) -> (Option<f64>, Option<crate::position_value::PositionValue>) {
+        let con_id: Option<i32> = position.contract_id.trim().parse().ok();
+        if let Some(row) = self.portfolio_row_of(position) {
+            let value = crate::position_value::tws_position_value(position.quantity, row.average_cost, row.market_value, row.unrealized_pnl);
+            return (Some(row.market_price), value);
+        }
+        let price =
+            con_id.and_then(|con_id| self.chains.contracts.iter().find(|c| c.con_id == con_id)).and_then(|contract| match (contract.bid, contract.ask) {
+                (Some(bid), Some(ask)) if bid >= 0.0 && ask > 0.0 => Some(f64::midpoint(bid, ask)),
+                _ => None,
+            });
+        (price, crate::position_value::position_value(position.quantity, position.average_cost, position.multiplier, price))
+    }
+
+    /// The positions TWS reports with their value at the market and their profit; the columns can be moved by drag and drop and keep
+    /// their order.
+    fn live_positions_table(&self, ui: &mut egui::Ui) {
+        let keys = ["account", "symbol", "contract", "type", "quantity", "average_cost", "price", "market_value", "profit", "profit_percent"];
+        let titles = [
+            self.tr("Account", "Konto"),
+            "Symbol",
+            self.tr("Contract", "Kontrakt"),
+            self.tr("Type", "Typ"),
+            self.tr("Quantity", "Menge"),
+            self.tr("Average cost", "Einstandskosten"),
+            self.tr("Price", "Kurs"),
+            self.tr("Market value", "Marktwert"),
+            self.tr("P/L", "G/V"),
+            self.tr("P/L %", "G/V %"),
+        ];
+        let weights = [1.3, 0.9, 1.6, 0.6, 0.8, 1.1, 0.8, 1.1, 1.0, 0.8];
+        let columns: Vec<TableColumn> = titles.iter().zip(weights).enumerate().map(|(i, (title, weight))| TableColumn::new(*title, weight, i >= 4)).collect();
+        let money = |value: rust_decimal::Decimal| format!("{:.2}", value.round_dp(2));
+        let rows: Vec<Vec<TableCell>> = self
+            .positions
+            .iter()
+            .map(|p| {
+                let (price, value) = self.position_figures(p);
+                let color = value.map(|v| if v.profit < rust_decimal::Decimal::ZERO { RED } else { GREEN_TXT });
+                let contract = if p.security_type == "OPT" { format!("{} {} {}", p.expiry, format_strike(p.strike), p.right) } else { String::new() };
+                vec![
+                    TableCell::new(&p.account),
+                    TableCell::new(&p.symbol),
+                    TableCell::new(contract),
+                    TableCell::new(&p.security_type),
+                    TableCell::new(format!("{}", p.quantity)),
+                    TableCell::new(p.average_cost.map_or_else(|| "-".to_string(), |cost| format!("{cost:.2}"))),
+                    TableCell::new(price.map_or_else(|| "-".to_string(), |price| format!("{price:.2}"))),
+                    TableCell::new(value.map_or_else(|| "-".to_string(), |v| money(v.market_value))),
+                    TableCell { text: value.map_or_else(|| "-".to_string(), |v| money(v.profit)), color, strong: true, ..TableCell::default() },
+                    TableCell {
+                        text: value.and_then(|v| v.percent).map_or_else(|| "-".to_string(), |p| format!("{:+.1} %", p.round_dp(1))),
+                        color,
+                        ..TableCell::default()
+                    },
+                ]
+            })
+            .collect();
+        let _ = crate::widgets::arranged_table(ui, "live_positions", &keys, &columns, &rows, None);
+        ui.label(
+            RichText::new(self.tr(
+                "Price, market value and P/L as TWS values the positions. Columns: drag a header to move it, drag the border between two headers to size them.",
+                "Kurs, Marktwert und G/V so, wie die TWS die Positionen bewertet. Spalten: Kopf ziehen zum Verschieben, Grenze zwischen zwei Köpfen ziehen für die Breite.",
+            ))
+            .small()
+            .color(muted_text()),
+        );
+    }
+
+    /// VIX9D divided by VIX, the same value the conditions use (`VIX9D/VIX`); `None` until both are quoted.
+    pub(super) fn vix9d_over_vix(&self) -> Option<rust_decimal::Decimal> {
+        self.condition_snapshot().value_with(crate::condition::Input::Vix9dOverVix, 1)
+    }
+
+    /// The line under the index quotes with the ratio of VIX9D to VIX and what it says: below 1 the next nine days are expected
+    /// calmer than the next thirty (the usual shape), above 1 the curve is inverted (short-term stress) and the ratio turns orange.
+    fn vix_term_ratio_line(&self, ui: &mut egui::Ui) {
+        let ratio = self.vix9d_over_vix();
+        let inverted = ratio.is_some_and(|r| r > rust_decimal::Decimal::ONE);
+        let (value, note) = match ratio {
+            Some(r) => (
+                format!("{:.2}", r.round_dp(2)),
+                if inverted {
+                    self.tr(
+                        "inverted: the next 9 days are expected more volatile than the next 30",
+                        "invertiert: die nächsten 9 Tage werden unruhiger erwartet als die nächsten 30",
+                    )
+                } else {
+                    self.tr(
+                        "normal: the next 9 days are expected calmer than the next 30",
+                        "normal: die nächsten 9 Tage werden ruhiger erwartet als die nächsten 30",
+                    )
+                },
+            ),
+            None => ("-".to_string(), self.tr("needs live quotes of VIX and VIX9D", "braucht Live-Kurse von VIX und VIX9D")),
+        };
+        ui.horizontal(|ui| {
+            ui.strong("VIX9D / VIX");
+            ui.add_space(6.0);
+            let color = if inverted { crate::theme::ORANGE_WARN } else { crate::theme::text_primary() };
+            ui.label(RichText::new(value).monospace().strong().size(15.0).color(color));
+            ui.add_space(6.0);
+            ui.label(RichText::new(note).color(muted_text()));
+        });
     }
 
     pub(super) fn quotes_page(&mut self, ui: &mut egui::Ui) {
@@ -211,5 +347,45 @@ impl App {
             }
             ui.label(format!("{} {}", self.chains.subscribed_count(), self.tr("data lines subscribed", "Datenzeilen abonniert")));
         });
+    }
+}
+
+/// Whether a portfolio row of TWS agrees with the position TWS reported for the same contract: the same quantity and, when both
+/// carry one, the same average cost. Both come from TWS, so a difference means the app did not read the message where its values are.
+fn portfolio_matches(position: &broker::Position, row: &broker::PortfolioRow) -> bool {
+    let same_quantity = (position.quantity - row.quantity).abs() < 1e-9;
+    let same_cost = position.average_cost.is_none_or(|cost| (cost - row.average_cost).abs() < 0.01);
+    same_quantity && same_cost
+}
+
+#[cfg(test)]
+mod tests {
+    use super::portfolio_matches;
+
+    fn position(quantity: f64, average_cost: Option<f64>) -> broker::Position {
+        broker::Position {
+            account: "U1".into(),
+            contract_id: "11".into(),
+            symbol: "MU".into(),
+            security_type: "STK".into(),
+            expiry: String::new(),
+            strike: 0.0,
+            right: String::new(),
+            multiplier: None,
+            quantity,
+            average_cost,
+        }
+    }
+
+    fn row(quantity: f64, average_cost: f64) -> broker::PortfolioRow {
+        broker::PortfolioRow { account: "U1".into(), con_id: 11, quantity, market_price: 900.0, market_value: 1800.0, average_cost, unrealized_pnl: 91.28 }
+    }
+
+    #[test]
+    fn a_portfolio_row_is_used_only_when_it_agrees_with_the_position_of_the_same_contract() {
+        assert!(portfolio_matches(&position(2.0, Some(854.36)), &row(2.0, 854.36)));
+        assert!(portfolio_matches(&position(2.0, None), &row(2.0, 854.36)), "a position without a cost: only the quantity counts");
+        assert!(!portfolio_matches(&position(2.0, Some(854.36)), &row(3.0, 854.36)), "another quantity");
+        assert!(!portfolio_matches(&position(2.0, Some(854.36)), &row(2.0, 900.0)), "another cost: the fields were not read where they are");
     }
 }

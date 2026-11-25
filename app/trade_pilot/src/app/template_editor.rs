@@ -10,6 +10,7 @@ use super::{
     EXCESS_LONG_BEHAVIORS, LONG_TYPES, MIN_MAX_DEBIT, PREFERENCES, PROFIT_TARGET_TYPES, PUT_CALL, STOP_BASES, STOP_ORDER_TYPES, STOP_TARGET_TYPES,
     STOP_TRIGGERS, STOP_TYPES, STRIKE_TARGET_TYPES, SYMBOLS, TRADE_TYPES,
 };
+use super::{Decimal, RichText, ORANGE_WARN};
 use crate::template_form::{Part, TemplateLayout};
 
 /// What the cards of the editor share: the errors of the last save (each faulty field is outlined
@@ -37,6 +38,15 @@ impl EditorContext<'_> {
     /// `checked` with a list of values to pick from.
     fn number(&self, ui: &mut egui::Ui, value: &mut String, width: f32, field: Field, list: &[&str]) {
         validated(ui, self.error_for(field).as_deref(), self.scroll_to_error, |ui| form_number(ui, value, width, list));
+    }
+
+    /// `number` for a distance in points that has to land on a strike (a width): with the distance between the strikes TWS reported
+    /// (`step`) the list offers only the distances that fit it; without one it offers them all.
+    fn strike_distance(&self, ui: &mut egui::Ui, value: &mut String, width: f32, field: Field, list: &[&str], step: Option<Decimal>) {
+        let offer = |item: &str| crate::strikes::fits_strike_step_text(step, item);
+        validated(ui, self.error_for(field).as_deref(), self.scroll_to_error, |ui| {
+            crate::widgets::form_number_offering(ui, value, width, list, &offer);
+        });
     }
 
     /// A text field outlined in red, with its message, when the last save found it faulty.
@@ -172,6 +182,17 @@ pub(super) fn long_strikes_card(ui: &mut egui::Ui, form: &mut TemplateForm, ctx:
     white_card(ui, |ui| {
         navy_bar(ui, ctx.layout.long_strike_title);
         ui.add_space(8.0);
+        let step = form.strike_step;
+        // Where the check of the widths stands: what TWS reported, or that nothing is known and so nothing is checked.
+        let note = match step {
+            Some(step) => format!("{} strikes are {} apart (from the TWS option chain): only widths that fit are offered.", form.symbol, step.normalize()),
+            None => format!(
+                "Strike distance of {} unknown: TWS has reported no strikes of it in this session (connect, or load its option chain) - the widths are not checked.",
+                form.symbol
+            ),
+        };
+        ui.label(RichText::new(note).small().color(if step.is_some() { muted_text() } else { ORANGE_WARN }));
+        ui.add_space(4.0);
         let mut sides: Vec<(&str, &mut LongSideForm, Side)> = Vec::new();
         if ctx.layout.shows(Part::LongPut) {
             sides.push(("PUT Selection", &mut form.long_put_side, Side::Put));
@@ -183,14 +204,18 @@ pub(super) fn long_strikes_card(ui: &mut egui::Ui, form: &mut TemplateForm, ctx:
             ui.horizontal(|ui| {
                 labeled(ui, title, |ui| form_combo(ui, ("tt_long_type", title), &mut side.long_type, &LONG_TYPES, 130.0));
                 if side.long_type == "Width" {
-                    labeled(ui, "Width(s)", |ui| ctx.number(ui, &mut side.width, 110.0, Field::LongWidth(which), &crate::number_lists::WIDTHS));
+                    labeled(ui, "Width(s)", |ui| {
+                        ctx.strike_distance(ui, &mut side.width, 110.0, Field::LongWidth(which), &crate::number_lists::WIDTHS, step);
+                    });
                     labeled(ui, "Use Closer .05 strike width, if available", |ui| form_toggle(ui, &mut side.use_closer_width, "On", "Off"));
                 } else {
                     labeled(ui, "Min Premium", |ui| form_number(ui, &mut side.min_premium, 80.0, &crate::number_lists::LONG_PREMIUMS));
                     labeled(ui, "Max Premium", |ui| {
                         ctx.number(ui, &mut side.max_premium, 80.0, Field::LongMaxPremium(which), &crate::number_lists::LONG_PREMIUMS);
                     });
-                    labeled(ui, "Max Width", |ui| form_number(ui, &mut side.max_width, 80.0, &crate::number_lists::WIDTHS));
+                    labeled(ui, "Max Width", |ui| {
+                        ctx.strike_distance(ui, &mut side.max_width, 80.0, Field::LongMaxWidth(which), &crate::number_lists::WIDTHS, step);
+                    });
                 }
             });
             ui.add_space(6.0);

@@ -598,20 +598,7 @@ pub fn select_trade(input: &EntryInput) -> EntryOutcome {
     if no_delta > 0 {
         out.log.push(format!("Trade - {no_delta} subscribed option(s) have no delta yet - a delta target cannot count them"));
     }
-    let mut max_width = Decimal::ZERO;
-    let mut candidates: Vec<Vertical> = Vec::new();
-    let put_longs =
-        LongChoice { long_type: &t.long_type, widths: parse_widths(&t.long_width), min_premium: n.long_min_premium, max_premium: n.long_max_premium };
-    side_candidates(trade_type, &options.puts, &options.narrow_puts, &put_longs, true, &mut max_width, &mut candidates);
-    out.log.push(format!("Trade - Load Contracts Puts Complete ({} possible trades)", candidates.len()));
-    let call_longs = LongChoice {
-        long_type: &t.long_type_call,
-        widths: parse_widths(&t.long_width_call),
-        min_premium: n.long_min_premium_call,
-        max_premium: n.long_max_premium_call,
-    };
-    side_candidates(trade_type, &options.calls, &options.narrow_calls, &call_longs, false, &mut max_width, &mut candidates);
-    out.log.push(format!("Trade - Load Contracts Call Complete ({} possible trades)", candidates.len()));
+    let (candidates, mut max_width) = load_candidates(trade_type, &options, t, &n, &mut out.log);
 
     // The strike the offset/percentage targets refer to: the long for debit trades, else the short.
     let use_long_leg = is_debit(trade_type) && !kind(TradeType::is_debit_spread);
@@ -767,6 +754,55 @@ fn side_candidates(trade_type: &str, options: &[Leg], narrow: &[Leg], longs: &Lo
     if kind(TradeType::sells_only) && kind(side) {
         candidates.extend(options.iter().map(|o| Vertical::new(Some(o.clone()), None)));
     }
+}
+
+/// The candidates of both sides (puts first, then calls) with the widest long width seen; the log says how many there are after
+/// each side and why a side gave none.
+fn load_candidates(trade_type: &str, options: &SideOptions, t: &TradeTemplate, n: &Numbers, log: &mut Vec<String>) -> (Vec<Vertical>, Decimal) {
+    let mut max_width = Decimal::ZERO;
+    let mut candidates: Vec<Vertical> = Vec::new();
+    let put_longs =
+        LongChoice { long_type: &t.long_type, widths: parse_widths(&t.long_width), min_premium: n.long_min_premium, max_premium: n.long_max_premium };
+    let call_longs = LongChoice {
+        long_type: &t.long_type_call,
+        widths: parse_widths(&t.long_width_call),
+        min_premium: n.long_min_premium_call,
+        max_premium: n.long_max_premium_call,
+    };
+    let sides = [(true, "Puts", &options.puts, &options.narrow_puts, &put_longs), (false, "Call", &options.calls, &options.narrow_calls, &call_longs)];
+    for (put, name, list, narrow, longs) in sides {
+        side_candidates(trade_type, list, narrow, longs, put, &mut max_width, &mut candidates);
+        log.push(format!("Trade - Load Contracts {name} Complete ({} possible trades)", candidates.len()));
+        log.extend(why_no_verticals(trade_type, list, longs, put, &candidates));
+    }
+    (candidates, max_width)
+}
+
+/// Why a side (`put` or call) whose options were loaded gave no vertical at a fixed width, for the log: no width is set, or no
+/// option lies at the width from any short, which happens when the width is not a multiple of the distance between the strikes
+/// (a width of 1 where the strikes are 5 apart). `None` when the side has verticals, is not built from verticals, has no options,
+/// or chooses its long by premium.
+fn why_no_verticals(trade_type: &str, options: &[Leg], longs: &LongChoice, put: bool, candidates: &[Vertical]) -> Option<String> {
+    let builds = crate::trade_type::is(trade_type, if put { TradeType::builds_put_verticals } else { TradeType::builds_call_verticals });
+    let side = if put { "put" } else { "call" };
+    let has_verticals = candidates.iter().any(|v| v.put_call() == if put { "P" } else { "C" });
+    if !builds || options.is_empty() || has_verticals || longs.long_type != "Width" {
+        return None;
+    }
+    if longs.widths.is_empty() {
+        return Some(format!("Trade - no {side} spread: the template has no Long Width for the {side} side"));
+    }
+    let strikes: Vec<Decimal> = options.iter().map(|o| o.strike).collect();
+    let step = crate::strikes::strike_step_of(&strikes);
+    let widths: Vec<String> = longs.widths.iter().map(|w| fmt_dec(*w)).collect();
+    Some(match step {
+        Some(step) => format!(
+            "Trade - no {side} spread: no {side} lies at a width of {} from any short - the {side} strikes are {} apart, the width must be a multiple of that",
+            widths.join(", "),
+            fmt_dec(step)
+        ),
+        None => format!("Trade - no {side} spread: no {side} lies at a width of {} from any short", widths.join(", ")),
+    })
 }
 
 /// The verticals of one side: each option as the short, with a long further out of the money -
@@ -2297,6 +2333,32 @@ mod tests {
         assert_eq!(strikes(out.call.as_ref()), (Some(d("6710")), Some(d("6720"))));
         assert_eq!(out.entry_price, Some(d("0.55")));
         assert_eq!(out.preview, "SPX  Price: 6700\nCALL:0.25 6710 2026-11-13 / 6720 2026-11-13\nPUT: 0.3 6605 2026-11-13 / 6595 2026-11-13\n");
+    }
+
+    #[test]
+    fn a_long_width_that_no_strike_is_at_says_so_in_the_log() {
+        // A call spread of width 1 where the strikes are 5 apart: no call lies at the width, nothing is built.
+        let width_one = TradeTemplate {
+            trade_type: "CallSpread".into(),
+            target_type_call: "Delta".into(),
+            target_min_call: Some(10.0),
+            target_max_call: Some(30.0),
+            long_width_call: "1".into(),
+            ..ic_template()
+        };
+        let out = select_trade(&input(&width_one));
+        assert!(out.call.is_none(), "{:?}", out.log);
+        assert!(out.log.iter().any(|l| l.contains("no call lies at a width of 1 from any short - the call strikes are 5 apart")), "{:?}", out.log);
+        // Without a width the log says that instead; the put side of a call spread says nothing.
+        let no_width = TradeTemplate { long_width_call: String::new(), ..width_one.clone() };
+        let out = select_trade(&input(&no_width));
+        assert!(out.log.iter().any(|l| l.contains("the template has no Long Width for the call side")), "{:?}", out.log);
+        assert!(!out.log.iter().any(|l| l.contains("no put spread")), "{:?}", out.log);
+        // A width of 10 builds the spreads and says nothing of the kind.
+        let ten = TradeTemplate { long_width_call: "10".into(), ..width_one };
+        let out = select_trade(&input(&ten));
+        assert!(!out.log.iter().any(|l| l.contains("no call spread")), "{:?}", out.log);
+        assert!(out.call.is_some(), "{:?}", out.log);
     }
 
     #[test]

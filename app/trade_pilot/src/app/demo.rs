@@ -152,6 +152,26 @@ impl App {
             demo_trade(1052, "PutSpread", "P", [(9005, "5900"), (9006, "5890")], 1, "0.80", None),
         ];
         self.trade_log = self.trades_stored.clone();
+        // The legs of two of the open put spreads as TWS reports them: quantity and the average cost per contract.
+        let position = |con_id: i32, strike: f64, quantity: f64, average_cost: f64| broker::Position {
+            account: "DU0000000".into(),
+            contract_id: con_id.to_string(),
+            symbol: "SPX".into(),
+            security_type: "OPT".into(),
+            expiry: expiry.clone(),
+            strike,
+            right: "P".into(),
+            multiplier: Some(100.0),
+            quantity,
+            average_cost: Some(average_cost),
+        };
+        self.positions = vec![
+            position(9001, 5880.0, -2.0, 231.0),
+            position(9002, 5870.0, 2.0, 116.0),
+            position(9005, 5900.0, -1.0, 152.0),
+            position(9006, 5890.0, 1.0, 72.0),
+        ];
+        self.loaded.positions_loaded = true;
         self.ui_state.trade_filter = "All".into();
         self.demo_schedules();
         self.refresh_trades(self.clock.instant(), true);

@@ -22,6 +22,10 @@ impl App {
     pub(super) fn submit_order(&mut self, order_id: i32, contract: IbContract, order: IbOrder) -> Result<(), OrderBlocked> {
         let handed_over = self.settings.view_flags.settings_logging_debug.then(|| describe_order(order_id, &contract, &order));
         let result = self.try_submit_order(order_id, contract, order);
+        // Blocked because TWS has no link to IB: said on the screen as well, also for an order the app sends by itself.
+        if let (Err(OrderBlocked::IbLinkLost), Some(note)) = (&result, self.order_block_note()) {
+            self.show_notice(note.to_string());
+        }
         match (&result, handed_over) {
             (Err(reason), _) => self.log(&format!("WARNING: order {order_id} NOT sent: {reason}")),
             (Ok(()), Some(text)) => self.debug(&format!("handed to TWS: {text}")),
@@ -33,6 +37,9 @@ impl App {
     pub(super) fn try_submit_order(&self, order_id: i32, contract: IbContract, order: IbOrder) -> Result<(), OrderBlocked> {
         if !self.trading_allowed() {
             return Err(OrderBlocked::SafetyGate);
+        }
+        if self.session.ib_link_lost {
+            return Err(OrderBlocked::IbLinkLost);
         }
         let sender = self.tws_cmd_sender.as_ref().ok_or(OrderBlocked::NotConnected)?;
         let quantity = core_types::Quantity::from_f64(order.total_quantity).map_err(|error| OrderBlocked::Risk(error.to_string()))?;
@@ -774,7 +781,7 @@ impl App {
                     }
                     if !filled.is_empty() {
                         self.log(&format!(
-                            "WARNING: {label}: order(s) {filled:?} filled while TradePilot was not running - the trade is closed (at least in part): use Mark closed"
+                            "WARNING: {label}: order(s) {filled:?} filled while TradePilot was not connected to TWS - the trade is closed (at least in part): use Mark closed"
                         ));
                     }
                     if !missing.is_empty() {
@@ -793,6 +800,7 @@ impl App {
                 }
             }
         }
+        problems += self.cancel_orders_of_closed_trades(working);
         let summary = if problems == 0 {
             "Reconciliation with TWS: the exit orders of all open trades are working".to_string()
         } else {
@@ -803,6 +811,24 @@ impl App {
             self.instant.template_status = Some(summary);
         }
     }
+    /// Stops, targets and close orders of this app that TWS still reports as working (`working`, from `reqOpenOrders`: the open
+    /// orders of this client) although their trade is no longer open (closed by another order, marked closed, expired): such an order
+    /// would open a new position when it fills, so it is cancelled. Cancelling only lowers the risk, so it needs no safety gate.
+    /// Returns how many were found.
+    fn cancel_orders_of_closed_trades(&mut self, working: &[i32]) -> usize {
+        let stale: Vec<(String, i32)> = self
+            .trades_stored
+            .iter()
+            .filter(|t| !t.is_open())
+            .flat_map(|t| t.exit_order_ids().into_iter().filter(|id| working.contains(id)).map(|id| (t.label(), id)).collect::<Vec<_>>())
+            .collect();
+        for (label, order_id) in &stale {
+            self.log(&format!("WARNING: {label} is no longer open, but its order {order_id} is still working in TWS - cancelling it"));
+            let _ = self.submit_cancel(*order_id);
+        }
+        stale.len()
+    }
+
     /// The old stop of an adjusted trade is cancelled: places the new one (`replacement_stop_orders`)
     /// in the OCA group of the trade's profit target, or in a new group when it has none, and
     /// remembers its order ids. Goes through the same checks as every order.
@@ -1074,6 +1100,20 @@ impl App {
         let Some(index) = self.trades_stored.iter().position(|t| t.is_open() && t.exit_order_ids().contains(&order_id)) else { return };
         let Some(trade) = self.trades_stored.get(index).cloned() else { return };
         let label = trade.label();
+        // The message is used only when what the app knows for sure agrees: the account and the symbol of the trade, and the
+        // reference this app gives its orders ("TraPi-<order id>"). Otherwise its fields may not be where the app reads them.
+        let reference_ok = info.order_ref.strip_prefix("TraPi-").is_none_or(|rest| rest.split(' ').next() == Some(order_id.to_string().as_str()));
+        if info.account != trade.account || info.symbol != trade.symbol || !reference_ok {
+            if self.watch.mismatch_reported.insert(format!("openOrder {order_id}")) {
+                self.log(&format!(
+                    "WARNING: TWS openOrder message of order {order_id} does not match {label} (account '{}', symbol '{}', reference '{}') - prices ignored",
+                    mask_account(&info.account),
+                    info.symbol,
+                    info.order_ref
+                ));
+            }
+            return;
+        }
         let mut updated = trade.clone();
         let (kind, old, new) = if trade.stop_order_id == Some(order_id) && trade.stop_limit_order_id.is_none() && info.order_type == "STP" {
             let Some(price) = info.aux_price.and_then(dec).map(|p| p.normalize()) else { return };
@@ -1150,7 +1190,7 @@ impl App {
                 _ => trade.remaining_qty(),
             };
             let Some((contracts, price)) = fill_of_order(&self.exec_history, order_id) else {
-                self.log(&format!("WARNING: {label}: the {kind} {order_id} filled while TradePilot was not running, but its price cannot be read from the executions - use Mark closed"));
+                self.log(&format!("WARNING: {label}: the {kind} {order_id} filled while TradePilot was not connected to TWS, but its price cannot be read from the executions - use Mark closed"));
                 continue;
             };
             if contracts < expected {
@@ -1159,7 +1199,9 @@ impl App {
                 ));
                 continue;
             }
-            self.log(&format!("{label}: the {kind} {order_id} filled while TradePilot was not running ({contracts} contract(s) at {price} per contract)"));
+            self.log(&format!(
+                "{label}: the {kind} {order_id} filled while TradePilot was not connected to TWS ({contracts} contract(s) at {price} per contract)"
+            ));
             self.end_by_exit_fill(index, &trade, order_id, kind, level, price);
             if self.trades_stored.get(index).is_some_and(|t| !t.is_open()) {
                 self.watch.closed_by.insert(trade.key(), order_id);
