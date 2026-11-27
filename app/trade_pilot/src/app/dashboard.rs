@@ -277,6 +277,12 @@ impl App {
         self.trades_stored.iter().position(|t| t.is_open() && t.key() == key)
     }
 
+    /// A selected trade was edited (stop/target sent, closed or marked closed, an exit deleted): the selection ends with it, so the list
+    /// and the actions below it are free for the next trade.
+    pub(super) fn trade_edit_done(&mut self) {
+        self.ui_state.selected_trade = None;
+    }
+
     /// The clicks on the list of today's trades: only an open trade can be selected, a click on a closed one changes nothing.
     pub(super) fn apply_trade_clicks(&mut self, clicks: crate::widgets::RowClicks) {
         let current = self.selected_open_index().and(self.ui_state.selected_trade.clone());
@@ -408,7 +414,7 @@ impl App {
                 .collect();
             let selected = self.schedule.selected_run.and_then(|id| runs.iter().position(|run| run.id == id));
             let keys = ["time_ny", "local_time", "type", "status", "template"];
-            let clicks = arranged_table(ui, "scheduled_tasks_table", &keys, &columns, &rows, Some(RowSelection { selected, locked: &[] }));
+            let clicks = arranged_table(ui, "scheduled_tasks_table", &keys, &columns, &rows, Some(RowSelection { selected, ticked: &[], locked: &[] }));
             self.schedule.selected_run = next_selection(self.schedule.selected_run, clicks, |index| runs.get(index).map(|run| run.id));
             if let Some(run) = clicks.double_clicked.and_then(|index| runs.get(index)).filter(|run| run.schedule_id > 0) {
                 self.edit_schedule(run.schedule_id);

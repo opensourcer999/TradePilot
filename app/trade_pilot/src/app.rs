@@ -8,6 +8,7 @@ mod demo;
 mod early_exit;
 mod entry_risk;
 mod housekeeping;
+mod import;
 mod indicators;
 mod instant_order;
 mod logs_page;
@@ -91,8 +92,8 @@ use crate::widgets::{
     PCR_TICKS, STATUS_ERROR, STATUS_NEUTRAL, STATUS_OK, STATUS_PENDING, WIN_TICKS,
 };
 use broker::{
-    connect_to_tws, looks_like_paper_account, parse_client_id, parse_tws_endpoint, ExecutionRow, IbComboLeg, IbContract, IbOrder, OrderHandling, Position,
-    TwsCommand, TwsEvent, IB_CLIENT_ID, IB_TWS_HOST, IB_TWS_PORT, TICK_ASK, TICK_ASK_SIZE, TICK_BID, TICK_BID_SIZE, TICK_CLOSE, TICK_DELAYED_ASK,
+    connect_to_tws, looks_like_paper_account, mask_account, parse_client_id, parse_tws_endpoint, ExecutionRow, IbComboLeg, IbContract, IbOrder, OrderHandling,
+    Position, TwsCommand, TwsEvent, IB_CLIENT_ID, IB_TWS_HOST, IB_TWS_PORT, TICK_ASK, TICK_ASK_SIZE, TICK_BID, TICK_BID_SIZE, TICK_CLOSE, TICK_DELAYED_ASK,
     TICK_DELAYED_ASK_SIZE, TICK_DELAYED_BID, TICK_DELAYED_BID_SIZE, TICK_DELAYED_CLOSE, TICK_DELAYED_LAST, TICK_DELAYED_LAST_SIZE, TICK_DELAYED_OPEN,
     TICK_LAST, TICK_LAST_SIZE, TICK_OPEN,
 };
@@ -344,6 +345,8 @@ struct TwsSession {
     status: String,
     /// The server version TWS reported.
     server_version: Option<String>,
+    /// The client id of the connection; orders and statuses of other client ids are not this app's.
+    client_id: Option<i32>,
     /// When the last connection check ran (see `maintain_connection_due`).
     last_broker_check: Instant,
     /// How often in a row the connection could not be kept.
@@ -383,6 +386,7 @@ impl TwsSession {
             stop: None,
             status: "Not connected".into(),
             server_version: None,
+            client_id: None,
             last_broker_check: now,
             broker_connection_retries: 0,
             mode_mismatch: None,
@@ -656,18 +660,6 @@ fn stored_custom_legs(planned: &trade_entry::PlannedTrade) -> Option<Vec<crate::
     })
 }
 
-/// Masks an account number: first 4 + "***" + last 4 characters (8+ long only).
-/// The input looks like "IB:DU1234567", so "IB:" counts towards the first 4.
-fn mask_account(account: &str) -> String {
-    let len = account.chars().count();
-    if len < 8 {
-        return account.to_string();
-    }
-    let head: String = account.chars().take(4).collect();
-    let tail: String = account.chars().skip(len - 4).collect();
-    format!("{head}***{tail}")
-}
-
 /// Gives Paper Trading its own copy of the existing settings and templates the first time it is
 /// used (see `storage::seed_mode_dir`).
 fn seed_paper_mode() {
@@ -806,6 +798,24 @@ pub struct PendingFlags {
     pub open_orders_requested: bool,
     /// The `storage_copy_data` switch.
     pub storage_copy_data: bool,
+    /// Where the listing of the working orders of every API client stands in this session.
+    pub all_orders: AllOrdersListing,
+}
+
+/// The one listing per session of the working orders of every API client (`reqAllOpenOrders`), after the reconciliation of the
+/// app's own orders: it shows in the log which orders TWS reports for other clients.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AllOrdersListing {
+    /// Not asked for yet in this session.
+    #[default]
+    NotAsked,
+    /// Asked for; the answer is coming in. `other_clients` counts the orders of other clients so far.
+    Listing {
+        /// Orders of other clients reported so far.
+        other_clients: usize,
+    },
+    /// The answer is complete.
+    Done,
 }
 
 /// The switches of the Instant Order ticket.
@@ -898,6 +908,9 @@ pub struct App {
     /// The orders TWS reported as still working since `reqOpenOrders` was sent; `None` while no
     /// such request is answered (see `reconcile_open_orders`).
     open_orders_snapshot: Option<Vec<i32>>,
+    /// The working orders of other API clients from the last listing (`request_all_open_orders`), one per perm id: while one touches
+    /// a trade, no stop or target of this app is sent for it (`other_client_lock`).
+    other_client_orders: Vec<broker::OpenOrderInfo>,
     /// How far the exit orders reach (see `check_stop_coverage`).
     exit_coverage: ExitCoverage,
     /// The TWS session: status, start, what it reported.
@@ -924,6 +937,8 @@ pub struct App {
     close_pending: Option<PendingClose>,
     /// A stop/target to attach to an open trade, waiting for the confirmation.
     exits_pending: Option<attach::PendingExits>,
+    /// The positions ticked to be taken over as a trade, and the window that does it.
+    import: import::TradeImport,
 
     // Real expiry/strike lists for the Instant Order Contract card, fetched from TWS via
     // `TwsCommand::RequestOptionParams` (`IBApi.EClient.reqSecDefOptParams`) - never guessed or
@@ -1685,7 +1700,7 @@ impl App {
             gauge_sweep_start: None,
             ui_state: UiState::default(),
 
-            pending: PendingFlags { trade_log_dirty: true, storage_copy_data: true, open_orders_requested: false },
+            pending: PendingFlags { trade_log_dirty: true, storage_copy_data: true, open_orders_requested: false, all_orders: AllOrdersListing::NotAsked },
             settings_tab: SettingsTab::General,
             folder_pick: None,
             new_symbol: String::new(),
@@ -1701,6 +1716,7 @@ impl App {
             tws_cmd_sender: None,
             next_order_id: None,
             open_orders_snapshot: None,
+            other_client_orders: Vec::new(),
             exit_coverage: ExitCoverage::default(),
             session: TwsSession::new(clock.instant()),
             csv_exported_day: None,
@@ -1717,6 +1733,7 @@ impl App {
             chains_last_manage: clock.instant(),
             close_pending: None,
             exits_pending: None,
+            import: import::TradeImport::default(),
 
             // Overwritten below once the real starting values above are known / loaded from disk.
             settings_saved: blank_saved_settings(),
@@ -2313,8 +2330,8 @@ impl App {
                     self.debug(&format!("TWS open order {order_id} - {role}"));
                     if let Some(info) = details {
                         self.debug(&format!(
-                            "TWS open order {order_id}: {} {} {} limit {:?} stop {:?} ({})",
-                            info.action, info.total_quantity, info.order_type, info.limit_price, info.aux_price, info.order_ref
+                            "TWS open order {order_id}: {} {} {} limit {:?} stop {:?} trail stop {:?} ({})",
+                            info.action, info.total_quantity, info.order_type, info.limit_price, info.aux_price, info.trail_stop_price, info.order_ref
                         ));
                         self.adopt_working_prices(&info);
                     }
@@ -2328,7 +2345,17 @@ impl App {
                     if let Some(working) = self.open_orders_snapshot.take() {
                         self.debug(&format!("TWS open orders complete: {working:?} - comparing them with the exit orders of the open trades"));
                         self.reconcile_open_orders(&working);
+                        self.request_all_open_orders(false);
+                    } else if let AllOrdersListing::Listing { other_clients } = self.pending.all_orders {
+                        self.pending.all_orders = AllOrdersListing::Done;
+                        self.log(&format!("TWS working orders of all API clients listed: {other_clients} of other clients"));
+                        // A reconciliation asked for while the listing ran was held back (see `request_open_orders`).
+                        self.request_open_orders();
                     }
+                }
+                TwsEvent::OtherClientOrder(info) => self.on_other_client_order(&info),
+                TwsEvent::OtherClientOrderStatus { order_id, client_id, perm_id, status } => {
+                    self.on_other_client_order_status(order_id, client_id, perm_id, &status);
                 }
                 TwsEvent::NextOrderId(id) => self.next_order_id = Some(id),
                 TwsEvent::MarketDataAck { ticker_id } => {
@@ -2404,6 +2431,8 @@ impl App {
         self.forget_account_data();
         self.open_orders_snapshot = None;
         self.pending.open_orders_requested = false;
+        self.pending.all_orders = AllOrdersListing::NotAsked;
+        self.other_client_orders.clear();
     }
 
     /// Forgets what TWS reported about the account (summary, positions, portfolio, today's executions), so a new session loads it
@@ -2766,6 +2795,7 @@ impl App {
         };
         let stop = Arc::new(AtomicBool::new(false));
         self.session.stop = Some(stop.clone());
+        self.session.client_id = Some(client_id);
         self.session.status = format!("Connecting to {host}:{port}...");
         self.log(&format!("{source}: {}", self.session.status));
         self.session.server_version = None;
@@ -2940,6 +2970,52 @@ impl App {
         self.log_unsent_requests("start option chains", unsent);
     }
 
+    /// The chains the open trades need, so their options get live quotes even when the settings do not follow their symbol or
+    /// expiry (a trade taken over from positions, or one opened days ago): the underlying of a symbol no setting follows, and the chain
+    /// of each expiry of a trade's options that is not loaded. Its options are then subscribed like every held option
+    /// (`OptionChains::subscription_plan`); a symbol followed only for its trades gets no strike window.
+    fn keep_trade_chains(&mut self) {
+        if !self.chains.is_started() {
+            return;
+        }
+        let Some(sender) = self.tws_cmd_sender.clone() else {
+            return;
+        };
+        let wanted: Vec<(String, Vec<String>)> =
+            self.trades_stored.iter().filter(|t| t.is_open() && !t.entry_unknown).map(|t| (t.symbol.clone(), self.trade_expiries(t))).collect();
+        let needs = self.chains.trade_needs(&wanted);
+        let mut unsent = 0;
+        for symbol in needs.symbols {
+            let req_id = self.next_request_id();
+            self.chains.symbols.push(ChainSymbol::for_trades(&symbol));
+            self.chains.underlyings.push(Underlying { symbol: symbol.clone(), req_id, price: None, price_at: None, chain_requested: false });
+            send_counted(&sender, TwsCommand::RequestMarketData { req_id, contract: underlying_contract(&symbol) }, &mut unsent);
+            self.log(&format!("Option chains: following {symbol} for its open trades (underlying price reqId {req_id})"));
+        }
+        for (symbol, expiry) in needs.lookups {
+            self.chains.trade_lookups.push((symbol.clone(), expiry.clone()));
+            self.request_chain_lookup(&symbol, &expiry);
+        }
+        self.log_unsent_requests("keep trade chains", unsent);
+    }
+
+    /// The expiries of the options of `trade`: its own (the near one of a calendar), those of its custom legs, and those of the
+    /// positions in its legs (the far leg of a calendar, which the trade does not store).
+    fn trade_expiries(&self, trade: &StoredTrade) -> Vec<String> {
+        let legs: Vec<i32> = trade_exit::close_legs(trade).iter().map(|leg| leg.con_id).collect();
+        let mut expiries = vec![trade.expiry.clone()];
+        expiries.extend(trade.custom_legs.iter().flatten().map(|leg| leg.expiry.clone()));
+        expiries.extend(
+            self.positions
+                .iter()
+                .filter(|p| p.account == trade.account && p.contract_id.trim().parse::<i32>().is_ok_and(|id| legs.contains(&id)))
+                .map(|p| p.expiry.clone()),
+        );
+        expiries.sort();
+        expiries.dedup();
+        expiries
+    }
+
     /// Option chains, step 2: one contract-details lookup
     /// per configured DTE that falls on a weekday.
     fn request_chain_lookups(&mut self, symbol: &str) {
@@ -3005,7 +3081,7 @@ impl App {
                 TradeRowView {
                     index,
                     account: mask_account(&t.account),
-                    order_id: crate::trade_rebuild::order_ref(t.order_id, ""),
+                    order_id: crate::trade_rebuild::trade_ref(t.order_id),
                     expiry: format_date(&t.expiry),
                     kind: t.trade_type.clone(),
                     status: t.status.clone(),
@@ -3138,6 +3214,7 @@ impl App {
             return;
         }
         self.chains_last_manage = now;
+        self.keep_trade_chains();
         let Some(sender) = self.tws_cmd_sender.clone() else {
             return;
         };
@@ -3866,6 +3943,7 @@ impl eframe::App for App {
         self.template_confirm_dialog(ctx);
         self.close_dialog(ctx);
         self.exits_dialog(ctx);
+        self.import_dialog(ctx);
         self.mode_mismatch_dialog(ctx);
         self.clear_logs_dialog(ctx);
         self.screenshot_step(ctx);

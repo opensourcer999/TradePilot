@@ -15,7 +15,8 @@ const TICK_MODEL_OPTION: i32 = 13;
 const TICK_DELAYED_MODEL_OPTION: i32 = 83;
 
 /// One configured symbol: which DTEs to load and how far around the
-/// underlying price (in points) puts and calls get live quotes.
+/// underlying price (in points) puts and calls get live quotes. A symbol without DTEs is followed only for the open trades on it
+/// (`ChainSymbol::for_trades`): its options get live quotes only where a trade or a position holds them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChainSymbol {
     pub symbol: String,
@@ -36,6 +37,12 @@ fn default_window(symbol: &str) -> (f64, f64, f64, f64) {
 }
 
 impl ChainSymbol {
+    /// A symbol that is not configured but has open trades: no DTEs of its own, the default window should it be traded later.
+    pub fn for_trades(symbol: &str) -> Self {
+        let window = default_window(symbol);
+        Self { symbol: symbol.to_string(), dtes: Vec::new(), put_otm: window.0, put_itm: window.1, call_otm: window.2, call_itm: window.3 }
+    }
+
     /// Settings > Market Data > Configure Symbols; with nothing configured, the
     /// first-run default seeds SPX, DTE 0, 220/20 puts, 200/20 calls.
     pub fn from_settings(configs: &[SymbolConfig]) -> Vec<Self> {
@@ -181,6 +188,18 @@ pub struct OptionChains {
     pub contracts: Vec<OptionContract>,
     /// Outstanding contract lookups: (request id, symbol, expiry).
     pub pending_lookups: Vec<(i32, String, String)>,
+    /// The (symbol, expiry) chains looked up this session for open trades (`trade_needs`): each once, so an expiry TWS has no options
+    /// for is not asked again every few seconds.
+    pub trade_lookups: Vec<(String, String)>,
+}
+
+/// What the open trades need of the chains that is not there yet (`OptionChains::trade_needs`).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TradeNeeds {
+    /// Symbols to follow: neither configured nor followed yet.
+    pub symbols: Vec<String>,
+    /// (symbol, expiry) chains to look up: not loaded, not asked for and not looked up for a trade before in this session.
+    pub lookups: Vec<(String, String)>,
 }
 
 /// What the subscription manager wants changed: contract indexes to subscribe and to cancel.
@@ -193,6 +212,27 @@ pub struct SubscriptionPlan {
 impl OptionChains {
     pub fn is_started(&self) -> bool {
         !self.underlyings.is_empty()
+    }
+
+    /// What the open trades (`wanted`: each its symbol and the expiries of its options) need so their options can get live quotes: a
+    /// symbol that is not followed (its underlying gives the price the subscriptions are planned around) and the chain of each expiry
+    /// that is not loaded. A quote needs the option in a loaded chain (see `subscription_plan`).
+    pub fn trade_needs(&self, wanted: &[(String, Vec<String>)]) -> TradeNeeds {
+        let mut needs = TradeNeeds::default();
+        for (symbol, expiries) in wanted {
+            if !self.symbols.iter().any(|s| s.symbol == *symbol) && !needs.symbols.contains(symbol) {
+                needs.symbols.push(symbol.clone());
+            }
+            for expiry in expiries.iter().filter(|e| !e.is_empty()) {
+                let key = (symbol.clone(), expiry.clone());
+                let loaded = self.contracts.iter().any(|c| c.symbol == *symbol && c.expiry == *expiry);
+                let asked = self.pending_lookups.iter().any(|(_, s, e)| s == symbol && e == expiry);
+                if !loaded && !asked && !self.trade_lookups.contains(&key) && !needs.lookups.contains(&key) {
+                    needs.lookups.push(key);
+                }
+            }
+        }
+        needs
     }
 
     pub fn subscribed_count(&self) -> usize {
@@ -293,11 +333,13 @@ impl OptionChains {
         for (i, contract) in self.contracts.iter().enumerate() {
             let Some(config) = self.symbols.iter().find(|s| s.symbol == contract.symbol) else { continue };
             let Some(price) = self.price(&contract.symbol) else { continue };
-            let in_window = match contract.right.as_str() {
-                "P" => contract.strike >= price - config.put_otm && contract.strike <= price + config.put_itm,
-                "C" => contract.strike >= price - config.call_itm && contract.strike <= price + config.call_otm,
-                _ => false,
-            };
+            // A symbol followed only for its trades has no window: just the options held get a line.
+            let in_window = !config.dtes.is_empty()
+                && match contract.right.as_str() {
+                    "P" => contract.strike >= price - config.put_otm && contract.strike <= price + config.put_itm,
+                    "C" => contract.strike >= price - config.call_itm && contract.strike <= price + config.call_otm,
+                    _ => false,
+                };
             let held = held_con_ids.contains(&contract.con_id);
             if in_window || held {
                 // A line that is open counts as a little nearer than it is: a price that moves back and forth over a strike must not
@@ -486,5 +528,50 @@ mod tests {
         assert!(!chains.add_contract(&data(6002, 1, "SPX", "SPXW", "P", 6000.0)));
         assert!(chains.lookup_finished(6002));
         assert!(!chains.lookup_finished(6002));
+    }
+
+    #[test]
+    fn open_trades_ask_for_the_symbol_and_the_expiries_no_setting_loads_each_once() {
+        let mut chains = spx_chain();
+        chains.contracts.push(OptionContract {
+            con_id: 1,
+            symbol: "SPX".into(),
+            right: "P".into(),
+            strike: 6650.0,
+            expiry: "20261120".into(),
+            local_symbol: String::new(),
+            req_id: None,
+            bid: None,
+            ask: None,
+            delta: None,
+            updated: None,
+            updated_at: None,
+        });
+        let wanted = vec![
+            ("SPX".to_string(), vec!["20261120".to_string(), "20261113".to_string(), "20261218".to_string()]),
+            ("INTC".to_string(), vec!["20261218".to_string(), String::new()]),
+        ];
+        let needs = chains.trade_needs(&wanted);
+        assert_eq!(needs.symbols, ["INTC"], "SPX is configured");
+        assert_eq!(
+            needs.lookups,
+            [("SPX".to_string(), "20261218".to_string()), ("INTC".to_string(), "20261218".to_string())],
+            "20261120 is loaded, 20261113 asked for already"
+        );
+        chains.trade_lookups.extend(needs.lookups);
+        assert_eq!(chains.trade_needs(&wanted).lookups, Vec::<(String, String)>::new(), "each chain is looked up once a session");
+    }
+
+    #[test]
+    fn a_symbol_followed_only_for_its_trades_gets_lines_for_the_held_options_only() {
+        let mut chains = OptionChains { symbols: vec![ChainSymbol::for_trades("INTC")], ..OptionChains::default() };
+        chains.underlyings.push(Underlying { symbol: "INTC".into(), req_id: 7001, price: Some(57.0), price_at: None, chain_requested: true });
+        chains.pending_lookups.push((7002, "INTC".into(), "20261113".into()));
+        for (con_id, strike) in [(55, 55.0), (57, 57.0), (60, 60.0)] {
+            assert!(chains.add_contract(&data(7002, con_id, "INTC", "INTC", "P", strike)));
+        }
+        let plan = chains.subscription_plan(&[60, 55], 100);
+        let subscribed: Vec<i32> = plan.subscribe.iter().filter_map(|i| chains.contracts.get(*i)).map(|c| c.con_id).collect();
+        assert_eq!(subscribed, [55, 60], "not the 57 at the price: no window");
     }
 }

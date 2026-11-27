@@ -88,7 +88,7 @@ fn a_margin_rejection_of_an_order_is_mailed() {
     let order_id = app.template.orders.first().expect("the sent order").order_id;
     app.tws_sender.send(TwsEvent::RequestError { req_id: order_id, code: 201, message: "Order rejected - reason: Insufficient margin".into() }).unwrap();
     app.poll_tws();
-    assert!(mail_lines(&app).iter().any(|l| l.contains("\"Unexpected Order Error - Margin Issue\"")), "{:?}", mail_lines(&app));
+    assert!(mail_lines(&app).iter().any(|l| l.contains("\"TradePilot: Unexpected Order Error - Margin Issue\"")), "{:?}", mail_lines(&app));
     // An error about something that is not an order of this app is not mailed.
     let before = mail_lines(&app).len();
     app.tws_sender.send(TwsEvent::RequestError { req_id: 987_654, code: 201, message: "margin".into() }).unwrap();
@@ -106,7 +106,7 @@ fn an_exit_order_that_fills_after_the_trade_was_closed_is_an_over_fill() {
     // The profit target fills as well: the contracts were closed twice.
     app.tws_sender.send(TwsEvent::OrderStatus { order_id: 12, status: "Filled".into(), filled: 1.0, remaining: 0.0, avg_fill_price: 0.15 }).unwrap();
     app.poll_tws();
-    assert!(mail_lines(&app).iter().any(|l| l.contains("\"ALERT: Exit order over-filled\"")), "{:?}", mail_lines(&app));
+    assert!(mail_lines(&app).iter().any(|l| l.contains("\"TradePilot: ALERT: Exit order over-filled\"")), "{:?}", mail_lines(&app));
     // Said once, however often TWS repeats the status.
     let count = mail_lines(&app).iter().filter(|l| l.contains("Over Fill")).count();
     app.tws_sender.send(TwsEvent::OrderStatus { order_id: 12, status: "Filled".into(), filled: 1.0, remaining: 0.0, avg_fill_price: 0.15 }).unwrap();
@@ -147,7 +147,7 @@ fn the_daily_profit_target_cancels_the_waiting_entries_and_is_reported_once() {
     app.poll_tws();
     assert!(app.daily_target_reached_today());
     assert!(app.schedule.runs.first().is_some_and(|r| r.status == RunStatus::Cancelled), "{:?}", app.schedule.runs.first().map(|r| r.status));
-    assert!(mail_lines(&app).iter().any(|l| l.contains("\"Daily profit target reached\"")), "{:?}", mail_lines(&app));
+    assert!(mail_lines(&app).iter().any(|l| l.contains("\"TradePilot: Daily profit target reached\"")), "{:?}", mail_lines(&app));
     let count = mail_lines(&app).len();
     app.watch.checked = None;
     app.run_watchers();
@@ -204,8 +204,8 @@ fn a_trade_that_opens_and_is_stopped_is_reported_by_email_with_its_account_maske
     app.tws_sender.send(TwsEvent::OrderStatus { order_id: 11, status: "Filled".into(), filled: 1.0, remaining: 0.0, avg_fill_price: 0.9 }).unwrap();
     app.poll_tws();
     let lines = mail_lines(&app);
-    assert!(lines.iter().any(|l| l.contains("\"Entry filled (")), "{lines:?}");
-    assert!(lines.iter().any(|l| l.contains("\"Stop filled (")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("\"TradePilot: Entry filled (")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("\"TradePilot: Stop filled (")), "{lines:?}");
     assert!(!lines.iter().any(|l| l.contains("DU1234567")), "{lines:?}");
 }
 
@@ -221,7 +221,7 @@ fn a_trade_closed_at_its_profit_target_is_reported_and_nothing_is_sent_while_the
     filled_trade_with_exits(&mut app, &commands);
     app.tws_sender.send(TwsEvent::OrderStatus { order_id: 12, status: "Filled".into(), filled: 1.0, remaining: 0.0, avg_fill_price: 0.15 }).unwrap();
     app.poll_tws();
-    assert!(mail_lines(&app).iter().any(|l| l.contains("\"Trade closed (")), "{:?}", mail_lines(&app));
+    assert!(mail_lines(&app).iter().any(|l| l.contains("\"TradePilot: Trade closed (")), "{:?}", mail_lines(&app));
 }
 
 #[test]

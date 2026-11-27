@@ -54,6 +54,9 @@ pub const OUT_CANCEL_ORDER: i32 = 4;
 /// `IBApi.OutgoingMessages` id: req open orders.
 pub const OUT_REQ_OPEN_ORDERS: i32 = 5;
 
+/// `IBApi.OutgoingMessages` id: req all open orders.
+pub const OUT_REQ_ALL_OPEN_ORDERS: i32 = 16;
+
 /// `IBApi.OutgoingMessages` id: req executions.
 pub const OUT_REQ_EXECUTIONS: i32 = 7;
 

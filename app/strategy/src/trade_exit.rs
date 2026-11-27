@@ -1019,14 +1019,14 @@ pub fn exit_orders(
             aux_price: offset.to_f64()?,
             handling: OrderHandling { outside_rth: template.order_flags.extended_hour_stop, ..OrderHandling::default() },
             condition_flags: OrderConditionFlags { conditions_ignore_rth: template.order_flags.extended_hour_stop, ..OrderConditionFlags::default() },
-            ..base(crate::trade_rebuild::order_ref(stop_id, "SL"), stop_qty)
+            ..base(crate::trade_rebuild::exit_order_ref(trade.order_id, stop_id, "SL"), stop_qty)
         }),
         (None, Some(price), _, _) => Some(IbOrder {
             order_type: "STP".to_string(),
             aux_price: price.to_f64()?,
             trigger_method: template.stop_trigger,
             handling: OrderHandling { outside_rth: template.order_flags.extended_hour_stop, ..OrderHandling::default() },
-            ..base(crate::trade_rebuild::order_ref(stop_id, "SL"), stop_qty)
+            ..base(crate::trade_rebuild::exit_order_ref(trade.order_id, stop_id, "SL"), stop_qty)
         }),
         // `AuxPrice` is the trailing amount, `TrailStopPrice` the stop price it starts at.
         (None, None, Some(trail), Some(start)) => Some(IbOrder {
@@ -1035,7 +1035,7 @@ pub fn exit_orders(
             trail_stop_price: start.to_f64()?,
             trigger_method: template.stop_trigger,
             handling: OrderHandling { outside_rth: template.order_flags.extended_hour_stop, ..OrderHandling::default() },
-            ..base(crate::trade_rebuild::order_ref(stop_id, "SL"), stop_qty)
+            ..base(crate::trade_rebuild::exit_order_ref(trade.order_id, stop_id, "SL"), stop_qty)
         }),
         _ => None,
     };
@@ -1046,7 +1046,7 @@ pub fn exit_orders(
             lmt_price: limit.to_f64()?,
             trigger_method: template.stop_trigger,
             handling: OrderHandling { outside_rth: template.order_flags.extended_hour_stop, ..OrderHandling::default() },
-            ..base(crate::trade_rebuild::order_ref(limit_id, "SL"), stop_qty)
+            ..base(crate::trade_rebuild::exit_order_ref(trade.order_id, limit_id, "SL"), stop_qty)
         }),
         _ => None,
     };
@@ -1055,11 +1055,23 @@ pub fn exit_orders(
             order_type: "LMT".to_string(),
             lmt_price: price.to_f64()?,
             handling: OrderHandling { outside_rth: template.order_flags.extended_hour_pt, ..OrderHandling::default() },
-            ..base(crate::trade_rebuild::order_ref(profit_id, "TP"), profit_qty)
+            ..base(crate::trade_rebuild::exit_order_ref(trade.order_id, profit_id, "TP"), profit_qty)
         }),
         None => None,
     };
     Some(ExitOrders { contract, stop, stop_limit, profit })
+}
+
+/// The price a stop or target typed by the person goes to TWS at, for a trade entered at `price_open` whose closing order has `legs`
+/// legs. A debit trade's exits are typed as the value of the position (positive); its combo is bought back at a negative price, a single
+/// option of it is sold at a positive one, as `exit_prices_with_basis` places them. A credit trade's price is the one typed.
+#[must_use]
+pub fn typed_exit_on_wire(price_open: Decimal, legs: usize, typed: Decimal) -> Decimal {
+    if price_open < Decimal::ZERO && legs > 1 {
+        -typed.abs()
+    } else {
+        typed
+    }
 }
 
 /// Whether the orders that close `trade` sell - a single long option - rather than buy: a combo is
@@ -1106,7 +1118,7 @@ pub fn level_order(
         lmt_price: price.to_f64()?,
         tif: if trade.expiry == today { "DAY" } else { "GTC" }.to_string(),
         account: trade.account.clone(),
-        order_ref: crate::trade_rebuild::order_ref(order_id, "TP"),
+        order_ref: crate::trade_rebuild::exit_order_ref(trade.order_id, order_id, "TP"),
         oca_group: group.to_string(),
         oca_type: 3,
         handling: OrderHandling { outside_rth, transmit: true, ..OrderHandling::default() },
@@ -2228,5 +2240,14 @@ mod tests {
         let c = orders.contract;
         assert_eq!((c.sec_type.as_str(), c.trading_class.as_str(), c.right.as_str(), c.strike), ("OPT", "SPXW", "P", 6600.0));
         assert_eq!(c.last_trade_date_or_contract_month, "20261116");
+    }
+
+    #[test]
+    fn a_typed_exit_of_a_debit_combo_goes_out_negative_and_the_rest_as_typed() {
+        let (debit, credit, typed) = (Decimal::new(-200, 2), Decimal::new(160, 2), Decimal::new(100, 2));
+        assert_eq!(typed_exit_on_wire(debit, 2, typed), Decimal::new(-100, 2), "a debit spread is bought back at a negative price");
+        assert_eq!(typed_exit_on_wire(debit, 1, typed), typed, "a long option is sold at a positive price");
+        assert_eq!(typed_exit_on_wire(credit, 2, typed), typed);
+        assert_eq!(typed_exit_on_wire(credit, 1, typed), typed);
     }
 }

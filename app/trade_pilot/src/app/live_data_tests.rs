@@ -230,7 +230,31 @@ fn reconnect_with_working_orders(app: &mut App, commands: &mpsc::Receiver<TwsCom
     }
     app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
     app.poll_tws();
-    drain(commands)
+    let mut sent = drain(commands);
+    answer_listing_of_all_clients(app, &mut sent);
+    sent
+}
+
+impl App {
+    /// The window "Stop / Ziel" for the trade at `index`, with TWS's answer to the listing of the orders of all clients that opening it
+    /// asks for (here with none of other clients).
+    fn open_exits_answered(&mut self, index: usize) {
+        self.request_exits(index);
+        if matches!(self.pending.all_orders, AllOrdersListing::Listing { .. }) {
+            self.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
+            self.poll_tws();
+        }
+    }
+}
+
+/// After the reconciliation the app asks once for the working orders of every client: TWS answers (here with none of other
+/// clients). The request is taken out of `sent`.
+fn answer_listing_of_all_clients(app: &mut App, sent: &mut Vec<TwsCommand>) {
+    let before = sent.len();
+    sent.retain(|c| !matches!(c, TwsCommand::RequestAllOpenOrders));
+    assert_eq!(before - sent.len(), 1, "the orders of all clients are listed once after the reconciliation");
+    app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
+    app.poll_tws();
 }
 
 /// Order #10 filled with stop #11 and target #12; its adjustment was hit and the cancel of #11
@@ -259,6 +283,45 @@ fn filled_trade_with_a_rel_stop(app: &mut App, commands: &mpsc::Receiver<TwsComm
     app.tws_sender.send(TwsEvent::OrderStatus { order_id: 10, status: "Filled".into(), filled: 1.0, remaining: 0.0, avg_fill_price: -0.3 }).unwrap();
     app.poll_tws();
     drain(commands)
+}
+
+/// A working order as TWS reports it in its `openOrder` message.
+fn working(order_id: i32, order_type: &str, limit_price: Option<f64>, aux_price: Option<f64>) -> TwsEvent {
+    working_with(order_id, order_type, limit_price, aux_price, |_| {})
+}
+
+/// `working` with a field of the message changed (`change`).
+fn working_with(
+    order_id: i32,
+    order_type: &str,
+    limit_price: Option<f64>,
+    aux_price: Option<f64>,
+    change: impl FnOnce(&mut broker::OpenOrderInfo),
+) -> TwsEvent {
+    let mut info = broker::OpenOrderInfo {
+        order_id,
+        con_id: 0,
+        symbol: "SPX".into(),
+        sec_type: "BAG".into(),
+        expiry: String::new(),
+        strike: 0.0,
+        right: String::new(),
+        action: "BUY".into(),
+        total_quantity: 1.0,
+        order_type: order_type.into(),
+        limit_price,
+        aux_price,
+        tif: "DAY".into(),
+        oca_group: "TradePilot-11".into(),
+        account: "DU1234567".into(),
+        order_ref: String::new(),
+        client_id: broker::IB_CLIENT_ID,
+        perm_id: 1_000_000,
+        combo_legs: Some(Vec::new()),
+        trail_stop_price: None,
+    };
+    change(&mut info);
+    TwsEvent::OpenOrder { order_id, details: Some(Box::new(info)) }
 }
 
 fn placed_orders(sent: &[TwsCommand]) -> Vec<(i32, IbOrder)> {
@@ -556,7 +619,7 @@ fn trade_with_attached_exits() -> (App, std::sync::mpsc::Receiver<TwsCommand>, i
     (bare.stop_order_id, bare.profit_order_id, bare.profit_price, bare.oca_group, bare.adjustments) = (None, None, None, None, None);
     bare.set_stop(None);
     app.trades_stored[0] = bare;
-    app.request_exits(0);
+    app.open_exits_answered(0);
     app.exits_pending.as_mut().unwrap().stop = "0.9".to_string();
     app.exits_pending.as_mut().unwrap().target = "0.15".to_string();
     app.exits_pending.as_mut().unwrap().stop_unit = Some(attach::ExitUnit::Price);

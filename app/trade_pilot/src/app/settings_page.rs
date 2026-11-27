@@ -538,6 +538,21 @@ impl App {
                 );
             }
         });
+        ui.add_space(14.0);
+
+        // Alerts go out by email and by webhook alike, each channel as set up above.
+        white_card(ui, |ui| {
+            section_header(ui, self.tr("Alerts", "Warnmeldungen"));
+            setting_row(ui, self.tr("Missing Stop Notifications", "Benachrichtigungen bei fehlendem Stop"), "", |ui| {
+                toggle_switch(ui, &mut self.settings.alert_flags.missing_stop_notifications_enabled);
+            });
+            setting_row(ui, self.tr("High Slippage Notifications", "Benachrichtigungen bei hoher Slippage"), "", |ui| {
+                toggle_switch(ui, &mut self.settings.alert_flags.high_slippage_notifications_enabled);
+            });
+            setting_row(ui, self.tr("% Slippage to Notify", "% Slippage f\u{fc}r Benachrichtigung"), "", |ui| {
+                crate::widgets::metal_field(ui, egui::TextEdit::singleline(&mut self.settings.high_slippage_pct).desired_width(80.0));
+            });
+        });
     }
 
     /// Settings > Trading Features. The stop conversions act through `stop_conversion`, the full stop split through `stop_split`, the
@@ -953,15 +968,6 @@ impl App {
                 let market = self.settings.stop_flags.close_beyond_stop_market_order;
                 ui.label(if market { self.tr("Market", "Market") } else { self.tr("Limit", "Limit") });
                 toggle_switch(ui, &mut self.settings.stop_flags.close_beyond_stop_market_order);
-            });
-            setting_row(ui, self.tr("Missing Stop Notifications", "Benachrichtigungen bei fehlendem Stop"), "", |ui| {
-                toggle_switch(ui, &mut self.settings.alert_flags.missing_stop_notifications_enabled);
-            });
-            setting_row(ui, self.tr("High Slippage Notifications", "Benachrichtigungen bei hoher Slippage"), "", |ui| {
-                toggle_switch(ui, &mut self.settings.alert_flags.high_slippage_notifications_enabled);
-            });
-            setting_row(ui, self.tr("% Slippage to Notify", "% Slippage f\u{fc}r Benachrichtigung"), "", |ui| {
-                crate::widgets::metal_field(ui, egui::TextEdit::singleline(&mut self.settings.high_slippage_pct).desired_width(80.0));
             });
             setting_row(
                 ui,

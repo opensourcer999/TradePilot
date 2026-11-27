@@ -51,7 +51,7 @@ fn at_second(app: &mut App, seconds: u64) {
 
 /// The stop is changed in the window to `price` and TWS confirms it.
 fn change_stop(app: &mut App, commands: &mpsc::Receiver<TwsCommand>, price: &str) {
-    app.request_exits(0);
+    app.open_exits_answered(0);
     let pending = app.exits_pending.as_mut().expect("the stop can be changed");
     pending.stop = price.into();
     pending.stop_unit = Some(attach::ExitUnit::Price);
@@ -82,7 +82,7 @@ fn changed_stop_then_restart_then_the_target_filled_meanwhile_closes_the_trade_e
     assert_eq!((trade.status.as_str(), trade.price_close), ("Closed", Some(Decimal::new(-15, 2))));
     assert!(warnings(&app).is_empty(), "the stop cancelled by its OCA group is no problem: {:?}", warnings(&app));
     // The trade offers no stop / target any more.
-    app.request_exits(0);
+    app.open_exits_answered(0);
     assert!(app.exits_pending.is_none());
     app.request_close(0, CloseKind::Market);
     assert!(app.close_pending.is_none());
@@ -115,7 +115,7 @@ fn the_stop_deleted_in_tws_while_the_app_was_closed_is_reported_and_a_new_one_ca
     assert!(warnings(&app).iter().any(|l| l.contains("NO stop")), "{:?}", warnings(&app));
 
     // A new stop joins the group of the target that still works.
-    app.request_exits(0);
+    app.open_exits_answered(0);
     let pending = app.exits_pending.as_mut().expect("a stop can be attached");
     pending.stop = "300%".into();
     app.confirm_exits();
@@ -132,7 +132,7 @@ fn the_stop_deleted_in_tws_while_the_app_was_closed_is_reported_and_a_new_one_ca
 fn a_stop_change_that_tws_confirms_only_after_a_dropped_connection_still_reaches_the_trade() {
     let (mut app, commands) = app_with_a_sent_template_order(true);
     filled_trade_with_exits(&mut app, &commands);
-    app.request_exits(0);
+    app.open_exits_answered(0);
     let pending = app.exits_pending.as_mut().unwrap();
     pending.stop = "1.10".into();
     pending.stop_unit = Some(attach::ExitUnit::Price);
@@ -190,7 +190,7 @@ fn a_stop_adjusted_and_then_changed_by_hand_is_the_stop_everywhere_until_the_tra
     assert_eq!(app.trade_row_views()[0].stop, "0.30");
 
     // The user moves it to 0.50 by hand; TWS confirms.
-    app.request_exits(0);
+    app.open_exits_answered(0);
     let pending = app.exits_pending.as_mut().unwrap();
     assert_eq!(pending.stop, "0.3", "the window starts from the stop that works");
     pending.stop = "0.50".into();
@@ -209,46 +209,11 @@ fn a_stop_adjusted_and_then_changed_by_hand_is_the_stop_everywhere_until_the_tra
     assert_eq!((trade.status.as_str(), trade.price_close), ("Stopped", Some(Decimal::new(-55, 2))));
 }
 
-/// A working order as TWS reports it in its `openOrder` message.
-fn working(order_id: i32, order_type: &str, limit_price: Option<f64>, aux_price: Option<f64>) -> TwsEvent {
-    working_with(order_id, order_type, limit_price, aux_price, |_| {})
-}
-
-/// `working` with a field of the message changed (`change`).
-fn working_with(
-    order_id: i32,
-    order_type: &str,
-    limit_price: Option<f64>,
-    aux_price: Option<f64>,
-    change: impl FnOnce(&mut broker::OpenOrderInfo),
-) -> TwsEvent {
-    let mut info = broker::OpenOrderInfo {
-        order_id,
-        con_id: 0,
-        symbol: "SPX".into(),
-        sec_type: "BAG".into(),
-        expiry: String::new(),
-        strike: 0.0,
-        right: String::new(),
-        action: "BUY".into(),
-        total_quantity: 1.0,
-        order_type: order_type.into(),
-        limit_price,
-        aux_price,
-        tif: "DAY".into(),
-        oca_group: "TradePilot-11".into(),
-        account: "DU1234567".into(),
-        order_ref: String::new(),
-    };
-    change(&mut info);
-    TwsEvent::OpenOrder { order_id, details: Some(Box::new(info)) }
-}
-
 #[test]
 fn a_stop_change_sent_just_before_the_app_was_closed_is_taken_from_tws_after_the_restart() {
     let (mut app, commands) = app_with_a_sent_template_order(true);
     filled_trade_with_exits(&mut app, &commands);
-    app.request_exits(0);
+    app.open_exits_answered(0);
     let pending = app.exits_pending.as_mut().unwrap();
     pending.stop = "1.10".into();
     pending.stop_unit = Some(attach::ExitUnit::Price);
@@ -270,7 +235,9 @@ fn a_stop_change_sent_just_before_the_app_was_closed_is_taken_from_tws_after_the
     assert_eq!(app.trade_row_views()[0].stop, "1.10");
     assert!(app.log_lines.iter().any(|l| l.contains("The stop 11 of") && l.contains("is at 1.1 in TWS (0.9 on record) - taken over")), "{:?}", app.log_lines);
     assert!(warnings(&app).is_empty(), "{:?}", warnings(&app));
-    assert!(drain(&commands).is_empty(), "nothing is sent: TWS already has it");
+    let mut sent = drain(&commands);
+    answer_listing_of_all_clients(&mut app, &mut sent);
+    assert!(sent.is_empty(), "nothing is sent: TWS already has it");
 }
 
 #[test]
@@ -317,7 +284,7 @@ fn a_lost_link_between_tws_and_ib_keeps_the_session_and_compares_the_orders_once
     assert!(app.log_lines.iter().any(|l| l.contains("TWS answered on the API connection") && l.contains("the socket is open")), "{:?}", app.log_lines);
     // While TWS has no link to IB no order goes out, and the person sees why: in the window and on the screen.
     assert!(app.order_block_note().is_some_and(|note| note.contains("1100")), "the windows that send orders show it");
-    app.request_exits(0);
+    app.open_exits_answered(0);
     let pending = app.exits_pending.as_mut().unwrap();
     pending.stop = "1.20".into();
     pending.stop_unit = Some(attach::ExitUnit::Price);
@@ -408,7 +375,7 @@ fn a_trade_opened_and_closed_by_another_instance_is_shown_closed_after_the_conne
     assert_eq!(trade.price_open, Decimal::new(75, 2));
     // Nothing can be done with a closed trade: no stop, target or close is offered.
     let index = app.trades_stored.iter().position(|t| t.strikes == "7110/7105 P").unwrap();
-    app.request_exits(index);
+    app.open_exits_answered(index);
     assert!(app.exits_pending.is_none());
 }
 
@@ -553,4 +520,394 @@ fn the_executions_of_the_day_sent_again_are_listed_once() {
     app.poll_tws();
     assert_eq!(app.today_trades.len(), 4, "four fills, each once");
     assert_eq!(app.exec_history.len(), 4);
+}
+
+#[test]
+fn the_orders_of_other_clients_are_listed_once_after_the_reconciliation_and_change_nothing() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    filled_trade_with_exits(&mut app, &commands);
+    let before = app.trades_stored.clone();
+    app.tws_sender.send(TwsEvent::AccountSummaryEnd).unwrap();
+    app.tws_sender.send(TwsEvent::ExecutionsEnd).unwrap();
+    app.poll_tws();
+    drain(&commands);
+    app.tws_sender.send(working(11, "STP", None, Some(0.9))).unwrap();
+    app.tws_sender.send(working(12, "LMT", Some(0.15), None)).unwrap();
+    app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
+    app.poll_tws();
+    assert_eq!(drain(&commands).iter().filter(|c| matches!(c, TwsCommand::RequestAllOpenOrders)).count(), 1);
+    // The answer: this client's orders again, and an order of client 7 that has the id of this app's stop.
+    app.tws_sender.send(working(11, "STP", None, Some(0.9))).unwrap();
+    let TwsEvent::OpenOrder { details: Some(mut other), .. } = working(11, "STP", None, Some(5.0)) else { unreachable!() };
+    other.client_id = 7;
+    other.perm_id = 424_242;
+    other.order_ref = "my stop".into();
+    app.tws_sender.send(TwsEvent::OtherClientOrder(other)).unwrap();
+    app.tws_sender.send(TwsEvent::OtherClientOrderStatus { order_id: 11, client_id: 7, perm_id: Some(424_242), status: "Cancelled".into() }).unwrap();
+    app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
+    app.poll_tws();
+    assert!(
+        app.log_lines.iter().any(|l| l.contains("TWS order of another client (client 7, perm id 424242, order 11)") && l.contains("ref 'my stop'")),
+        "{:?}",
+        app.log_lines
+    );
+    assert!(app.log_lines.iter().any(|l| l.contains("TWS working orders of all API clients listed: 1 of other clients")), "{:?}", app.log_lines);
+    assert_eq!(app.trades_stored, before, "the stop 11 of this app keeps its price and stays working");
+    assert!(drain(&commands).is_empty(), "nothing is sent and nothing is reconciled again");
+    // Later answers of the same session do not ask again.
+    app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
+    app.poll_tws();
+    assert!(drain(&commands).is_empty());
+}
+
+/// A stop entered by hand in TWS on contract `con_id` of `account`: as TWS reports such an order, client 0, order id 0, known by its
+/// perm id.
+fn stop_entered_in_tws(con_id: i32, account: &str) -> broker::OpenOrderInfo {
+    let TwsEvent::OpenOrder { details: Some(mut order), .. } = working(0, "STP", None, Some(5.0)) else { unreachable!() };
+    order.client_id = 0;
+    order.perm_id = 622_296_617;
+    order.sec_type = "OPT".into();
+    order.con_id = con_id;
+    order.account = account.to_string();
+    *order
+}
+
+#[test]
+fn no_stop_is_sent_while_an_order_entered_in_tws_works_on_a_leg_of_the_trade() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    filled_trade_with_exits(&mut app, &commands);
+    let account = app.trades_stored[0].account.clone();
+    // Opening the window asks TWS what other clients have working; until the answer is complete nothing is sent.
+    app.request_exits(0);
+    assert_eq!(drain(&commands).iter().filter(|c| matches!(c, TwsCommand::RequestAllOpenOrders)).count(), 1);
+    let pending = app.exits_pending.as_mut().unwrap();
+    pending.stop = "1.20".into();
+    pending.stop_unit = Some(attach::ExitUnit::Price);
+    app.confirm_exits();
+    assert!(placed_orders(&drain(&commands)).is_empty());
+    assert!(app.log_lines.iter().any(|l| l.contains("Blocked stop/target: Waiting for TWS to list the orders of other programs")), "{:?}", app.log_lines);
+    // The answer: a stop entered by hand on the short put (contract 100).
+    app.tws_sender.send(TwsEvent::OtherClientOrder(Box::new(stop_entered_in_tws(100, &account)))).unwrap();
+    app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
+    app.poll_tws();
+    app.confirm_exits();
+    assert!(placed_orders(&drain(&commands)).is_empty(), "a second stop would not share the OCA group of the one in TWS");
+    assert!(
+        app.log_lines.iter().any(|l| l.contains("Orders that are not TradePilot's work on contracts of this trade in TWS: BUY 1 STP (perm id 622296617)")),
+        "{:?}",
+        app.log_lines
+    );
+    assert!(app.exits_pending.is_some(), "the window stays open with the prices typed");
+    // Cancelled in TWS: now the change goes out.
+    app.tws_sender.send(TwsEvent::OtherClientOrderStatus { order_id: 0, client_id: 0, perm_id: Some(622_296_617), status: "Cancelled".into() }).unwrap();
+    app.poll_tws();
+    app.confirm_exits();
+    assert_eq!(placed_orders(&drain(&commands)).iter().map(|(id, _)| *id).collect::<Vec<_>>(), [11], "the stop is re-sent under its id");
+}
+
+#[test]
+fn an_order_entered_in_tws_on_other_contracts_does_not_hold_back_the_stop() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    filled_trade_with_exits(&mut app, &commands);
+    let account = app.trades_stored[0].account.clone();
+    app.request_exits(0);
+    app.tws_sender.send(TwsEvent::OtherClientOrder(Box::new(stop_entered_in_tws(999, &account)))).unwrap();
+    app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
+    app.poll_tws();
+    drain(&commands);
+    let pending = app.exits_pending.as_mut().unwrap();
+    pending.stop = "1.20".into();
+    pending.stop_unit = Some(attach::ExitUnit::Price);
+    app.confirm_exits();
+    assert_eq!(placed_orders(&drain(&commands)).iter().map(|(id, _)| *id).collect::<Vec<_>>(), [11]);
+}
+
+/// A put held on account DU1234567 that expires 18-12-2026, as TWS reports a position.
+fn put_held(con_id: i32, strike: f64, quantity: f64, average_cost: f64) -> broker::Position {
+    broker::Position {
+        account: "DU1234567".into(),
+        contract_id: con_id.to_string(),
+        symbol: "SPX".into(),
+        security_type: "OPT".into(),
+        expiry: "20261218".into(),
+        strike,
+        right: "P".into(),
+        multiplier: Some(100.0),
+        quantity,
+        average_cost: Some(average_cost),
+    }
+}
+
+/// A put spread opened by hand in TWS on an earlier day: short 6650 at 1.20, long 6640 at 0.50, two contracts; both legs ticked.
+fn spread_opened_in_tws(app: &mut App) {
+    app.tws_sender.send(TwsEvent::Position(put_held(701, 6650.0, -2.0, 120.0))).unwrap();
+    app.tws_sender.send(TwsEvent::Position(put_held(702, 6640.0, 2.0, 50.0))).unwrap();
+    app.tws_sender.send(TwsEvent::PositionsEnd).unwrap();
+    app.poll_tws();
+    app.import.selection = vec![("DU1234567".to_string(), 701), ("DU1234567".to_string(), 702)];
+}
+
+#[test]
+fn positions_opened_in_tws_are_taken_over_as_an_open_trade_once_tws_has_listed_the_orders_of_other_programs() {
+    let (mut app, commands) = connected_app();
+    spread_opened_in_tws(&mut app);
+    app.open_import();
+    assert_eq!(app.import.pending.as_ref().map(|p| p.price.as_str()), Some("0.7"), "1.20 received, 0.50 paid");
+    assert_eq!(drain(&commands).iter().filter(|c| matches!(c, TwsCommand::RequestAllOpenOrders)).count(), 1);
+    app.confirm_import();
+    assert_eq!(app.trades_stored.len(), 0, "not before TWS has listed the orders of other programs");
+    assert!(app.log_lines.iter().any(|l| l.contains("Import from TWS positions refused: Waiting for TWS to list")), "{:?}", app.log_lines);
+    app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
+    app.poll_tws();
+    app.confirm_import();
+    let trade = app.trades_stored.first().expect("taken over").clone();
+    assert_eq!((trade.order_id, trade.label().as_str(), trade.qty, trade.status.as_str()), (-1, "SPX PutSpread 6650/6640 P", 2, "Open"));
+    assert_eq!((trade.price_open, trade.multiplier, trade.expiry.as_str()), (Decimal::new(7, 1), 100, "20261218"));
+    assert!(
+        app.log_lines.iter().any(|l| l.contains("Trade imported from TWS positions: TraPi-Imp-1 SPX PutSpread 6650/6640 P x2")
+            && l.contains("entry 0.7 (the average cost TWS reports)")),
+        "{:?}",
+        app.log_lines
+    );
+    assert_eq!(crate::unmanaged::unmanaged_positions(&app.positions, &app.trades_stored), Some(Vec::new()), "the positions belong to it now");
+    assert!(app.import.selection.is_empty() && app.import.pending.is_none());
+    assert!(placed_orders(&drain(&commands)).is_empty(), "nothing is sent to TWS");
+}
+
+#[test]
+fn a_typed_entry_price_is_the_trades_and_an_order_of_another_program_on_a_leg_holds_the_import_back() {
+    let (mut app, commands) = connected_app();
+    spread_opened_in_tws(&mut app);
+    app.open_import();
+    // A stop entered by hand in TWS on the short put.
+    let TwsEvent::OpenOrder { details: Some(mut stop), .. } = working(0, "STP", None, Some(5.0)) else { unreachable!() };
+    (stop.client_id, stop.perm_id, stop.sec_type, stop.con_id) = (0, 622_296_617, "OPT".into(), 701);
+    app.tws_sender.send(TwsEvent::OtherClientOrder(stop)).unwrap();
+    app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
+    app.poll_tws();
+    app.import.pending.as_mut().unwrap().price = "0,65".into();
+    app.confirm_import();
+    assert_eq!(app.trades_stored.len(), 0);
+    assert!(app.log_lines.iter().any(|l| l.contains("Import from TWS positions refused: Orders that are not TradePilot's")), "{:?}", app.log_lines);
+    // Cancelled in TWS: taken over at the typed price.
+    app.tws_sender.send(TwsEvent::OtherClientOrderStatus { order_id: 0, client_id: 0, perm_id: Some(622_296_617), status: "Cancelled".into() }).unwrap();
+    app.poll_tws();
+    app.confirm_import();
+    assert_eq!(app.trades_stored.first().map(|t| t.price_open), Some(Decimal::new(65, 2)));
+    assert!(app.log_lines.iter().any(|l| l.contains("entry 0.65 (typed; 0.7 proposed)")), "{:?}", app.log_lines);
+    assert!(placed_orders(&drain(&commands)).is_empty());
+}
+
+#[test]
+fn legs_that_do_not_make_one_trade_or_an_empty_price_are_not_taken_over() {
+    let (mut app, _commands) = connected_app();
+    spread_opened_in_tws(&mut app);
+    app.open_import();
+    app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
+    app.poll_tws();
+    app.import.pending.as_mut().unwrap().price = String::new();
+    app.confirm_import();
+    assert_eq!(app.trades_stored.len(), 0);
+    assert!(app.log_lines.iter().any(|l| l.contains("refused: enter the entry price")), "{:?}", app.log_lines);
+    // A leg of another underlying.
+    app.tws_sender.send(TwsEvent::Position(broker::Position { symbol: "RUT".into(), ..put_held(703, 2400.0, -1.0, 300.0) })).unwrap();
+    app.poll_tws();
+    app.import.selection.push(("DU1234567".to_string(), 703));
+    app.import.pending.as_mut().unwrap().legs = app.import.selection.clone();
+    app.import.pending.as_mut().unwrap().price = "0.7".into();
+    app.confirm_import();
+    assert_eq!(app.trades_stored.len(), 0);
+    assert!(app.log_lines.iter().any(|l| l.contains("refused: the positions are on different underlyings")), "{:?}", app.log_lines);
+}
+
+#[test]
+fn stop_and_target_of_a_debit_trade_are_the_value_it_is_sold_at_and_percentages_of_the_debit() {
+    use super::attach::{typed_stop, typed_target, ExitUnit};
+    let debit = Decimal::new(-200, 2);
+    assert_eq!(typed_stop("50%", ExitUnit::Percent, debit), Some(Decimal::ONE), "50% of the 2.00 paid lost: sold at 1.00");
+    assert_eq!(typed_stop("100%", ExitUnit::Percent, debit), None, "a stop at 0 never triggers");
+    assert_eq!(typed_target("50%", ExitUnit::Percent, debit), Some(Decimal::new(300, 2)), "50% gained: sold at 3.00");
+    assert_eq!(typed_target("150%", ExitUnit::Percent, debit), Some(Decimal::new(500, 2)), "a debit can gain more than 100%");
+    assert_eq!(typed_stop("1.20", ExitUnit::Price, debit), Some(Decimal::new(120, 2)), "a price stays a price");
+}
+
+/// The price that counts for an exit order: the trigger of a stop, the limit of a limit order.
+fn price_of(order: &IbOrder) -> f64 {
+    if order.order_type == "STP" {
+        order.aux_price
+    } else {
+        order.lmt_price
+    }
+}
+
+/// Takes the ticked positions over as a trade (TWS lists no orders of other programs) and returns its index.
+fn take_over(app: &mut App, legs: &[(i32, f64, f64, f64)]) -> usize {
+    for (con_id, strike, quantity, cost) in legs {
+        app.tws_sender.send(TwsEvent::Position(put_held(*con_id, *strike, *quantity, *cost))).unwrap();
+    }
+    app.tws_sender.send(TwsEvent::PositionsEnd).unwrap();
+    app.poll_tws();
+    app.import.selection = legs.iter().map(|(con_id, ..)| ("DU1234567".to_string(), *con_id)).collect();
+    app.open_import();
+    app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
+    app.poll_tws();
+    app.confirm_import();
+    app.trades_stored.iter().position(|t| t.order_id < 0).expect("taken over")
+}
+
+#[test]
+fn a_long_put_taken_over_gets_a_stop_below_and_a_target_above_what_selling_it_brings() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    // The put 6680 of the chain (bid 1.55), bought for 2.00.
+    let index = take_over(&mut app, &[(101, 6680.0, 1.0, 200.0)]);
+    assert_eq!((app.trades_stored[index].trade_type.as_str(), app.trades_stored[index].price_open), ("LongPut", Decimal::new(-2, 0)));
+    drain(&commands);
+    app.open_exits_answered(index);
+    let pending = app.exits_pending.as_mut().unwrap();
+    (pending.stop, pending.stop_unit) = ("1.60".into(), Some(attach::ExitUnit::Price));
+    app.confirm_exits();
+    assert!(placed_orders(&drain(&commands)).is_empty());
+    assert!(app.log_lines.iter().any(|l| l.contains("the stop is passed already (the trade brings 1.55 to close now)")), "{:?}", app.log_lines);
+    app.open_exits_answered(index);
+    let pending = app.exits_pending.as_mut().unwrap();
+    (pending.stop, pending.stop_unit) = ("50%".into(), Some(attach::ExitUnit::Percent));
+    (pending.target, pending.target_unit) = ("50%".into(), Some(attach::ExitUnit::Percent));
+    app.confirm_exits();
+    let placed = placed_orders(&drain(&commands));
+    let orders: Vec<(&str, &str, f64, f64)> = placed.iter().map(|(_, o)| (o.order_type.as_str(), o.action.as_str(), price_of(o), o.total_quantity)).collect();
+    assert_eq!(orders, [("STP", "SELL", 1.0, 1.0), ("LMT", "SELL", 3.0, 1.0)], "the put is sold: stopped at 1.00, the target at 3.00");
+    let trade = &app.trades_stored[index];
+    assert_eq!((trade.stop_now(), trade.target_now()), (Some(Decimal::ONE), Some(Decimal::new(3, 0))));
+}
+
+#[test]
+fn a_debit_spread_taken_over_is_bought_back_at_negative_prices_like_the_exits_of_a_template() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    // Long 6690 (bid 1.85) for 3.00, short 6680 (ask 1.65) for 1.00: a debit of 2.00, worth 0.20 to close now.
+    let index = take_over(&mut app, &[(100, 6690.0, 1.0, 300.0), (101, 6680.0, -1.0, 100.0)]);
+    assert_eq!((app.trades_stored[index].trade_type.as_str(), app.trades_stored[index].price_open), ("PutDebitSpread", Decimal::new(-2, 0)));
+    drain(&commands);
+    app.open_exits_answered(index);
+    let pending = app.exits_pending.as_mut().unwrap();
+    (pending.stop, pending.stop_unit) = ("0.10".into(), Some(attach::ExitUnit::Price));
+    (pending.target, pending.target_unit) = ("3".into(), Some(attach::ExitUnit::Price));
+    app.confirm_exits();
+    let placed = placed_orders(&drain(&commands));
+    let orders: Vec<(&str, &str, f64)> = placed.iter().map(|(_, o)| (o.order_type.as_str(), o.action.as_str(), price_of(o))).collect();
+    assert_eq!(orders, [("STP", "BUY", -0.1), ("LMT", "BUY", -3.0)], "{:?}", app.log_lines);
+    // The window shows the prices on record as the value again.
+    app.open_exits_answered(index);
+    let pending = app.exits_pending.as_ref().unwrap();
+    assert_eq!((pending.stop.as_str(), pending.target.as_str()), ("0.1", "3"));
+}
+
+#[test]
+fn the_exits_of_a_trade_taken_over_carry_its_name_and_the_selection_ends_once_they_are_sent() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    let index = take_over(&mut app, &[(101, 6680.0, 1.0, 200.0)]);
+    drain(&commands);
+    app.ui_state.selected_trade = Some(app.trades_stored[index].key());
+    app.open_exits_answered(index);
+    let pending = app.exits_pending.as_mut().unwrap();
+    (pending.stop, pending.stop_unit) = ("1.00".into(), Some(attach::ExitUnit::Price));
+    (pending.target, pending.target_unit) = ("3.00".into(), Some(attach::ExitUnit::Price));
+    app.confirm_exits();
+    let placed = placed_orders(&drain(&commands));
+    let refs: Vec<&str> = placed.iter().map(|(_, o)| o.order_ref.as_str()).collect();
+    assert_eq!(refs, ["TraPi-Imp-1 (SL)", "TraPi-Imp-1 (TP)"], "TWS shows which trade the orders belong to");
+    assert_eq!(app.ui_state.selected_trade, None, "the edit is done: nothing stays selected");
+    // The stop moved in TWS by hand keeps the reference: TWS's price is taken over, the reference is known as the trade's.
+    let stop_id = placed[0].0;
+    let TwsEvent::OpenOrder { details: Some(mut moved), .. } = working(stop_id, "STP", None, Some(0.9)) else { unreachable!() };
+    (moved.order_ref, moved.sec_type, moved.con_id, moved.action) = ("TraPi-Imp-1 (SL)".into(), "OPT".into(), 101, "SELL".into());
+    app.tws_sender.send(TwsEvent::OpenOrder { order_id: stop_id, details: Some(moved) }).unwrap();
+    app.poll_tws();
+    assert_eq!(app.trades_stored[index].stop_now(), Some(Decimal::new(9, 1)), "{:?}", app.log_lines);
+    assert!(!app.log_lines.iter().any(|l| l.contains("does not match")), "{:?}", app.log_lines);
+}
+
+#[test]
+fn a_selected_trade_is_no_longer_selected_once_a_close_order_for_it_went_out_but_stays_selected_after_a_refusal() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    filled_trade_with_exits(&mut app, &commands);
+    let key = app.trades_stored[0].key();
+    app.ui_state.selected_trade = Some(key.clone());
+    app.request_close(0, CloseKind::Limit);
+    app.close_pending.as_mut().unwrap().price = String::new();
+    app.confirm_close();
+    assert_eq!(app.ui_state.selected_trade.as_deref(), Some(key.as_str()), "nothing was done: still selected");
+    app.request_close(0, CloseKind::Limit);
+    app.close_pending.as_mut().unwrap().price = "0.20".into();
+    app.confirm_close();
+    assert!(placed_orders(&drain(&commands)).iter().any(|(_, o)| o.order_ref.ends_with("(Close)")));
+    assert_eq!(app.ui_state.selected_trade, None);
+}
+
+#[test]
+fn a_trade_on_a_symbol_no_setting_follows_gets_its_chain_and_quotes_for_its_legs_only() {
+    let (mut app, commands) = connected_app();
+    // The chains of the settings are running (SPX).
+    app.chains.symbols = crate::option_chain::ChainSymbol::from_settings(&[]);
+    app.chains.underlyings.push(Underlying { symbol: "SPX".into(), req_id: 1, price: Some(6700.0), price_at: Some(Instant::now()), chain_requested: true });
+    // An INTC put spread opened by hand in TWS, taken over: short 60 at 2.00, long 55 at 0.50.
+    let intc = |con_id: i32, strike: f64, quantity: f64, cost: f64| broker::Position { symbol: "INTC".into(), ..put_held(con_id, strike, quantity, cost) };
+    app.tws_sender.send(TwsEvent::Position(intc(860, 60.0, -1.0, 200.0))).unwrap();
+    app.tws_sender.send(TwsEvent::Position(intc(855, 55.0, 1.0, 50.0))).unwrap();
+    app.tws_sender.send(TwsEvent::PositionsEnd).unwrap();
+    app.poll_tws();
+    app.import.selection = vec![("DU1234567".to_string(), 860), ("DU1234567".to_string(), 855)];
+    app.open_import();
+    app.tws_sender.send(TwsEvent::OpenOrderEnd).unwrap();
+    app.poll_tws();
+    app.confirm_import();
+    assert_eq!(app.trades_stored.first().map(StoredTrade::label), Some("INTC PutSpread 60/55 P".to_string()));
+    drain(&commands);
+
+    app.manage_chain_subscriptions(Instant::now(), true);
+    let sent = drain(&commands);
+    let underlying = sent.iter().find_map(|c| match c {
+        TwsCommand::RequestMarketData { req_id, contract } if contract.symbol == "INTC" && contract.sec_type == "STK" => Some(*req_id),
+        _ => None,
+    });
+    let lookup = sent.iter().find_map(|c| match c {
+        TwsCommand::RequestContractDetails { req_id, contract } if contract.symbol == "INTC" && contract.last_trade_date_or_contract_month == "20261218" => {
+            Some(*req_id)
+        }
+        _ => None,
+    });
+    let (Some(underlying), Some(lookup)) = (underlying, lookup) else { panic!("INTC and its 18-12-2026 chain are asked for: {:?}", app.log_lines) };
+    app.manage_chain_subscriptions(Instant::now(), true);
+    assert!(!drain(&commands).iter().any(|c| matches!(c, TwsCommand::RequestContractDetails { .. })), "each chain once");
+
+    // TWS answers: three puts of the chain and a price of INTC.
+    for (con_id, strike) in [(855, 55.0), (857, 57.5), (860, 60.0)] {
+        app.tws_sender
+            .send(TwsEvent::ContractDetails(broker::ContractData {
+                req_id: lookup,
+                con_id,
+                symbol: "INTC".into(),
+                sec_type: "OPT".into(),
+                expiry: "20261218".into(),
+                strike,
+                right: "P".into(),
+                exchange: "SMART".into(),
+                currency: "USD".into(),
+                local_symbol: String::new(),
+                trading_class: "INTC".into(),
+            }))
+            .unwrap();
+    }
+    app.tws_sender.send(TwsEvent::ContractDetailsEnd { req_id: lookup }).unwrap();
+    app.tws_sender.send(TwsEvent::TickPrice { ticker_id: underlying, tick_type: broker::TICK_LAST, price: 57.5 }).unwrap();
+    app.poll_tws();
+    app.manage_chain_subscriptions(Instant::now(), true);
+    let mut quoted: Vec<i32> = drain(&commands)
+        .iter()
+        .filter_map(|c| match c {
+            TwsCommand::RequestMarketData { contract, .. } if contract.sec_type == "OPT" => Some(contract.con_id),
+            _ => None,
+        })
+        .collect();
+    quoted.sort_unstable();
+    assert_eq!(quoted, [855, 860], "the legs of the trade, not the 57.5 at the price");
 }

@@ -178,7 +178,7 @@ fn deleting_the_target_after_a_level_filled_cancels_only_the_working_level() {
     assert!(!app.log_lines.iter().any(|l| l.contains("WARNING")), "{:?}", app.log_lines);
 
     // A new target for the 2 contracts still open becomes the next level: the trade has a target again and the list shows it.
-    app.request_exits(0);
+    app.open_exits_answered(0);
     let pending = app.exits_pending.as_mut().expect("the target can be attached");
     pending.target = "0.05".to_string();
     pending.target_unit = Some(attach::ExitUnit::Price);
@@ -565,7 +565,7 @@ fn a_dialog_acts_on_its_own_trade_also_when_the_list_moved_while_it_was_open() {
     // The same for "Stop / target": the window was opened for a trade that is gone from the list now - nothing is sent.
     let (mut app, commands) = app_with_a_sent_template_order(true);
     filled_trade_with_exits(&mut app, &commands);
-    app.request_exits(0);
+    app.open_exits_answered(0);
     let pending = app.exits_pending.as_mut().unwrap();
     pending.stop = "1.5".into();
     app.trades_stored[0] = other;

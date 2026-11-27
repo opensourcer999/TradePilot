@@ -43,6 +43,42 @@ pub fn order_ref(id: i32, kind: &str) -> String {
     }
 }
 
+/// The name of a trade taken over from positions (`unmanaged::import_trade`), in the style of the references above: `TraPi-Imp-3`
+/// for order id -3; `None` for the id of a real order. It is no order reference: such a trade had no opening order of this app.
+#[must_use]
+pub fn import_ref(order_id: i32) -> Option<String> {
+    (order_id < 0).then(|| format!("TraPi-Imp-{}", order_id.unsigned_abs()))
+}
+
+/// The reference of the exit order `id` (`kind`: "SL", "TP" or "Close") of the trade with the order id `trade_id`: `TraPi-13 (SL)`, the
+/// order's own id; for a trade taken over from positions the trade's name, `TraPi-Imp-1 (SL)`, so its orders show in TWS which trade
+/// they belong to.
+#[must_use]
+pub fn exit_order_ref(trade_id: i32, id: i32, kind: &str) -> String {
+    match import_ref(trade_id) {
+        Some(name) => format!("{name} ({kind})"),
+        None => order_ref(id, kind),
+    }
+}
+
+/// Whether `reference` is one this app gives the exit order `id` of the trade with the order id `trade_id` (`exit_order_ref`), or no
+/// reference of this app at all (an order from before the references, or changed by hand).
+#[must_use]
+pub fn is_exit_ref_of(reference: &str, trade_id: i32, id: i32) -> bool {
+    if let Some(name) = import_ref(trade_id) {
+        if reference.strip_prefix(name.as_str()).is_some_and(|rest| rest.starts_with(" (")) {
+            return true;
+        }
+    }
+    reference.strip_prefix("TraPi-").is_none_or(|rest| rest.split(' ').next() == Some(id.to_string().as_str()))
+}
+
+/// How a trade is named by its `order_id` on the screen and in the log: the reference of its opening order, or its import name.
+#[must_use]
+pub fn trade_ref(order_id: i32) -> String {
+    import_ref(order_id).unwrap_or_else(|| order_ref(order_id, ""))
+}
+
 /// The order id in an opening reference: `TraPi-12`, or the shorter `TP-12` and the longer `TradePilot OrderID: 12 (Opening)` of earlier versions.
 #[must_use]
 pub fn opening_order_id(order_ref: &str) -> Option<i32> {
@@ -186,7 +222,7 @@ fn custom_strikes_text(legs: &[crate::records::CustomLegStored]) -> String {
 /// One opening order as a trade (status "Open"); `None` for a price that cannot be computed. A leg combination without a standard
 /// type is a custom trade when the order is one of this app (`allow_custom`), else nothing: an order without the reference of the app
 /// (one that closes a calendar by hand, say) must not turn into a trade.
-fn opening_trade(order_id: i32, execs: &[&StoredExecution], allow_custom: bool) -> Option<StoredTrade> {
+pub(crate) fn opening_trade(order_id: i32, execs: &[&StoredExecution], allow_custom: bool) -> Option<StoredTrade> {
     let first = execs.first()?;
     let legs = merge_legs(execs)?;
     // A set of legs this app has no standard type for is a custom trade; one that fits a standard type is rebuilt as that type.
@@ -857,5 +893,19 @@ mod tests {
         assert_eq!(rebuild(std::slice::from_ref(&close), &[]), Rebuilt::default());
         let found = rebuild(&[exec("z", T, 99, "", 31, "P", 7000.0, "SLD", 1.0, 2.0), close], &[]);
         assert_eq!(found.new.iter().map(|t| (t.order_id, t.trade_type.as_str())).collect::<Vec<_>>(), [(99, "ShortPut")]);
+    }
+
+    #[test]
+    fn the_exit_orders_of_a_trade_taken_over_carry_its_name_and_are_known_by_it() {
+        assert_eq!(exit_order_ref(12, 13, "SL"), "TraPi-13 (SL)", "an order of this app: its own id");
+        assert_eq!(exit_order_ref(-1, 148, "SL"), "TraPi-Imp-1 (SL)");
+        assert_eq!(exit_order_ref(-1, 149, "TP"), "TraPi-Imp-1 (TP)");
+        assert!(is_exit_ref_of("TraPi-13 (SL)", 12, 13));
+        assert!(!is_exit_ref_of("TraPi-14 (SL)", 12, 13), "another order's reference");
+        assert!(is_exit_ref_of("TraPi-Imp-1 (SL)", -1, 148));
+        assert!(!is_exit_ref_of("TraPi-Imp-2 (SL)", -1, 148), "another taken-over trade");
+        assert!(!is_exit_ref_of("TraPi-Imp-10 (SL)", -1, 148), "not a prefix of a longer name");
+        assert!(is_exit_ref_of("", -1, 148), "no reference of this app");
+        assert_eq!(opening_order_id("TraPi-Imp-1 (SL)"), None, "never taken for an opening order");
     }
 }

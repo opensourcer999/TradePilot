@@ -81,7 +81,7 @@ fn a_stop_that_fills_far_beyond_its_price_and_a_missing_stop_are_reported_when_t
     // The stop is 0.90; it filled at 1.80: 100 % beyond it.
     app.tws_sender.send(TwsEvent::OrderStatus { order_id: 11, status: "Filled".into(), filled: 1.0, remaining: 0.0, avg_fill_price: 1.8 }).unwrap();
     app.poll_tws();
-    assert!(mail_lines(&app).iter().any(|l| l.contains("\"ALERT: Stop filled with high slippage (")), "{:?}", mail_lines(&app));
+    assert!(mail_lines(&app).iter().any(|l| l.contains("\"TradePilot: ALERT: Stop filled with high slippage (")), "{:?}", mail_lines(&app));
 
     let (mut app, commands) = app_with_a_sent_template_order(true);
     app.settings.alert_flags.high_slippage_notifications_enabled = true;
@@ -97,7 +97,7 @@ fn a_stop_that_fills_far_beyond_its_price_and_a_missing_stop_are_reported_when_t
     filled_trade_with_exits(&mut app, &commands);
     app.reconcile_open_orders(&[12]);
     app.poll_tws();
-    assert!(mail_lines(&app).iter().any(|l| l.contains("\"ALERT: Trade without a stop\"")), "{:?}", mail_lines(&app));
+    assert!(mail_lines(&app).iter().any(|l| l.contains("\"TradePilot: ALERT: Trade without a stop\"")), "{:?}", mail_lines(&app));
 }
 
 #[test]

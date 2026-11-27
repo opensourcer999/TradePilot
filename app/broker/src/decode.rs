@@ -1,8 +1,8 @@
 //! Decoders: what a message from TWS says, as events and values.
 
 use crate::{
-    ContractData, ExecutionRow, OpenOrderInfo, PortfolioRow, Position, TwsEvent, IB_ACCOUNT_SUMMARY_REQUEST_ID, IN_MARKET_DATA_TYPE, IN_TICK_GENERIC,
-    IN_TICK_REQ_PARAMS, IN_TICK_STRING,
+    ContractData, ExecutionRow, OpenOrderInfo, OpenOrderLeg, PortfolioRow, Position, TwsEvent, IB_ACCOUNT_SUMMARY_REQUEST_ID, IN_MARKET_DATA_TYPE,
+    IN_TICK_GENERIC, IN_TICK_REQ_PARAMS, IN_TICK_STRING,
 };
 
 /// IB's documented convention for paper-trading account identifiers (e.g. "DU1234567"), used only
@@ -13,6 +13,19 @@ use crate::{
 #[must_use]
 pub fn looks_like_paper_account(account_id: &str) -> bool {
     account_id.trim().to_ascii_uppercase().starts_with("DU")
+}
+
+/// Masks an account number for the log and mails: first 4 + "***" + last 4 characters (8+ long only). The input may look like
+/// "IB:DU1234567", so "IB:" counts towards the first 4.
+#[must_use]
+pub fn mask_account(account: &str) -> String {
+    let len = account.chars().count();
+    if len < 8 {
+        return account.to_string();
+    }
+    let head: String = account.chars().take(4).collect();
+    let tail: String = account.chars().skip(len - 4).collect();
+    format!("{head}***{tail}")
 }
 
 /// `IBApi.EDecoder.HistoricalDataUpdateEvent`: reqId, bar count, then date, open, close, high, low, wap, volume of the
@@ -50,19 +63,37 @@ pub fn parse_historical_bars(fields: &[String]) -> Option<Vec<TwsEvent>> {
 /// 145 (`ORDER_CONTAINER`) a version field comes first, from 145 on the order id directly.
 #[must_use]
 pub fn parse_open_order_id(fields: &[String], server_version: i32) -> Option<i32> {
-    let index = if server_version < 145 { 2 } else { 1 };
-    fields.get(index)?.parse().ok()
+    fields.get(open_order_first_field(server_version))?.parse().ok()
 }
+
+/// The place of the order id in an `openOrder`: after the message version below server version 145, else right after the message id.
+#[must_use]
+pub fn open_order_first_field(server_version: i32) -> usize {
+    if server_version < 145 {
+        2
+    } else {
+        1
+    }
+}
+
+/// The account of an `openOrder`, counted from its order id (see `parse_open_order`).
+pub const OPEN_ORDER_ACCOUNT: usize = 19;
+
+/// The permId of an `openOrder`, counted from its order id: the last field `parse_open_order` reads.
+pub const OPEN_ORDER_PERM_ID: usize = 24;
+
+/// The account of an `updatePortfolio`, its last field (see `parse_portfolio_value`).
+pub const PORTFOLIO_ACCOUNT: usize = 19;
 
 /// The message version of an `openOrder` from which every contract field this reads is sent (multiplier and trading class).
 const OPEN_ORDER_FULL_CONTRACT: i32 = 32;
 
 /// The head of an `openOrder` message (`IBApi.EDecoder.OpenOrderEvent` with its `OrderDecoder`): the order id, the contract (conId,
 /// symbol, secType, expiry, strike, right, multiplier, exchange, currency, localSymbol, tradingClass), then action, totalQuantity,
-/// orderType, lmtPrice, auxPrice, tif, ocaGroup, account, openClose, origin and orderRef. These come first in every version this app
-/// accepts (the message version is the server version from 145 on, else its own field, 32 or more for the full contract); what follows
-/// them (algo parameters, combo legs, conditions, the order state) depends on the version and is not read. `None` when the head is
-/// missing or a number in it cannot be read.
+/// orderType, lmtPrice, auxPrice, tif, ocaGroup, account, openClose, origin, orderRef, clientId (message version 3 on) and permId
+/// (version 4 on). These come first in every version this app accepts (the message version is the server version from 145 on, else
+/// its own field, 32 or more for the full contract); what follows them (algo parameters, combo legs, conditions, the order state)
+/// depends on the version and is not read. `None` when the head is missing or a number in it cannot be read.
 #[must_use]
 pub fn parse_open_order(fields: &[String], server_version: i32) -> Option<OpenOrderInfo> {
     let (version, first): (i32, usize) = if server_version < 145 { (fields.get(1)?.trim().parse::<i32>().ok()?, 2) } else { (server_version, 1) };
@@ -103,10 +134,92 @@ pub fn parse_open_order(fields: &[String], server_version: i32) -> Option<OpenOr
         aux_price: price(16)?,
         tif: text(17)?,
         oca_group: text(18)?,
-        account: text(19)?,
+        account: text(OPEN_ORDER_ACCOUNT)?,
         // 20 openClose, 21 origin
         order_ref: text(22)?,
+        client_id: text(23)?.parse().ok()?,
+        perm_id: text(OPEN_ORDER_PERM_ID)?.parse().ok()?,
+        combo_legs: open_order_combo_legs(fields, server_version).map(|(legs, _)| legs),
+        trail_stop_price: open_order_trail_stop_price(fields, server_version),
     })
+}
+
+/// The combo legs of an `openOrder` and the place of the first field after them. From the permId on the message is walked as
+/// `IBApi.EOrderDecoder` reads it for message version 32 and up (`OpenOrderEvent`): outsideRth, hidden, discretionaryAmt,
+/// goodAfterTime, sharesAllocation, faGroup, faMethod, faPercentage (one more field below server version 177), modelCode (server
+/// version 103 on), goodTillDate, rule80A, percentOffset, settlingFirm, shortSaleSlot, designatedLocation, exemptCode,
+/// auctionStrategy, startingPrice, stockRefPrice, delta, stockRangeLower, stockRangeUpper, displaySize, blockOrder, sweepToFill,
+/// allOrNone, minQty, ocaType, eTradeOnly, firmQuoteOnly, nbboPriceCap, parentId, triggerMethod, volatility, volatilityType,
+/// deltaNeutralOrderType, deltaNeutralAuxPrice (with a delta-neutral order type eight more), continuousUpdate,
+/// referencePriceType, trailStopPrice, trailingPercent, basisPoints, basisPointsType, comboLegsDescription, then the number of
+/// legs and for each conId, ratio, action, exchange, openClose, shortSaleSlot, designatedLocation, exemptCode, then the number of
+/// order combo legs and a price for each. An order of one contract has no legs. `None` when the message ends early or a count
+/// or leg cannot be read.
+#[must_use]
+pub fn open_order_combo_legs(fields: &[String], server_version: i32) -> Option<(Vec<OpenOrderLeg>, usize)> {
+    let field = |index: usize| fields.get(index).map(|f| f.trim());
+    // trailStopPrice, trailingPercent, the basis points fields, comboLegsDescription.
+    let mut index = open_order_trail_stop_field(fields, server_version)?.checked_add(5)?;
+    let count: usize = field(index)?.parse().ok()?;
+    index = index.checked_add(1)?;
+    let mut legs = Vec::with_capacity(count.min(16));
+    for _ in 0..count {
+        legs.push(OpenOrderLeg {
+            con_id: field(index)?.parse().ok()?,
+            ratio: field(index.checked_add(1)?)?.parse().ok()?,
+            action: field(index.checked_add(2)?)?.to_string(),
+        });
+        index = index.checked_add(8)?;
+    }
+    let prices: usize = field(index)?.parse().ok()?;
+    let after = index.checked_add(1)?.checked_add(prices)?;
+    (after <= fields.len()).then_some((legs, after))
+}
+
+/// The place of the trailStopPrice of an `openOrder` (walked as in `open_order_combo_legs`): after deltaNeutralOrderType, its aux
+/// price (with a delta-neutral order type eight more fields), continuousUpdate and referencePriceType. `None` when the message ends
+/// before deltaNeutralOrderType.
+fn open_order_trail_stop_field(fields: &[String], server_version: i32) -> Option<usize> {
+    let first = open_order_first_field(server_version);
+    // From outsideRth to faPercentage, then the optional fields that depend on the server version.
+    let mut index = first.checked_add(OPEN_ORDER_PERM_ID)?.checked_add(9)?;
+    if server_version < 177 {
+        index = index.checked_add(1)?;
+    }
+    if server_version >= 103 {
+        index = index.checked_add(1)?;
+    }
+    // goodTillDate up to deltaNeutralOrderType.
+    index = index.checked_add(26)?;
+    let delta_neutral = !fields.get(index)?.trim().is_empty();
+    index.checked_add(if delta_neutral { 12 } else { 4 })
+}
+
+/// The trailStopPrice of an `openOrder` (`IBApi.Order.TrailStopPrice`, read by `EOrderDecoder.readTrailParams`): the stop price of a
+/// trailing stop. `None` when TWS sends none (an empty field or its "unset" value, the largest double) or the field cannot be read.
+#[must_use]
+pub fn open_order_trail_stop_price(fields: &[String], server_version: i32) -> Option<f64> {
+    let value = fields.get(open_order_trail_stop_field(fields, server_version)?)?.trim();
+    value.parse::<f64>().ok().filter(|number| number.is_finite() && number.abs() < 1.0e300)
+}
+
+/// The `clientId` of an `orderStatus` message (`IBApi.EDecoder.OrderStatusEvent`): from server version 131 on, after orderId, status,
+/// filled, remaining, avgFillPrice, permId, parentId and lastFillPrice. `None` for an older server or a field that cannot be read.
+#[must_use]
+pub fn order_status_client_id(fields: &[String], server_version: i32) -> Option<i32> {
+    if server_version < 131 {
+        return None;
+    }
+    fields.get(9)?.trim().parse().ok()
+}
+
+/// The `permId` of an `orderStatus` message, the field after avgFillPrice from server version 131 on (see `order_status_client_id`).
+#[must_use]
+pub fn order_status_perm_id(fields: &[String], server_version: i32) -> Option<i64> {
+    if server_version < 131 {
+        return None;
+    }
+    fields.get(6)?.trim().parse().ok()
 }
 
 /// `IBApi.EDecoder.TickPriceEvent`'s real field order: version, tickerId, tickType, price,
@@ -296,7 +409,7 @@ pub fn parse_portfolio_value(fields: &[String]) -> Option<PortfolioRow> {
         market_value: number(15)?,
         average_cost: number(16)?,
         unrealized_pnl: number(17)?,
-        account: fields.get(19)?.trim().to_string(),
+        account: fields.get(PORTFOLIO_ACCOUNT)?.trim().to_string(),
     })
 }
 

@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "trade_pilot"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "broker",
  "chrono",

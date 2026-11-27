@@ -6,7 +6,7 @@ name = "trade_pilot"
 # bump the last number by 1 with every real code change (0.5.0 -> 0.5.1 -> ...); after 9 it rolls over into the
 # middle number (0.5.9 -> 0.6.0, 0.9.9 -> 1.0.0). The built .exe is named
 # TradePilot-V{major}.{minor}.{patch}.exe by build.ps1.
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 publish = false
 license.workspace = true

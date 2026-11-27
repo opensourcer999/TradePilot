@@ -594,12 +594,13 @@ impl App {
     }
 
     /// "Delete stop" / "Delete target": cancels the working stop (and stop-limit) or profit-target orders (every level) of the open trade at
-    /// `index`. The trade is left without them; TWS confirms each cancel and the trade forgets the order then.
+    /// `index`. The trade is left without them; TWS confirms each cancel and the trade forgets the order then. The other exit is kept:
+    /// TWS cancels it with them (one OCA group), so it is placed again once it has ended (`place_kept_exits`).
     pub(super) fn delete_exit_orders(&mut self, index: usize, stop: bool) {
         let Some(trade) = self.trades_stored.get(index).filter(|t| t.is_open()).cloned() else { return };
         let label = trade.label();
-        let mut ids: Vec<i32> =
-            if stop { [trade.stop_order_id, trade.stop_limit_order_id].into_iter().flatten().collect() } else { super::attach::working_target_ids(&trade) };
+        let stop_ids = |t: &StoredTrade| -> Vec<i32> { [t.stop_order_id, t.stop_limit_order_id].into_iter().flatten().collect() };
+        let mut ids: Vec<i32> = if stop { stop_ids(&trade) } else { super::attach::working_target_ids(&trade) };
         ids.sort_unstable();
         ids.dedup();
         let what = if stop { "stop" } else { "profit target" };
@@ -607,10 +608,94 @@ impl App {
             self.log(&format!("Delete {what} of {label}: the trade has none"));
             return;
         }
+        let (kept_orders, kept_price) =
+            if stop { (super::attach::working_target_ids(&trade), trade.target_now()) } else { (stop_ids(&trade), trade.stop_now()) };
+        if let (false, Some(price)) = (kept_orders.is_empty(), kept_price) {
+            self.watch.kept_exits.retain(|kept| kept.trade != trade.key());
+            self.watch.kept_exits.push(crate::watch::KeptExit {
+                trade: trade.key(),
+                stop: !stop,
+                price,
+                record: if stop { None } else { trade.adjustments.clone() },
+                orders: kept_orders,
+                deleted: ids.clone(),
+                at: self.clock.instant(),
+            });
+        }
         self.log(&format!("Delete {what} of {label}: cancelling the orders {ids:?}"));
         for id in ids {
             if self.submit_cancel(id).is_ok() {
                 self.watch.user_cancelled.insert(id);
+            }
+        }
+    }
+
+    /// The order `order_id` of the trade at `index` is one TWS cancelled with an exit the person deleted (`KeptExit`): said in the log
+    /// as expected, not as a warning, and forgotten; the exit is placed again once all its orders have ended.
+    fn end_kept_exit_order(&mut self, index: usize, order_id: i32, kind: &str, status: &str) -> bool {
+        // Only within the wait after the delete: an order that ends later ended for another reason.
+        let now = self.clock.instant();
+        self.watch.kept_exits.retain(|kept| now.saturating_duration_since(kept.at) <= crate::watch::KEPT_EXIT_WAIT);
+        let Some(kept) = self.watch.kept_exits.iter().find(|kept| kept.orders.contains(&order_id)) else { return false };
+        let other = if kept.stop { "profit target" } else { "stop" };
+        let label = self.trades_stored.get(index).map(StoredTrade::label).unwrap_or_default();
+        self.log(&format!("The {kind} {order_id} of {label} is {status} by TWS with the deleted {other} (same OCA group) - it is placed again"));
+        self.forget_ended_exit_order(index, order_id);
+        true
+    }
+
+    /// Places the kept exits again whose orders and deleted orders have all ended (`KeptExit`): at their price, in an OCA group of
+    /// their own. A kept exit whose orders TWS left working is dropped after `KEPT_EXIT_WAIT`; so is one of a trade that is no longer
+    /// open. A stop that cannot be placed again is a warning and a missing-stop mail.
+    pub(super) fn place_kept_exits(&mut self) {
+        let now = self.clock.instant();
+        for kept in self.watch.kept_exits.clone() {
+            let Some(index) = self.trades_stored.iter().position(|t| t.is_open() && t.key() == kept.trade) else {
+                self.watch.kept_exits.retain(|k| k.trade != kept.trade);
+                continue;
+            };
+            let Some(trade) = self.trades_stored.get(index).cloned() else { continue };
+            let working = trade.exit_order_ids();
+            let still_working = kept.orders.iter().chain(kept.deleted.iter()).any(|id| working.contains(id));
+            if still_working {
+                if now.saturating_duration_since(kept.at) > crate::watch::KEPT_EXIT_WAIT {
+                    self.watch.kept_exits.retain(|k| k.trade != kept.trade);
+                }
+                continue;
+            }
+            self.watch.kept_exits.retain(|k| k.trade != kept.trade);
+            let label = trade.label();
+            let what = if kept.stop { "stop" } else { "profit target" };
+            if let (true, Some(record)) = (kept.stop, kept.record.clone()) {
+                // A stop of a template comes back as the same kind of stop (REL, stop-limit, trailing ...), from its record.
+                let mut restored = StoredTrade { oca_group: None, ..trade.clone() };
+                restored.adjustments = Some(StopAdjustments { replace_pending: false, ..record });
+                self.save_trade(index, restored);
+                self.log(&format!("Placing the stop of {label} again as it was ({}) after the profit target was deleted", kept.price.normalize()));
+                self.place_stop_from_record(index, "restored stop");
+                let placed = self.trades_stored.get(index).is_some_and(|t| t.stop_order_id.is_some() || t.stop_limit_order_id.is_some());
+                if !placed {
+                    self.notify_missing_stop(&[format!("{label}: the stop could not be placed again after the target was deleted - the trade has NO stop")]);
+                }
+                continue;
+            }
+            let legs = trade_exit::close_legs(&trade);
+            let placed = match (trade_exit::exit_contract(&trade, &legs), self.next_order_id, self.tws_cmd_sender.is_some()) {
+                (Some(contract), Some(first_id), true) => {
+                    // A group of its own: the old one is the group TWS just cancelled.
+                    let fresh = StoredTrade { oca_group: None, ..trade.clone() };
+                    let (stop, target) = if kept.stop { (Some(kept.price), None) } else { (None, Some(kept.price)) };
+                    self.log(&format!("Placing the {what} of {label} again at {} after the other exit was deleted", kept.price.normalize()));
+                    self.place_attached_exits(index, &fresh, contract, stop, target, first_id, legs.as_slice());
+                    self.trades_stored.get(index).is_some_and(|t| if kept.stop { t.stop_order_id.is_some() } else { t.profit_order_id.is_some() })
+                }
+                _ => false,
+            };
+            if !placed {
+                self.log(&format!("WARNING: the {what} of {label} was cancelled by TWS with the deleted exit and could NOT be placed again"));
+                if kept.stop {
+                    self.notify_missing_stop(&[format!("{label}: the stop could not be placed again after the target was deleted - the trade has NO stop")]);
+                }
             }
         }
     }
@@ -712,6 +797,10 @@ impl App {
         if self.pending.open_orders_requested || !self.loaded.today_trades_loaded || !self.loaded.account_summary_loaded {
             return;
         }
+        // Both answers end in the same `openOrderEnd`: while the listing of all clients runs, the reconciliation waits for its end.
+        if matches!(self.pending.all_orders, super::AllOrdersListing::Listing { .. }) {
+            return;
+        }
         let Some(sender) = self.tws_cmd_sender.as_ref() else { return };
         self.pending.open_orders_requested = true;
         if sender.send(TwsCommand::RequestOpenOrders).is_ok() {
@@ -719,6 +808,105 @@ impl App {
         } else {
             self.open_orders_snapshot = None;
             self.log("WARNING: the working orders could not be requested from TWS - the trades' stops are not checked");
+        }
+    }
+
+    /// Asks TWS for the working orders of every API client (`reqAllOpenOrders`): first after the reconciliation, `again` whenever a
+    /// stop or target is about to be attached, so the check against the orders of other clients (`other_client_lock`) works on what
+    /// TWS has now. Not while the reconciliation waits for its answer: both answers end in the same `openOrderEnd`.
+    pub(super) fn request_all_open_orders(&mut self, again: bool) {
+        let due = match self.pending.all_orders {
+            super::AllOrdersListing::NotAsked => true,
+            super::AllOrdersListing::Done => again,
+            super::AllOrdersListing::Listing { .. } => false,
+        };
+        if !due || self.open_orders_snapshot.is_some() {
+            return;
+        }
+        let Some(sender) = self.tws_cmd_sender.as_ref() else { return };
+        if sender.send(TwsCommand::RequestAllOpenOrders).is_ok() {
+            self.pending.all_orders = super::AllOrdersListing::Listing { other_clients: 0 };
+            self.other_client_orders.clear();
+        } else {
+            self.pending.all_orders = super::AllOrdersListing::Done;
+            self.log("WARNING: the working orders of all API clients could not be requested from TWS");
+        }
+    }
+
+    /// A working order of another API client: written to the log with what identifies it. Its order id counts for that client only, so
+    /// it is not compared with the orders of this app.
+    pub(super) fn on_other_client_order(&mut self, info: &broker::OpenOrderInfo) {
+        if let super::AllOrdersListing::Listing { other_clients } = &mut self.pending.all_orders {
+            *other_clients = other_clients.saturating_add(1);
+        }
+        self.other_client_orders.retain(|known| known.perm_id != info.perm_id);
+        self.other_client_orders.push(info.clone());
+        let contract = match (info.sec_type.as_str(), &info.combo_legs) {
+            ("OPT", _) => format!("{} {} {}", info.expiry, info.strike, info.right),
+            ("BAG", Some(legs)) => {
+                let legs: Vec<String> = legs.iter().map(|leg| format!("{} {}x con id {}", leg.action, leg.ratio, leg.con_id)).collect();
+                format!("legs [{}]", legs.join(", "))
+            }
+            ("BAG", None) => "legs not readable".to_string(),
+            _ => format!("con id {}", info.con_id),
+        };
+        self.log(&format!(
+            "TWS order of another client (client {}, perm id {}, order {}): {} {} {} {} {} {} {} limit {:?} stop {:?} {} ref '{}' - left alone",
+            info.client_id,
+            info.perm_id,
+            info.order_id,
+            mask_account(&info.account),
+            info.symbol,
+            info.sec_type,
+            contract,
+            info.action,
+            info.total_quantity,
+            info.order_type,
+            info.limit_price,
+            info.aux_price,
+            info.tif,
+            info.order_ref
+        ));
+    }
+
+    /// The status of an order of another API client: a filled or cancelled one no longer works, so it no longer holds back the exit
+    /// orders of a trade. Its order id counts for that client only; it is found by its perm id.
+    pub(super) fn on_other_client_order_status(&mut self, order_id: i32, client_id: i32, perm_id: Option<i64>, status: &str) {
+        self.debug(&format!("TWS order status of client {client_id}, order {order_id}, perm id {perm_id:?}: {status} - not an order of this app"));
+        if let Some(perm_id) = perm_id.filter(|_| order_is_final(status)) {
+            self.other_client_orders.retain(|order| order.perm_id != perm_id);
+        }
+    }
+
+    /// Why no stop or target may be sent for `trade` now on account of the orders of other API clients, in German when `de` (for the
+    /// screen), else in English (for the log); `None` when nothing holds it back. Until the listing of those orders is complete nothing is sent, as an order of
+    /// another client on the same contracts would not share the OCA group of this app's orders: if both filled, a new position opened.
+    pub(super) fn other_client_lock(&self, trade: &StoredTrade, de: bool) -> Option<String> {
+        match self.pending.all_orders {
+            super::AllOrdersListing::NotAsked | super::AllOrdersListing::Listing { .. } => Some(
+                if de {
+                    "Warte auf die Liste der Orders anderer Programme von der TWS ..."
+                } else {
+                    "Waiting for TWS to list the orders of other programs ..."
+                }
+                .to_string(),
+            ),
+            super::AllOrdersListing::Done => {
+                let found = crate::unmanaged::other_client_orders_on(trade, &self.other_client_orders);
+                if found.is_empty() {
+                    return None;
+                }
+                let orders: Vec<String> =
+                    found.iter().map(|order| format!("{} {} {} (perm id {})", order.action, order.total_quantity, order.order_type, order.perm_id)).collect();
+                Some(if de {
+                    format!(
+                        "In der TWS laufen Orders, die nicht von TradePilot stammen, auf Kontrakten dieses Trades: {}. Erst in der TWS stornieren, dann hier setzen.",
+                        orders.join(", ")
+                    )
+                } else {
+                    format!("Orders that are not TradePilot's work on contracts of this trade in TWS: {}. Cancel them in TWS first.", orders.join(", "))
+                })
+            }
         }
     }
 
@@ -829,10 +1017,15 @@ impl App {
         stale.len()
     }
 
-    /// The old stop of an adjusted trade is cancelled: places the new one (`replacement_stop_orders`)
-    /// in the OCA group of the trade's profit target, or in a new group when it has none, and
-    /// remembers its order ids. Goes through the same checks as every order.
+    /// The old stop of an adjusted trade is cancelled: places the new one (`place_stop_from_record`).
     pub(super) fn place_replacement_stop(&mut self, index: usize) {
+        self.place_stop_from_record(index, "adjusted stop");
+    }
+
+    /// Places the stop the trade's record describes (`StopAdjustments`: order type, price, offsets, REL, trigger, legs;
+    /// `replacement_stop_orders`) in the OCA group of the trade's profit target, or in a new group when it has none, and remembers
+    /// its order ids. `what` names it in the log ("adjusted stop"). Goes through the same checks as every order.
+    fn place_stop_from_record(&mut self, index: usize, what: &str) {
         let Some(trade) = self.trades_stored.get(index).cloned() else {
             return;
         };
@@ -845,7 +1038,7 @@ impl App {
         updated.stop_order_id = None;
         updated.stop_limit_order_id = None;
         let (true, Some(first_id), true) = (self.tws_cmd_sender.is_some(), self.next_order_id, self.trading_allowed()) else {
-            self.log(&format!("WARNING: the adjusted stop of {label} was NOT placed (not connected, or the safety gate is shut) - the trade has no stop"));
+            self.log(&format!("WARNING: the {what} of {label} was NOT placed (not connected, or the safety gate is shut) - the trade has no stop"));
             updated.adjustments = Some(adjustments);
             self.save_trade(index, updated);
             return;
@@ -857,7 +1050,7 @@ impl App {
             trade_exit::oca_group(stop_id)
         };
         let Some(orders) = trade_exit::replacement_stop_orders(&trade, &adjustments, &self.clock.new_york_today(), &group, stop_id, limit_id) else {
-            self.log(&format!("WARNING: the adjusted stop of {label} cannot be built - NO stop placed"));
+            self.log(&format!("WARNING: the {what} of {label} cannot be built - NO stop placed"));
             updated.adjustments = Some(adjustments);
             self.save_trade(index, updated);
             return;
@@ -865,14 +1058,14 @@ impl App {
         self.next_order_id = Some(first_id.saturating_add(2));
         updated.oca_group = Some(group);
         if let Some(order) = orders.stop {
-            self.log(&format!("Place {} ClientOrderID: {stop_id} Price: {} Qty: {} (adjusted stop)", order.order_type, order.aux_price, order.total_quantity));
+            self.log(&format!("Place {} ClientOrderID: {stop_id} Price: {} Qty: {} ({what})", order.order_type, order.aux_price, order.total_quantity));
             if self.submit_order(stop_id, orders.contract.clone(), order).is_ok() {
                 updated.stop_order_id = Some(stop_id);
             }
         }
         if let Some(order) = orders.stop_limit {
             self.log(&format!(
-                "Place STP LMT ClientOrderID: {limit_id} Stop Price: {} Limit Price: {} Qty: {} (adjusted stop)",
+                "Place STP LMT ClientOrderID: {limit_id} Stop Price: {} Limit Price: {} Qty: {} ({what})",
                 order.aux_price, order.lmt_price, order.total_quantity
             ));
             if self.submit_order(limit_id, orders.contract, order).is_ok() {
@@ -882,7 +1075,7 @@ impl App {
         let placed = updated.stop_order_id.is_some() || updated.stop_limit_order_id.is_some();
         let stop = adjustments.stop.as_deref().and_then(|p| p.parse::<Decimal>().ok()).filter(|_| placed);
         if !placed {
-            self.log(&format!("WARNING: the adjusted stop of {label} was NOT placed - the trade has no stop"));
+            self.log(&format!("WARNING: the {what} of {label} was NOT placed - the trade has no stop"));
         }
         updated.adjustments = Some(adjustments);
         updated.set_stop(stop);
@@ -1070,6 +1263,11 @@ impl App {
             if self.watch.user_cancelled.remove(&order_id) {
                 self.log(&format!("The {kind} {order_id} of {label} is {status}, as asked"));
                 self.forget_ended_exit_order(index, order_id);
+                self.place_kept_exits();
+                return;
+            }
+            if status != "Filled" && self.end_kept_exit_order(index, order_id, kind, status) {
+                self.place_kept_exits();
                 return;
             }
             if kind == "stop" && trade.adjustments.as_ref().is_some_and(|a| a.replace_pending) {
@@ -1102,7 +1300,7 @@ impl App {
         let label = trade.label();
         // The message is used only when what the app knows for sure agrees: the account and the symbol of the trade, and the
         // reference this app gives its orders ("TraPi-<order id>"). Otherwise its fields may not be where the app reads them.
-        let reference_ok = info.order_ref.strip_prefix("TraPi-").is_none_or(|rest| rest.split(' ').next() == Some(order_id.to_string().as_str()));
+        let reference_ok = crate::trade_rebuild::is_exit_ref_of(&info.order_ref, trade.order_id, order_id);
         if info.account != trade.account || info.symbol != trade.symbol || !reference_ok {
             if self.watch.mismatch_reported.insert(format!("openOrder {order_id}")) {
                 self.log(&format!(
@@ -1119,6 +1317,11 @@ impl App {
             let Some(price) = info.aux_price.and_then(dec).map(|p| p.normalize()) else { return };
             updated.set_stop(Some(price));
             ("stop", trade.stop_now(), price)
+        } else if trade.stop_order_id == Some(order_id) && trade.stop_limit_order_id.is_none() && info.order_type == "TRAIL" {
+            // The stop price of a trailing stop is its trailStopPrice (its aux price is the trailing amount).
+            let Some(price) = info.trail_stop_price.and_then(dec).map(|p| p.normalize()) else { return };
+            updated.set_stop(Some(price));
+            ("trailing stop", trade.stop_now(), price)
         } else if info.order_type == "LMT" {
             let Some(price) = info.limit_price.and_then(dec).map(|p| p.normalize()) else { return };
             let slot = trade.exit_levels.as_ref().and_then(|levels| levels.order_ids.iter().position(|id| *id == Some(order_id)));
@@ -1145,6 +1348,14 @@ impl App {
             "The {kind} {order_id} of {label} is at {new} in TWS ({} on record) - taken over",
             old.map_or_else(|| "-".to_string(), |p| p.normalize().to_string())
         ));
+        // A kept exit waiting to be placed again (see `KeptExit`) comes back at the price TWS has now.
+        let key = trade.key();
+        for kept in self.watch.kept_exits.iter_mut().filter(|k| k.trade == key && k.orders.contains(&order_id)) {
+            kept.price = new;
+            if let Some(record) = kept.record.as_mut() {
+                record.stop = Some(new.to_string());
+            }
+        }
         self.save_trade(index, updated);
     }
 
@@ -1357,7 +1568,7 @@ impl App {
                 order_type: "MKT".to_string(),
                 tif: "DAY".to_string(),
                 account: trade.account.clone(),
-                order_ref: crate::trade_rebuild::order_ref(order_id, "Close"),
+                order_ref: crate::trade_rebuild::exit_order_ref(trade.order_id, order_id, "Close"),
                 handling: super::OrderHandling { transmit: true, ..super::OrderHandling::default() },
                 ..IbOrder::default()
             };

@@ -695,7 +695,7 @@ fn grid_font_size() -> f32 {
 /// ellipsis. Column widths are shares of the available width. The text size and row height follow
 /// the grid font size of the settings.
 pub fn data_table(ui: &mut egui::Ui, id: &str, columns: &[TableColumn], rows: &[Vec<TableCell>]) {
-    let _ = table_core(ui, id, columns, rows, (false, None, &[]), false);
+    let _ = table_core(ui, id, columns, rows, (false, None, &[], &[]), false);
 }
 
 /// The box in front of a row of a list that can be selected: empty, or filled with a tick for the
@@ -786,20 +786,34 @@ pub fn next_selection<K: Clone + PartialEq>(current: Option<K>, clicks: RowClick
     }
 }
 
+/// The rows chosen together after this frame's `clicks`, for a table where several rows are chosen at once: a click on a row ticks it, a
+/// click on a ticked row takes the tick away. `key_of` turns a row index into the key the page keeps its selection by.
+pub fn toggle_selection<K: PartialEq>(current: &mut Vec<K>, clicks: RowClicks, key_of: impl Fn(usize) -> Option<K>) {
+    let Some(key) = clicks.clicked.or(clicks.double_clicked).and_then(key_of) else { return };
+    match current.iter().position(|known| *known == key) {
+        Some(place) => {
+            current.remove(place);
+        }
+        None => current.push(key),
+    }
+}
+
 /// `data_table` whose rows can be selected: a column of boxes in front shows the `selected` row with a tick
 /// (its text is bold too), and the clicks of this frame are returned.
 pub fn data_table_rows(ui: &mut egui::Ui, id: &str, columns: &[TableColumn], rows: &[Vec<TableCell>], selected: Option<usize>) -> RowClicks {
-    table_core(ui, id, columns, rows, (true, selected, &[]), false).0
+    table_core(ui, id, columns, rows, (true, selected, &[], &[]), false).0
 }
 
 /// How far the text of a table stays from the ends of its row strips.
 const TABLE_INSET: f32 = 10.0;
 
-/// How the rows of an `arranged_table` can be selected: the selected row (with a tick) and the rows that cannot be selected
-/// (their box greyed out, a click on them not returned).
+/// How the rows of an `arranged_table` can be selected: the selected row (with a tick), further ticked rows of a table where several
+/// rows are chosen together (see `toggle_selection`), and the rows that cannot be selected (their box greyed out, a click on them not
+/// returned).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RowSelection<'a> {
     pub selected: Option<usize>,
+    pub ticked: &'a [usize],
     pub locked: &'a [usize],
 }
 
@@ -822,7 +836,7 @@ pub fn arranged_table(
         order.iter().filter_map(|i| columns.get(*i).map(|c| TableColumn { weight: widths.get(*i).copied().unwrap_or(c.weight), ..c.clone() })).collect();
     let rows: Vec<Vec<TableCell>> = rows.iter().map(|row| order.iter().filter_map(|i| row.get(*i).cloned()).collect()).collect();
     let select = selection.unwrap_or_default();
-    let (clicks, edit) = table_core(ui, id, &arranged, &rows, (selection.is_some(), select.selected, select.locked), true);
+    let (clicks, edit) = table_core(ui, id, &arranged, &rows, (selection.is_some(), select.selected, select.ticked, select.locked), true);
     if let Some((from, to)) = edit.moved {
         crate::column_order::move_column(id, keys, from, to);
         ui.ctx().request_repaint();
@@ -912,18 +926,19 @@ fn resize_grip(ui: &egui::Ui, cell: egui::Rect, spacing_x: f32, table_id: egui::
     }
 }
 
-/// The one table behind `data_table`, `data_table_rows` and `arranged_table`: `selection` (selectable, selected row, locked
-/// rows) adds the column of boxes in front; when `arranged` the headers can be dragged onto each other and their borders sized,
+/// The one table behind `data_table`, `data_table_rows` and `arranged_table`: `selection` (selectable, selected row, further ticked
+/// rows, locked rows) adds the column of boxes in front; when `arranged` the headers can be dragged onto each other and their borders sized,
 /// and what the person did is returned (see `TableEdit`, places in `columns`).
 fn table_core(
     ui: &mut egui::Ui,
     id: &str,
     columns: &[TableColumn],
     rows: &[Vec<TableCell>],
-    selection: (bool, Option<usize>, &[usize]),
+    selection: (bool, Option<usize>, &[usize], &[usize]),
     arranged: bool,
 ) -> (RowClicks, TableEdit) {
-    let (selectable, selected, locked) = selection;
+    let (selectable, selected, ticked, locked) = selection;
+    let is_ticked = |row: usize| selected == Some(row) || ticked.contains(&row);
     let mut clicks = RowClicks::default();
     let mut edit = TableEdit::default();
     let table_id = egui::Id::new(("table_columns", id));
@@ -981,7 +996,7 @@ fn table_core(
                                 locked_mark(ui, font);
                                 return;
                             }
-                            let mark = selection_mark(ui, selected == Some(row_index), font);
+                            let mark = selection_mark(ui, is_ticked(row_index), font);
                             if mark.double_clicked() {
                                 clicks.double_clicked = Some(row_index);
                             } else if mark.clicked() {
@@ -999,7 +1014,7 @@ fn table_core(
                                         status_dot(ui, dot);
                                     }
                                     let mut text = RichText::new(&cell.text).size(font).color(cell.color.unwrap_or_else(text_primary));
-                                    if cell.strong || selected == Some(row_index) {
+                                    if cell.strong || is_ticked(row_index) {
                                         text = text.strong();
                                     }
                                     let sense = if row_locked { egui::Sense::hover() } else { egui::Sense::click() };
@@ -1124,7 +1139,7 @@ pub fn trade_table(ui: &mut egui::Ui, rows: &[TradeRowView], titles: [&str; 12],
     // Only an open trade can be selected (its buttons are under the list); a closed one has nothing to act on.
     let locked: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.status != crate::trade_summary::TradeStatus::Open.as_str()).map(|(i, _)| i).collect();
     let keys = ["trade", "order_ref", "strikes", "expiry", "qty", "open", "stop", "target", "bid", "mid", "ask", "profit"];
-    let clicks = arranged_table(ui, "trade_table", &keys, &columns, &cells, Some(RowSelection { selected: position, locked: &locked }));
+    let clicks = arranged_table(ui, "trade_table", &keys, &columns, &cells, Some(RowSelection { selected: position, ticked: &[], locked: &locked }));
     let index_of = |row: Option<usize>| row.and_then(|row| rows.get(row)).map(|r| r.index);
     RowClicks { clicked: index_of(clicks.clicked), double_clicked: index_of(clicks.double_clicked) }
 }

@@ -6,18 +6,22 @@ use crate::{
 };
 use crate::{
     encode_cancel_order, encode_place_order, encode_req_bars, encode_req_contract_details, encode_req_daily_bars, encode_req_executions, encode_req_mkt_data,
-    encode_req_open_orders, encode_req_sec_def_opt_params, market_data_farm_status, parse_account_summary, parse_commission_report, parse_contract_data,
-    parse_execution_data, parse_historical_bars, parse_historical_update, parse_incoming_message, parse_managed_accounts, parse_market_data_ack,
-    parse_open_order, parse_open_order_id, parse_option_delta, parse_order_status, parse_position, parse_security_definition_option_parameter,
-    parse_tick_price, parse_tick_size, read_api_frame, read_tws_handshake, send_outgoing_message, tws_error_message, BarsRequest, IbExecutionFilter,
-    TwsCommand, TwsEvent, IB_ACCOUNT_SUMMARY_REQUEST_ID, IB_API_VERSION_MAX, IB_API_VERSION_MIN, IB_CLIENT_ID, IB_EXECUTIONS_REQUEST_ID, IN_COMMISSION_REPORT,
-    IN_CONTRACT_DATA, IN_CONTRACT_DATA_END, IN_EXECUTION_DATA, IN_EXECUTION_DATA_END, IN_HISTORICAL_DATA, IN_HISTORICAL_DATA_END, IN_HISTORICAL_DATA_UPDATE,
-    IN_MANAGED_ACCOUNTS, IN_MARKET_DATA_TYPE, IN_OPEN_ORDER, IN_OPEN_ORDER_END, IN_ORDER_STATUS, IN_SECURITY_DEFINITION_OPTION_PARAMETER,
-    IN_SECURITY_DEFINITION_OPTION_PARAMETER_END, IN_TICK_GENERIC, IN_TICK_OPTION_COMPUTATION, IN_TICK_PRICE, IN_TICK_REQ_PARAMS, IN_TICK_SIZE, IN_TICK_STRING,
-    MARKET_DATA_REQUEST_SPACING_MS, OUT_CANCEL_MKT_DATA, OUT_CANCEL_ORDER, OUT_PLACE_ORDER, OUT_REQ_CONTRACT_DETAILS, OUT_REQ_EXECUTIONS,
-    OUT_REQ_HISTORICAL_DATA, OUT_REQ_MKT_DATA, OUT_REQ_OPEN_ORDERS, OUT_REQ_SEC_DEF_OPT_PARAMS,
+    encode_req_open_orders, encode_req_sec_def_opt_params, market_data_farm_status, order_status_client_id, order_status_perm_id, parse_account_summary,
+    parse_commission_report, parse_contract_data, parse_execution_data, parse_historical_bars, parse_historical_update, parse_incoming_message,
+    parse_managed_accounts, parse_market_data_ack, parse_open_order, parse_open_order_id, parse_option_delta, parse_order_status, parse_position,
+    parse_security_definition_option_parameter, parse_tick_price, parse_tick_size, read_api_frame, read_tws_handshake, send_outgoing_message,
+    tws_error_message, BarsRequest, IbExecutionFilter, TwsCommand, TwsEvent, IB_ACCOUNT_SUMMARY_REQUEST_ID, IB_API_VERSION_MAX, IB_API_VERSION_MIN,
+    IB_CLIENT_ID, IB_EXECUTIONS_REQUEST_ID, IN_COMMISSION_REPORT, IN_CONTRACT_DATA, IN_CONTRACT_DATA_END, IN_EXECUTION_DATA, IN_EXECUTION_DATA_END,
+    IN_HISTORICAL_DATA, IN_HISTORICAL_DATA_END, IN_HISTORICAL_DATA_UPDATE, IN_MANAGED_ACCOUNTS, IN_MARKET_DATA_TYPE, IN_OPEN_ORDER, IN_OPEN_ORDER_END,
+    IN_ORDER_STATUS, IN_SECURITY_DEFINITION_OPTION_PARAMETER, IN_SECURITY_DEFINITION_OPTION_PARAMETER_END, IN_TICK_GENERIC, IN_TICK_OPTION_COMPUTATION,
+    IN_TICK_PRICE, IN_TICK_REQ_PARAMS, IN_TICK_SIZE, IN_TICK_STRING, MARKET_DATA_REQUEST_SPACING_MS, OUT_CANCEL_MKT_DATA, OUT_CANCEL_ORDER, OUT_PLACE_ORDER,
+    OUT_REQ_ALL_OPEN_ORDERS, OUT_REQ_CONTRACT_DETAILS, OUT_REQ_EXECUTIONS, OUT_REQ_HISTORICAL_DATA, OUT_REQ_MKT_DATA, OUT_REQ_OPEN_ORDERS,
+    OUT_REQ_SEC_DEF_OPT_PARAMS,
 };
-use crate::{IN_CURRENT_TIME, OUT_REQ_CURRENT_TIME};
+use crate::{
+    mask_account, open_order_combo_legs, open_order_first_field, IN_CURRENT_TIME, OPEN_ORDER_ACCOUNT, OPEN_ORDER_PERM_ID, OUT_REQ_CURRENT_TIME,
+    PORTFOLIO_ACCOUNT,
+};
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -175,6 +179,7 @@ fn send_command(stream: &mut TcpStream, server_version_num: i32, command: TwsCom
             send_outgoing_message(stream, server_version_num, OUT_CANCEL_ORDER, &encode_cancel_order(server_version_num, order_id))
         }
         TwsCommand::RequestOpenOrders => send_outgoing_message(stream, server_version_num, OUT_REQ_OPEN_ORDERS, &encode_req_open_orders()),
+        TwsCommand::RequestAllOpenOrders => send_outgoing_message(stream, server_version_num, OUT_REQ_ALL_OPEN_ORDERS, &encode_req_open_orders()),
         TwsCommand::RequestCurrentTime => send_outgoing_message(stream, server_version_num, OUT_REQ_CURRENT_TIME, &["1".to_string()]),
         TwsCommand::RequestExecutions => send_outgoing_message(
             stream,
@@ -217,15 +222,31 @@ fn send_command(stream: &mut TcpStream, server_version_num: i32, command: TwsCom
 pub(crate) static RAW_OPEN_ORDER_LOGGED: AtomicBool = AtomicBool::new(false);
 pub(crate) static RAW_PORTFOLIO_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// Writes `fields` of a `kind` of message to the log as TWS sent them, the first time in the session (`logged`).
-fn log_raw_once(logged: &AtomicBool, kind: &str, fields: &[String], sender: &mpsc::Sender<TwsEvent>) {
+/// Writes the first `read` fields of a `kind` of message to the log as TWS sent them, the first time in the session (`logged`): the
+/// fields the app reads, with the account at `account` masked. The rest is left out, as it carries the TWS user name (`submitter`).
+fn log_raw_once(logged: &AtomicBool, kind: &str, fields: &[String], read: usize, account: usize, sender: &mpsc::Sender<TwsEvent>) {
     if !logged.swap(true, Ordering::Relaxed) {
-        let _ = sender.send(TwsEvent::Log(format!("TWS raw {kind} message (to check the fields TradePilot reads): {}", fields.join("|"))));
+        let _ = sender.send(TwsEvent::Log(format!("TWS raw {kind} message (to check the fields TradePilot reads): {}", masked_head(fields, read, account))));
+    }
+}
+
+/// The first `read` fields joined by "|", the account (the field at `account`) masked wherever it stands (`mask_account`): TWS also
+/// writes it into other fields, the share allocation of an `openOrder` say.
+pub(crate) fn masked_head(fields: &[String], read: usize, account: usize) -> String {
+    let head = fields.iter().take(read).cloned().collect::<Vec<_>>().join("|");
+    match fields.get(account).map(|a| a.trim()).filter(|a| !a.is_empty()) {
+        Some(account) => head.replace(account, &mask_account(account)),
+        None => head,
     }
 }
 
 /// Handles one message TWS sent: what the app needs of it goes on as events; an error ends the session.
-pub(crate) fn handle_incoming_message(message_fields: &[String], server_version_num: i32, sender: &mpsc::Sender<TwsEvent>) -> Result<(), String> {
+pub(crate) fn handle_incoming_message(
+    message_fields: &[String],
+    server_version_num: i32,
+    own_client_id: i32,
+    sender: &mpsc::Sender<TwsEvent>,
+) -> Result<(), String> {
     match message_fields.first().map(String::as_str) {
         Some("4") => {
             let (id, code, detail) = tws_error_message(message_fields, server_version_num)?;
@@ -274,15 +295,15 @@ pub(crate) fn handle_incoming_message(message_fields: &[String], server_version_
             let _ = sender.send(TwsEvent::PositionsEnd);
         }
         Some(id) if id.parse::<i32>() == Ok(IN_PORTFOLIO_VALUE) => {
-            log_raw_once(&RAW_PORTFOLIO_LOGGED, "updatePortfolio", message_fields, sender);
-            match parse_portfolio_value(message_fields) {
-                Some(row) => {
-                    let _ = sender.send(TwsEvent::Portfolio(row));
-                }
-                None => {
-                    let _ = sender.send(TwsEvent::Log(format!("TWS: portfolio message not read, fields: {}", message_fields.join("|"))));
-                }
-            }
+            log_raw_once(&RAW_PORTFOLIO_LOGGED, "updatePortfolio", message_fields, PORTFOLIO_ACCOUNT + 1, PORTFOLIO_ACCOUNT, sender);
+            let event = parse_portfolio_value(message_fields).map_or_else(
+                || {
+                    let fields = masked_head(message_fields, PORTFOLIO_ACCOUNT + 1, PORTFOLIO_ACCOUNT);
+                    TwsEvent::Log(format!("TWS: portfolio message not read, fields: {fields}"))
+                },
+                TwsEvent::Portfolio,
+            );
+            let _ = sender.send(event);
         }
         // `currentTime`: 49, version, the time in seconds since 1970.
         Some(id) if id.parse::<i32>() == Ok(IN_CURRENT_TIME) => {
@@ -316,24 +337,39 @@ pub(crate) fn handle_incoming_message(message_fields: &[String], server_version_
                 let _ = sender.send(event);
             }
         }
-        _ => handle_order_and_chain_message(message_fields, server_version_num, sender),
+        _ => handle_order_and_chain_message(message_fields, server_version_num, own_client_id, sender),
     }
     Ok(())
 }
 
 /// Handles the messages about orders, executions and the option chain (and logs any other kind).
-fn handle_order_and_chain_message(message_fields: &[String], server_version_num: i32, sender: &mpsc::Sender<TwsEvent>) {
+fn handle_order_and_chain_message(message_fields: &[String], server_version_num: i32, own_client_id: i32, sender: &mpsc::Sender<TwsEvent>) {
     match message_fields.first().map(String::as_str) {
         Some(id) if id.parse::<i32>() == Ok(IN_ORDER_STATUS) => {
-            if let Some(event) = parse_order_status(message_fields, server_version_num) {
-                let _ = sender.send(event);
+            let other_client = order_status_client_id(message_fields, server_version_num).filter(|client| *client != own_client_id);
+            match (parse_order_status(message_fields, server_version_num), other_client) {
+                (Some(TwsEvent::OrderStatus { order_id, status, .. }), Some(client_id)) => {
+                    let perm_id = order_status_perm_id(message_fields, server_version_num);
+                    let _ = sender.send(TwsEvent::OtherClientOrderStatus { order_id, client_id, perm_id, status });
+                }
+                (Some(event), _) => {
+                    let _ = sender.send(event);
+                }
+                (None, _) => {}
             }
         }
         Some(id) if id.parse::<i32>() == Ok(IN_OPEN_ORDER) => match parse_open_order_id(message_fields, server_version_num) {
             Some(order_id) => {
-                log_raw_once(&RAW_OPEN_ORDER_LOGGED, "openOrder", message_fields, sender);
+                let first = open_order_first_field(server_version_num);
+                // Up to the end of the combo legs, the last part the app reads; up to the permId when they cannot be found.
+                let read = open_order_combo_legs(message_fields, server_version_num).map_or(first + OPEN_ORDER_PERM_ID + 1, |(_, after)| after);
+                log_raw_once(&RAW_OPEN_ORDER_LOGGED, "openOrder", message_fields, read, first + OPEN_ORDER_ACCOUNT, sender);
                 let details = parse_open_order(message_fields, server_version_num).filter(|d| d.order_id == order_id).map(Box::new);
-                let _ = sender.send(TwsEvent::OpenOrder { order_id, details });
+                let event = match details {
+                    Some(info) if info.client_id != own_client_id => TwsEvent::OtherClientOrder(info),
+                    details => TwsEvent::OpenOrder { order_id, details },
+                };
+                let _ = sender.send(event);
             }
             None => {
                 let _ = sender.send(TwsEvent::Log("Malformed TWS openOrder message: no order id".into()));
@@ -443,7 +479,7 @@ pub fn tws_session_at(
         match read_api_frame(&mut stream, Instant::now() + Duration::from_millis(250)) {
             Ok(Some(message)) => {
                 let message_fields = parse_incoming_message(&message, server_version_num);
-                handle_incoming_message(&message_fields, server_version_num, sender)?;
+                handle_incoming_message(&message_fields, server_version_num, client_id, sender)?;
             }
             Ok(None) => {}
             Err(error) => return Err(format!("TWS connection closed: {error}")),

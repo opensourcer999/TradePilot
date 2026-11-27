@@ -639,7 +639,7 @@ pub fn encode_req_account_updates(subscribe: bool, account: &str) -> Vec<String>
 
 /// `IBApi.EClient.reqOpenOrders`'s real fields: only its version, 1. TWS answers with an
 /// `openOrder` (and an `orderStatus`) for every order of this client that is still working, then
-/// `openOrderEnd`.
+/// `openOrderEnd`. `reqAllOpenOrders` sends the same single field under its own message id.
 #[must_use]
 pub fn encode_req_open_orders() -> Vec<String> {
     vec!["1".to_string()]

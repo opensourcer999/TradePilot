@@ -241,6 +241,8 @@ fn framed_handshake_and_informational_message_before_ready() {
             | TwsEvent::OrderStatus { .. }
             | TwsEvent::OpenOrder { .. }
             | TwsEvent::OpenOrderEnd
+            | TwsEvent::OtherClientOrder(_)
+            | TwsEvent::OtherClientOrderStatus { .. }
             | TwsEvent::ContractDetails(_)
             | TwsEvent::OptionDelta { .. }
             | TwsEvent::RequestError { .. }
@@ -1162,8 +1164,8 @@ fn the_first_open_order_and_portfolio_message_of_a_session_are_logged_as_tws_sen
     let open_order = ["5", "11", "0", "SPX", "BAG"].map(String::from).to_vec();
     let portfolio = ["7", "8", "1234", "MU"].map(String::from).to_vec();
     for _ in 0..2 {
-        crate::connection::handle_incoming_message(&open_order, 200, &sender).unwrap();
-        crate::connection::handle_incoming_message(&portfolio, 200, &sender).unwrap();
+        crate::connection::handle_incoming_message(&open_order, 200, 1, &sender).unwrap();
+        crate::connection::handle_incoming_message(&portfolio, 200, 1, &sender).unwrap();
     }
     let raw: Vec<String> =
         receiver.try_iter().filter_map(|e| if let TwsEvent::Log(line) = e { Some(line) } else { None }).filter(|l| l.contains("TWS raw")).collect();
@@ -1182,7 +1184,7 @@ fn the_current_time_of_tws_is_read_as_the_ib_client_reads_it() {
     assert_eq!((OUT_REQ_CURRENT_TIME, IN_CURRENT_TIME), (49, 49));
     let (sender, receiver) = mpsc::channel();
     let fields = ["49", "1", "1795635718"].map(String::from).to_vec();
-    assert!(crate::connection::handle_incoming_message(&fields, 200, &sender).is_ok());
+    assert!(crate::connection::handle_incoming_message(&fields, 200, 1, &sender).is_ok());
     let times: Vec<i64> = receiver.try_iter().filter_map(|e| if let TwsEvent::CurrentTime(t) = e { Some(t) } else { None }).collect();
     assert_eq!(times, [1_795_635_718]);
 }
@@ -1194,15 +1196,15 @@ fn a_notice_without_a_request_is_passed_on_and_one_about_a_request_is_left_to_th
     let notices = |receiver: &mpsc::Receiver<TwsEvent>| {
         receiver.try_iter().filter_map(|e| if let TwsEvent::TwsNotice { code, kind, .. } = e { Some((code, kind)) } else { None }).collect::<Vec<_>>()
     };
-    assert!(crate::connection::handle_incoming_message(&error("-1", "2110"), 200, &sender).is_ok(), "2110 keeps the session");
+    assert!(crate::connection::handle_incoming_message(&error("-1", "2110"), 200, 1, &sender).is_ok(), "2110 keeps the session");
     assert_eq!(notices(&receiver), [(2110, TwsCodeKind::ServerLinkBroken)]);
-    assert!(crate::connection::handle_incoming_message(&error("-1", "9999"), 200, &sender).is_ok());
+    assert!(crate::connection::handle_incoming_message(&error("-1", "9999"), 200, 1, &sender).is_ok());
     assert_eq!(notices(&receiver), [(9999, TwsCodeKind::Unclassified)], "an unknown system notice is reported, not dropped");
-    assert!(crate::connection::handle_incoming_message(&error("42", "9999"), 200, &sender).is_ok());
+    assert!(crate::connection::handle_incoming_message(&error("42", "9999"), 200, 1, &sender).is_ok());
     assert_eq!(notices(&receiver), [], "about request 42: left to that request");
-    assert!(crate::connection::handle_incoming_message(&error("-1", "2104"), 200, &sender).is_ok());
+    assert!(crate::connection::handle_incoming_message(&error("-1", "2104"), 200, 1, &sender).is_ok());
     assert_eq!(notices(&receiver), [], "a farm that is OK is no notice");
-    assert!(crate::connection::handle_incoming_message(&error("-1", "507"), 200, &sender).is_err(), "507 ends the session");
+    assert!(crate::connection::handle_incoming_message(&error("-1", "507"), 200, 1, &sender).is_err(), "507 ends the session");
 }
 
 #[test]
@@ -1213,14 +1215,14 @@ fn a_lost_link_between_tws_and_ib_keeps_the_session_and_is_reported_until_tws_re
     let connectivity = |receiver: &mpsc::Receiver<TwsEvent>| {
         receiver.try_iter().find_map(|event| if let TwsEvent::IbConnectivity { connected, data_lost } = event { Some((connected, data_lost)) } else { None })
     };
-    assert!(crate::connection::handle_incoming_message(&error("1100"), 200, &sender).is_ok(), "1100 does not end the session");
+    assert!(crate::connection::handle_incoming_message(&error("1100"), 200, 1, &sender).is_ok(), "1100 does not end the session");
     assert_eq!(connectivity(&receiver), Some((false, false)));
-    assert!(crate::connection::handle_incoming_message(&error("1101"), 200, &sender).is_ok());
+    assert!(crate::connection::handle_incoming_message(&error("1101"), 200, 1, &sender).is_ok());
     assert_eq!(connectivity(&receiver), Some((true, true)), "back, the market data is gone");
-    assert!(crate::connection::handle_incoming_message(&error("1102"), 200, &sender).is_ok());
+    assert!(crate::connection::handle_incoming_message(&error("1102"), 200, 1, &sender).is_ok());
     assert_eq!(connectivity(&receiver), Some((true, false)), "back with everything kept");
     // A real loss of the session still ends it.
-    assert!(crate::connection::handle_incoming_message(&error("1300"), 200, &sender).is_err());
+    assert!(crate::connection::handle_incoming_message(&error("1300"), 200, 1, &sender).is_err());
 }
 
 #[test]
@@ -1311,7 +1313,7 @@ fn the_head_of_an_open_order_gives_its_contract_and_its_prices_for_every_server_
         (11, "BAG", "BUY", "STP", None, Some(1.2))
     );
     assert_eq!((info.total_quantity, info.tif.as_str(), info.oca_group.as_str()), (1.0, "DAY", "TradePilot-11"));
-    assert_eq!((info.account.as_str(), info.order_ref.as_str()), ("DU1234567", "TraPi-11 (SL)"));
+    assert_eq!((info.account.as_str(), info.order_ref.as_str(), info.client_id, info.perm_id), ("DU1234567", "TraPi-11 (SL)", 0, 123));
 
     // A limit order of one option; an empty aux price is none as well.
     let option_target = [
@@ -1339,8 +1341,11 @@ fn the_head_of_an_open_order_gives_its_contract_and_its_prices_for_every_server_
         "O",
         "0",
         "TraPi-12 (TP)",
+        "1",
+        "456",
     ];
     let info = parse_open_order(&fields(&option_target), 200).unwrap();
+    assert_eq!((info.client_id, info.perm_id), (1, 456), "clientId and permId follow orderRef");
     assert_eq!((info.con_id, info.expiry.as_str(), info.strike, info.right.as_str()), (945_737_094, "20261123", 7155.0, "P"));
     assert_eq!((info.total_quantity, info.limit_price, info.aux_price, info.oca_group.as_str()), (2.0, Some(0.2), None, ""));
 
@@ -1387,4 +1392,135 @@ fn cancel_order_drops_the_legacy_version_field_at_192() {
     assert_eq!(below[1], "42");
     assert_eq!(at[0], "42");
     assert!(at.contains(&i32::MAX.to_string()), "ManualOrderIndicator is sent literally when unset");
+}
+
+/// An `openOrder` of server version 200 for a limit order of one option, placed by `client_id` (fields as `IBApi.EDecoder.OpenOrderEvent`
+/// reads them, up to permId).
+fn open_order_of_client(order_id: &str, client_id: &str) -> Vec<String> {
+    let head = ["5", order_id, "945737094", "SPX", "OPT", "20261123", "7155", "P", "100", "SMART", "USD", "SPXW  261123P07155000", "SPXW"];
+    let order = ["SELL", "1", "STP", "", "4.5", "GTC", "", "DU1234567", "O", "0", "", client_id, "987654"];
+    head.iter().chain(order.iter()).map(std::string::ToString::to_string).collect()
+}
+
+#[test]
+fn an_open_order_of_another_client_is_kept_apart_from_the_orders_of_this_client() {
+    let (sender, receiver) = mpsc::channel();
+    crate::connection::handle_incoming_message(&open_order_of_client("11", "7"), 200, 1, &sender).unwrap();
+    crate::connection::handle_incoming_message(&open_order_of_client("11", "1"), 200, 1, &sender).unwrap();
+    let orders: Vec<TwsEvent> = receiver.try_iter().filter(|e| matches!(e, TwsEvent::OpenOrder { .. } | TwsEvent::OtherClientOrder(_))).collect();
+    match orders.as_slice() {
+        [TwsEvent::OtherClientOrder(other), TwsEvent::OpenOrder { order_id: 11, details: Some(own) }] => {
+            assert_eq!((other.order_id, other.client_id, other.perm_id), (11, 7, 987_654), "the same order id, but another client");
+            assert_eq!(own.client_id, 1);
+        }
+        other => panic!("unexpected events: {} of them", other.len()),
+    }
+}
+
+#[test]
+fn an_order_status_of_another_client_is_kept_apart_from_the_statuses_of_this_client() {
+    // `IBApi.EDecoder.OrderStatusEvent` from server version 131 on: orderId, status, filled, remaining, avgFillPrice, permId, parentId,
+    // lastFillPrice, clientId, whyHeld, mktCapPrice.
+    let status = |client_id: &str| ["3", "11", "Cancelled", "0", "1", "0", "987654", "0", "0", client_id, "", "0"].map(String::from).to_vec();
+    let (sender, receiver) = mpsc::channel();
+    crate::connection::handle_incoming_message(&status("7"), 200, 1, &sender).unwrap();
+    crate::connection::handle_incoming_message(&status("1"), 200, 1, &sender).unwrap();
+    let events: Vec<TwsEvent> = receiver.try_iter().collect();
+    assert!(
+        matches!(events.as_slice(), [TwsEvent::OtherClientOrderStatus { order_id: 11, client_id: 7, .. }, TwsEvent::OrderStatus { order_id: 11, .. }]),
+        "a cancel of another client's order 11 must not reach the order 11 of this app"
+    );
+    assert_eq!(order_status_client_id(&status("7"), 130), None, "below 131 the fields are counted from a version field");
+}
+
+#[test]
+fn all_open_orders_are_asked_for_with_their_own_message_id() {
+    assert_eq!(OUT_REQ_ALL_OPEN_ORDERS, 16);
+    assert_eq!(encode_req_open_orders(), ["1"]);
+}
+
+/// An `openOrder` from a real paper-account session (server version 200, 2026-11-26): a limit order entered by hand in TWS. The account
+/// and the TWS user name are replaced by dummies; everything else is as TWS sent it.
+const MANUAL_TWS_ORDER: &str = "5|0|676632085|INTC|OPT|20261218|55|P|100|SMART|USD|INTC  261218P00055000|INTC|SELL|1|LMT|0.05|0.0|GTC||DU1234567||0||0|622296617|0|0|0||622296617.3/DU1234567/100|||||||||0||-1|0||||||2147483647|0|0|0||3|0|0||0|0||0|Keine||0||||?|0|0||0|0||||||0|0|0|2147483647|2147483647|||0||IB|0|0||0|0|PreSubmitted|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308||||||1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|-9223372036854775808||0||0|0|0|Keine|1.7976931348623157E308|3.3499999999999996|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|1.7976931348623157E308|0||||0|1|0|0|1|||0|||||||0||0||2147483647|tester-paper|0|";
+
+#[test]
+fn an_order_entered_by_hand_in_tws_comes_from_client_0_with_order_id_0_and_its_perm_id() {
+    let fields: Vec<String> = MANUAL_TWS_ORDER.split('|').map(String::from).collect();
+    let info = parse_open_order(&fields, 200).unwrap();
+    assert_eq!((info.order_id, info.client_id, info.perm_id), (0, 0, 622_296_617));
+    assert_eq!((info.con_id, info.symbol.as_str(), info.action.as_str(), info.order_type.as_str()), (676_632_085, "INTC", "SELL", "LMT"));
+    assert_eq!((info.limit_price, info.aux_price, info.tif.as_str(), info.order_ref.as_str()), (Some(0.05), Some(0.0), "GTC", ""));
+    assert_eq!(info.account, "DU1234567");
+    // Client 1 gets it as an order of another client.
+    let (sender, receiver) = mpsc::channel();
+    crate::connection::handle_incoming_message(&fields, 200, 1, &sender).unwrap();
+    assert!(receiver.try_iter().any(|e| matches!(e, TwsEvent::OtherClientOrder(other) if other.perm_id == 622_296_617)));
+    // What the raw log line shows: the fields the app reads up to the combo legs, the account masked wherever it stands (also in the
+    // share allocation), not the TWS user name at the end.
+    let (_, after) = open_order_combo_legs(&fields, 200).unwrap();
+    let raw = crate::connection::masked_head(&fields, after, open_order_first_field(200) + OPEN_ORDER_ACCOUNT);
+    assert!(raw.contains("|GTC||DU12***4567||0||0|622296617|") && raw.contains("|622296617.3/DU12***4567/100|"), "{raw}");
+    assert!(!raw.contains("tester-paper") && !raw.contains("DU1234567"), "{raw}");
+}
+
+#[test]
+fn the_combo_legs_of_an_open_order_are_found_behind_the_fields_before_them() {
+    let fields: Vec<String> = MANUAL_TWS_ORDER.split('|').map(String::from).collect();
+    // The German TWS sends the delta-neutral order type as "Keine", not empty: the eight delta-neutral fields follow, then the count
+    // of legs (0) at field 78 and of order combo legs (0) at 79; the smart combo routing count (0) and the scale sizes (the largest
+    // int) come after them.
+    assert_eq!(open_order_combo_legs(&fields, 200), Some((Vec::new(), 80)));
+    assert_eq!((fields[80].as_str(), fields[81].as_str()), ("0", "2147483647"));
+    assert_eq!(parse_open_order(&fields, 200).unwrap().combo_legs, Some(Vec::new()));
+
+    // A combo of two legs: the 8 fields of each leg, then one price per order combo leg.
+    let mut combo = fields[..78].to_vec();
+    let leg = |con_id: &str, action: &str| [con_id, "1", action, "SMART", "0", "0", "", "-1"].map(String::from);
+    combo.push("2".into());
+    combo.extend(leg("111", "SELL"));
+    combo.extend(leg("222", "BUY"));
+    combo.extend(["2", "", ""].map(String::from));
+    combo.extend(fields[80..].iter().cloned());
+    let legs = vec![OpenOrderLeg { con_id: 111, ratio: 1, action: "SELL".into() }, OpenOrderLeg { con_id: 222, ratio: 1, action: "BUY".into() }];
+    assert_eq!(open_order_combo_legs(&combo, 200), Some((legs, 98)));
+
+    // Without a delta-neutral order type the eight fields are not sent.
+    let mut plain = fields[..61].to_vec();
+    plain.push(String::new());
+    plain.extend(fields[62..63].iter().cloned());
+    plain.extend(fields[71..].iter().cloned());
+    assert_eq!(open_order_combo_legs(&plain, 200), Some((Vec::new(), 72)));
+
+    // Below server version 177 one more FA field comes, below 103 no model code, and below 145 the message version comes before the
+    // order id: the walk moves with them.
+    let mut older = fields.clone();
+    older.insert(34, String::new());
+    assert_eq!(open_order_combo_legs(&older, 176), Some((Vec::new(), 81)));
+    older.remove(35);
+    older.insert(1, "34".into());
+    assert_eq!(open_order_combo_legs(&older, 102), Some((Vec::new(), 81)));
+
+    // A message that ends inside the legs gives nothing.
+    assert_eq!(open_order_combo_legs(&combo[..90], 200), None);
+}
+
+#[test]
+fn the_stop_price_of_a_trailing_stop_is_read_after_the_reference_price_type() {
+    let fields: Vec<String> = MANUAL_TWS_ORDER.split('|').map(String::from).collect();
+    // A limit order has none: TWS leaves field 73 (after "Keine", its eight fields, continuousUpdate and referencePriceType) empty.
+    assert_eq!(fields[73], "");
+    assert_eq!(parse_open_order(&fields, 200).unwrap().trail_stop_price, None);
+    let mut trailing = fields.clone();
+    trailing[73] = "1.35".into();
+    assert_eq!(parse_open_order(&trailing, 200).unwrap().trail_stop_price, Some(1.35));
+    assert_eq!(open_order_combo_legs(&trailing, 200), Some((Vec::new(), 80)), "the legs are found as before");
+    trailing[73] = "1.7976931348623157E308".into();
+    assert_eq!(open_order_trail_stop_price(&trailing, 200), None, "the unset value");
+    // Without a delta-neutral order type it stands four fields after it.
+    let mut plain = fields[..61].to_vec();
+    plain.push(String::new());
+    plain.extend(fields[62..63].iter().cloned());
+    plain.extend(fields[71..].iter().cloned());
+    plain[65] = "2.5".into();
+    assert_eq!(open_order_trail_stop_price(&plain, 200), Some(2.5));
 }

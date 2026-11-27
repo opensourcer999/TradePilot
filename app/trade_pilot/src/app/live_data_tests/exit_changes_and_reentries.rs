@@ -291,7 +291,7 @@ fn a_limit_exit_without_a_quote_waits_and_then_goes_to_market_and_a_missed_windo
     app.check_timed_exits(app.clock.new_york());
     app.poll_tws();
     assert!(orders_sent_now(&commands).is_empty(), "nothing is sent after the window");
-    assert!(mail_lines(&app).iter().any(|l| l.contains("\"ALERT: Timed close not completed\"")), "{:?}", mail_lines(&app));
+    assert!(mail_lines(&app).iter().any(|l| l.contains("\"TradePilot: ALERT: Timed close not completed\"")), "{:?}", mail_lines(&app));
     assert_eq!(app.trades_stored.first().unwrap().timed_exit, None, "dropped");
 }
 
@@ -300,7 +300,7 @@ fn a_stop_and_a_target_can_be_attached_to_an_open_trade_that_lacks_them() {
     let (mut app, commands) = app_with_a_sent_template_order(true);
     filled_trade_with_exits(&mut app, &commands);
     // A trade that has both offers them for a change, prefilled with the prices on record.
-    app.request_exits(0);
+    app.open_exits_answered(0);
     assert!(app.exits_pending.is_some(), "an existing stop and target can be changed");
     app.exits_pending = None;
     // The stop and the target are gone (say, cancelled in TWS and the trade was edited by hand).
@@ -308,7 +308,7 @@ fn a_stop_and_a_target_can_be_attached_to_an_open_trade_that_lacks_them() {
     (bare.stop_order_id, bare.profit_order_id, bare.profit_price, bare.oca_group, bare.adjustments) = (None, None, None, None, None);
     bare.set_stop(None);
     app.trades_stored[0] = bare;
-    app.request_exits(0);
+    app.open_exits_answered(0);
     assert!(app.exits_pending.is_some());
     app.exits_pending.as_mut().unwrap().stop = "0,90".to_string();
     app.exits_pending.as_mut().unwrap().target = "0.15".to_string();
@@ -330,7 +330,7 @@ fn a_stop_and_a_target_can_be_attached_to_an_open_trade_that_lacks_them() {
     assert_eq!(trade.oca_group.as_deref(), Some(stop.oca_group.as_str()));
     assert_eq!(trade.stop_price.map(|p| p.normalize().to_string()).as_deref(), Some("0.9"));
     // Changing the stop re-sends the working order under its own id; the unchanged target is left alone.
-    app.request_exits(0);
+    app.open_exits_answered(0);
     let pending = app.exits_pending.as_mut().expect("both can be changed");
     assert_eq!((pending.stop.as_str(), pending.target.as_str()), ("0.9", "0.15"));
     pending.stop = "1,10".to_string();
@@ -358,7 +358,7 @@ fn a_changed_stop_is_the_stop_the_list_shows_also_when_the_adjustments_keep_one(
     trade.adjustments = Some(StopAdjustments { stop: trade.stop_price.map(|p| p.normalize().to_string()), ..StopAdjustments::default() });
     app.trades_stored[0] = trade;
     let stop_id = app.trades_stored.first().unwrap().stop_order_id.unwrap();
-    app.request_exits(0);
+    app.open_exits_answered(0);
     app.exits_pending.as_mut().expect("the stop can be changed").stop = "1,10".to_string();
     app.confirm_exits();
     drain(&commands);
@@ -371,7 +371,7 @@ fn a_changed_stop_is_the_stop_the_list_shows_also_when_the_adjustments_keep_one(
 #[test]
 fn a_typed_price_that_rounds_to_the_price_on_record_sends_nothing() {
     let (mut app, commands, _) = trade_with_attached_exits();
-    app.request_exits(0);
+    app.open_exits_answered(0);
     // 0.92 lies on the 0.05 grid of an SPX spread at 0.90, the stop on record.
     app.exits_pending.as_mut().unwrap().stop = "0,92".to_string();
     app.confirm_exits();
@@ -393,7 +393,7 @@ fn the_target_of_a_running_trade_can_be_given_as_a_percentage_of_its_credit() {
     // In the window: the working target is changed to the price the percentage stands for, on the price grid.
     let (mut app, commands, _) = trade_with_attached_exits();
     let open = app.trades_stored.first().unwrap().price_open;
-    app.request_exits(0);
+    app.open_exits_answered(0);
     app.exits_pending.as_mut().unwrap().target = "80%".to_string();
     app.confirm_exits();
     let sent = drain(&commands);
@@ -419,7 +419,7 @@ fn the_stop_of_a_running_trade_can_be_given_as_the_loss_in_percent_of_its_credit
     // In the window: the working stop is changed to the price the percentage stands for, on the price grid.
     let (mut app, commands, stop_id) = trade_with_attached_exits();
     let open = app.trades_stored.first().unwrap().price_open;
-    app.request_exits(0);
+    app.open_exits_answered(0);
     app.exits_pending.as_mut().unwrap().stop = "300%".to_string();
     app.confirm_exits();
     let sent = drain(&commands);
@@ -439,7 +439,7 @@ fn a_value_without_its_unit_or_a_stop_price_far_above_the_trade_is_never_sent() 
     (bare.stop_order_id, bare.profit_order_id, bare.profit_price, bare.oca_group, bare.adjustments) = (None, None, None, None, None);
     bare.set_stop(None);
     app.trades_stored[0] = bare;
-    app.request_exits(0);
+    app.open_exits_answered(0);
     let pending = app.exits_pending.as_mut().unwrap();
     assert_eq!((pending.stop_unit, pending.target_unit), (None, None), "an empty field has no unit until the user chooses");
     // "300" alone: a price or 300%? Nothing is sent, the window stays open.
@@ -466,7 +466,7 @@ fn a_value_without_its_unit_or_a_stop_price_far_above_the_trade_is_never_sent() 
 fn a_change_that_tws_refuses_or_that_meets_an_ended_order_keeps_the_old_price() {
     // TWS refuses the modify.
     let (mut app, commands, stop_id) = trade_with_attached_exits();
-    app.request_exits(0);
+    app.open_exits_answered(0);
     app.exits_pending.as_mut().unwrap().stop = "1.1".to_string();
     app.confirm_exits();
     drain(&commands);
@@ -482,7 +482,7 @@ fn a_change_that_tws_refuses_or_that_meets_an_ended_order_keeps_the_old_price() 
     assert_eq!(stop_price(&app).as_deref(), Some("0.9"));
     // The order was cancelled in TWS before the change reached it: the trade shows no stop, not one at the new price.
     let (mut app, commands, stop_id) = trade_with_attached_exits();
-    app.request_exits(0);
+    app.open_exits_answered(0);
     app.exits_pending.as_mut().unwrap().stop = "1.1".to_string();
     app.confirm_exits();
     drain(&commands);
@@ -505,7 +505,7 @@ fn a_stop_cancelled_in_tws_disappears_from_the_trade_and_can_be_attached_again()
     assert_eq!((trade.profit_order_id, trade.profit_price.is_some()), (Some(12), true), "the target stays");
     assert!(trade.is_open());
     // The Dashboard offers a new stop, but no new target.
-    app.request_exits(0);
+    app.open_exits_answered(0);
     assert!(app.exits_pending.is_some());
     assert_eq!(attach::missing_exits(app.trades_stored.first().unwrap()), (true, false));
 }
@@ -521,4 +521,214 @@ fn a_profit_target_cancelled_in_tws_disappears_from_the_trade_too() {
     assert_eq!(trade.stop_order_id, Some(11), "the stop stays");
     assert!(trade.is_open());
     assert_eq!(attach::missing_exits(trade), (false, true));
+}
+
+#[test]
+fn a_target_that_tws_cancels_with_the_deleted_stop_is_placed_again_in_a_group_of_its_own() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    filled_trade_with_exits(&mut app, &commands);
+    let before = app.trades_stored.first().unwrap().clone();
+    let target = before.target_now().expect("a target");
+    app.delete_exit_orders(0, true);
+    assert_eq!(cancelled_orders(&drain(&commands)), [11], "only the stop is cancelled by the app");
+    // As in a real session: TWS cancels the target of the same OCA group with the stop.
+    app.tws_sender.send(order_status(12, "PendingCancel", 0.0, 1.0)).unwrap();
+    app.tws_sender.send(order_status(11, "Cancelled", 0.0, 1.0)).unwrap();
+    app.tws_sender.send(order_status(12, "Cancelled", 0.0, 1.0)).unwrap();
+    app.poll_tws();
+    let placed = placed_orders(&drain(&commands));
+    assert_eq!(placed.len(), 1, "{:?}", app.log_lines);
+    let (id, order) = &placed[0];
+    assert_eq!((order.order_type.as_str(), order.lmt_price), ("LMT", target.to_f64().unwrap()));
+    assert_ne!(Some(order.oca_group.clone()), before.oca_group, "not the group TWS just cancelled");
+    let trade = app.trades_stored.first().unwrap();
+    assert_eq!((trade.stop_order_id, trade.profit_order_id, trade.target_now()), (None, Some(*id), Some(target)));
+    assert!(app.log_lines.iter().any(|l| l.contains("The profit target 12") && l.contains("by TWS with the deleted stop")), "{:?}", app.log_lines);
+    assert!(!app.log_lines.iter().any(|l| l.contains("WARNING")), "{:?}", app.log_lines);
+}
+
+#[test]
+fn a_stop_that_tws_cancels_with_the_deleted_target_comes_back_once_both_have_ended() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    app.settings.alert_flags.missing_stop_notifications_enabled = true;
+    filled_trade_with_exits(&mut app, &commands);
+    let stop = app.trades_stored.first().unwrap().stop_now().expect("a stop");
+    app.delete_exit_orders(0, false);
+    assert_eq!(cancelled_orders(&drain(&commands)), [12]);
+    // The stop's end comes first: nothing is placed while the deleted target still works.
+    app.tws_sender.send(order_status(11, "Cancelled", 0.0, 1.0)).unwrap();
+    app.poll_tws();
+    assert!(placed_orders(&drain(&commands)).is_empty());
+    app.tws_sender.send(order_status(12, "Cancelled", 0.0, 1.0)).unwrap();
+    app.poll_tws();
+    let placed = placed_orders(&drain(&commands));
+    let orders: Vec<(&str, f64)> = placed.iter().map(|(_, o)| (o.order_type.as_str(), o.aux_price)).collect();
+    assert_eq!(orders, [("STP", stop.to_f64().unwrap())], "{:?}", app.log_lines);
+    assert_eq!(app.trades_stored.first().unwrap().stop_now(), Some(stop));
+    assert!(!app.log_lines.iter().any(|l| l.contains("WARNING")), "{:?}", app.log_lines);
+    assert!(mail_lines(&app).is_empty(), "{:?}", mail_lines(&app));
+}
+
+#[test]
+fn a_stop_attached_in_the_window_and_cancelled_by_tws_with_the_deleted_target_comes_back() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    app.settings.alert_flags.missing_stop_notifications_enabled = true;
+    filled_trade_with_exits(&mut app, &commands);
+    // Both exits end in TWS; "Stop / target" attaches a new pair in one OCA group.
+    app.tws_sender.send(order_status(11, "Cancelled", 0.0, 1.0)).unwrap();
+    app.tws_sender.send(order_status(12, "Cancelled", 0.0, 1.0)).unwrap();
+    app.poll_tws();
+    drain(&commands);
+    app.open_exits_answered(0);
+    let pending = app.exits_pending.as_mut().expect("stop and target can be attached");
+    pending.stop = "1.5".into();
+    pending.stop_unit = Some(attach::ExitUnit::Price);
+    pending.target = "0.05".into();
+    pending.target_unit = Some(attach::ExitUnit::Price);
+    app.confirm_exits();
+    let attached = placed_orders(&drain(&commands));
+    assert_eq!(attached.len(), 2, "{:?}", app.log_lines);
+    let (stop_id, target_id) = (attached[0].0, attached[1].0);
+    app.log_lines.clear();
+    // The target is deleted; TWS cancels the stop of the same group first, then the target.
+    app.delete_exit_orders(0, false);
+    assert_eq!(cancelled_orders(&drain(&commands)), [target_id]);
+    app.tws_sender.send(order_status(stop_id, "Cancelled", 0.0, 1.0)).unwrap();
+    app.tws_sender.send(order_status(target_id, "Cancelled", 0.0, 1.0)).unwrap();
+    app.poll_tws();
+    let placed = placed_orders(&drain(&commands));
+    let orders: Vec<(&str, f64)> = placed.iter().map(|(_, o)| (o.order_type.as_str(), o.aux_price)).collect();
+    assert_eq!(orders, [("STP", 1.5)], "{:?}", app.log_lines);
+    assert_eq!(app.trades_stored.first().unwrap().stop_now(), Some(Decimal::new(15, 1)));
+    assert!(!app.log_lines.iter().any(|l| l.contains("WARNING")), "{:?}", app.log_lines);
+    assert!(mail_lines(&app).is_empty(), "{:?}", mail_lines(&app));
+}
+
+#[test]
+fn an_exit_that_ends_long_after_the_other_was_deleted_is_a_warning_and_not_placed_again() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    filled_trade_with_exits(&mut app, &commands);
+    app.delete_exit_orders(0, true);
+    app.tws_sender.send(order_status(11, "Cancelled", 0.0, 1.0)).unwrap();
+    app.poll_tws();
+    drain(&commands);
+    // TWS left the target working; two minutes later it is cancelled by hand in TWS.
+    let later = app.watch.kept_exits[0].at.checked_sub(Duration::from_secs(120)).unwrap();
+    app.watch.kept_exits[0].at = later;
+    app.tws_sender.send(order_status(12, "Cancelled", 0.0, 1.0)).unwrap();
+    app.poll_tws();
+    assert!(placed_orders(&drain(&commands)).is_empty());
+    assert!(app.log_lines.iter().any(|l| l.contains("WARNING: the profit target 12")), "{:?}", app.log_lines);
+}
+
+/// Deletes the profit target of the trade at 0, and TWS cancels the whole OCA group with it: the target, then the stop orders.
+fn delete_target_and_tws_cancels_the_group(app: &mut App, commands: &mpsc::Receiver<TwsCommand>) -> Vec<(i32, IbOrder)> {
+    let trade = app.trades_stored.first().unwrap().clone();
+    drain(commands);
+    app.delete_exit_orders(0, false);
+    let target = super::attach::working_target_ids(&trade);
+    assert_eq!(cancelled_orders(&drain(commands)), target, "the app cancels only the target");
+    for id in target.iter().chain([trade.stop_order_id, trade.stop_limit_order_id].iter().flatten()) {
+        app.tws_sender.send(order_status(*id, "Cancelled", 0.0, 1.0)).unwrap();
+    }
+    app.poll_tws();
+    placed_orders(&drain(commands))
+}
+
+#[test]
+fn a_rel_stop_cancelled_with_the_deleted_target_comes_back_as_the_same_rel_stop() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    let before = placed_orders(&filled_trade_with_a_rel_stop(&mut app, &commands, |t| {
+        t.stop_rel_limit = Some(3.0);
+        t.stop_rel_offset = Some(0.25);
+    }));
+    let old = before[0].1.clone();
+    assert_eq!(old.order_type, "REL");
+    let placed = delete_target_and_tws_cancels_the_group(&mut app, &commands);
+    assert_eq!(placed.len(), 1, "{:?}", app.log_lines);
+    let (id, stop) = &placed[0];
+    assert_eq!(
+        (stop.order_type.as_str(), stop.lmt_price, stop.aux_price, stop.action.as_str(), stop.total_quantity),
+        ("REL", 3.0, 0.25, "BUY", old.total_quantity),
+        "the same kind of stop, not a plain STP"
+    );
+    assert_eq!(stop.conditions, old.conditions, "with its price condition");
+    assert_ne!(stop.oca_group, old.oca_group, "in a group of its own");
+    let trade = app.trades_stored.first().unwrap();
+    assert_eq!((trade.stop_order_id, trade.profit_order_id), (Some(*id), None));
+    assert_eq!(trade.adjustments.as_ref().map(|a| a.order_type.as_str()), Some("Market stop"), "the record stays for the adjustments");
+    assert!(!app.log_lines.iter().any(|l| l.contains("WARNING")), "{:?}", app.log_lines);
+}
+
+#[test]
+fn a_stop_limit_with_its_market_backstop_comes_back_as_both_orders() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    let before = placed_orders(&filled_trade_with_a_rel_stop(&mut app, &commands, |t| {
+        t.stop_flags.stop_rel = false;
+        t.stop_order_type = "Limit stop with OCO".into();
+        t.stop_limit_offset = Some(0.1);
+        t.stop_limit_market_offset = Some(0.2);
+    }));
+    let old: Vec<(String, f64, f64)> =
+        before.iter().filter(|(_, o)| o.order_type != "LMT").map(|(_, o)| (o.order_type.clone(), o.aux_price, o.lmt_price)).collect();
+    assert_eq!(old.len(), 2, "a market backstop and a stop-limit");
+    let placed = delete_target_and_tws_cancels_the_group(&mut app, &commands);
+    let new: Vec<(String, f64, f64)> = placed.iter().map(|(_, o)| (o.order_type.clone(), o.aux_price, o.lmt_price)).collect();
+    assert_eq!(new, old, "{:?}", app.log_lines);
+    let trade = app.trades_stored.first().unwrap();
+    assert!(trade.stop_order_id.is_some() && trade.stop_limit_order_id.is_some());
+}
+
+#[test]
+fn a_trailing_stop_cancelled_with_the_deleted_target_comes_back_at_the_price_tws_trailed_it_to() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    let before = placed_orders(&filled_trade_with_a_rel_stop(&mut app, &commands, |t| {
+        t.stop_flags.stop_rel = false;
+        t.stop_order_type = "Trailing".into();
+        t.stop_multiple = 0.0;
+        t.stop_offset = 0.5;
+    }));
+    let (stop_id, old) = before.iter().find(|(_, o)| o.order_type == "TRAIL").cloned().unwrap();
+    assert_eq!((old.aux_price, old.trail_stop_price), (0.5, 0.8), "it starts at the credit plus its amount");
+    // TWS has trailed the stop down to 0.60: its openOrder says so in the trailStopPrice.
+    app.tws_sender.send(working_with(stop_id, "TRAIL", None, Some(0.5), |info| info.trail_stop_price = Some(0.6))).unwrap();
+    app.poll_tws();
+    let trade = app.trades_stored.first().unwrap();
+    assert_eq!(trade.stop_now(), Some(Decimal::new(6, 1)));
+    assert_eq!(trade.adjustments.as_ref().and_then(|a| a.stop.as_deref()), Some("0.6"));
+    assert!(
+        app.log_lines.iter().any(|l| l.contains(&format!("The trailing stop {stop_id} of")) && l.contains("is at 0.6 in TWS (0.8 on record)")),
+        "{:?}",
+        app.log_lines
+    );
+    let placed = delete_target_and_tws_cancels_the_group(&mut app, &commands);
+    assert_eq!(placed.len(), 1, "{:?}", app.log_lines);
+    let stop = &placed[0].1;
+    assert_eq!((stop.order_type.as_str(), stop.aux_price, stop.trail_stop_price), ("TRAIL", 0.5, 0.6), "from where TWS had it, not from 0.80");
+    assert!(!app.log_lines.iter().any(|l| l.contains("WARNING")), "{:?}", app.log_lines);
+}
+
+#[test]
+fn a_trailed_price_reported_while_the_kept_stop_waits_is_the_price_it_comes_back_at() {
+    let (mut app, commands) = app_with_a_sent_template_order(true);
+    let before = placed_orders(&filled_trade_with_a_rel_stop(&mut app, &commands, |t| {
+        t.stop_flags.stop_rel = false;
+        t.stop_order_type = "Trailing".into();
+        t.stop_multiple = 0.0;
+        t.stop_offset = 0.5;
+    }));
+    let (stop_id, _) = before.iter().find(|(_, o)| o.order_type == "TRAIL").cloned().unwrap();
+    let trade = app.trades_stored.first().unwrap().clone();
+    drain(&commands);
+    app.delete_exit_orders(0, false);
+    drain(&commands);
+    // Between the delete and the cancel TWS reports the stop trailed to 0.55.
+    app.tws_sender.send(working_with(stop_id, "TRAIL", None, Some(0.5), |info| info.trail_stop_price = Some(0.55))).unwrap();
+    for id in super::attach::working_target_ids(&trade).iter().chain([stop_id].iter()) {
+        app.tws_sender.send(order_status(*id, "Cancelled", 0.0, 1.0)).unwrap();
+    }
+    app.poll_tws();
+    let placed = placed_orders(&drain(&commands));
+    assert_eq!(placed.len(), 1, "{:?}", app.log_lines);
+    assert_eq!((placed[0].1.order_type.as_str(), placed[0].1.trail_stop_price), ("TRAIL", 0.55));
 }

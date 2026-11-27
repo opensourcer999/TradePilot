@@ -3,7 +3,7 @@
 use super::{
     card_bg, format_date, format_delta, format_strike, header_text, muted_text, navy_bar, App, ChainSymbol, Color32, OptionContract, RichText, Session,
 };
-use super::{mask_account, TwsCommand, GREEN_TXT, RED};
+use super::{mask_account, TwsCommand, GREEN_TXT, ORANGE_WARN, RED};
 use crate::widgets::{PlasticRows, TableCell, TableColumn};
 use eframe::egui;
 
@@ -72,7 +72,87 @@ impl App {
             ui.colored_label(muted_text(), self.tr("TWS reports no open positions.", "Die TWS meldet keine offenen Positionen."));
         } else {
             self.live_positions_table(ui);
+            ui.add_space(18.0);
+            self.unmanaged_positions_table(ui);
         }
+    }
+
+    /// The option positions no open trade of this app holds (`unmanaged::unmanaged_positions`), with the part of each that has no trade.
+    fn unmanaged_positions_table(&mut self, ui: &mut egui::Ui) {
+        ui.strong(self.tr("Positions Without a Trade", "Positionen ohne Trade"));
+        ui.add_space(6.0);
+        let Some(found) = crate::unmanaged::unmanaged_positions(&self.positions, &self.trades_stored) else {
+            ui.colored_label(
+                ORANGE_WARN,
+                self.tr(
+                    "The positions cannot be compared with the trades: a quantity TWS reported cannot be read.",
+                    "Die Positionen lassen sich nicht mit den Trades vergleichen: eine Menge der TWS ist nicht lesbar.",
+                ),
+            );
+            return;
+        };
+        if found.is_empty() {
+            ui.colored_label(muted_text(), self.tr("Every option position belongs to an open trade.", "Jede Optionsposition gehört zu einem offenen Trade."));
+            return;
+        }
+        let keys = ["account", "symbol", "contract", "dte", "quantity", "without_trade", "average_cost"];
+        let titles = [
+            self.tr("Account", "Konto"),
+            "Symbol",
+            self.tr("Contract", "Kontrakt"),
+            "DTE",
+            self.tr("Position", "Position"),
+            self.tr("Without trade", "Ohne Trade"),
+            self.tr("Average cost", "Einstandskosten"),
+        ];
+        let weights = [1.3, 0.9, 1.6, 0.6, 0.8, 0.9, 1.1];
+        let columns: Vec<TableColumn> = titles.iter().zip(weights).enumerate().map(|(i, (title, weight))| TableColumn::new(*title, weight, i >= 3)).collect();
+        let today = self.clock.new_york_today();
+        let shown: Vec<(&crate::unmanaged::UnmanagedPosition, &broker::Position)> =
+            found.iter().filter_map(|u| self.positions.get(u.position).map(|p| (u, p))).collect();
+        let row_keys: Vec<Option<super::import::PositionKey>> = shown.iter().map(|(u, _)| self.position_key(u.position)).collect();
+        let ticked: Vec<usize> =
+            row_keys.iter().enumerate().filter(|(_, key)| key.as_ref().is_some_and(|k| self.import.selection.contains(k))).map(|(i, _)| i).collect();
+        let rows: Vec<Vec<TableCell>> = shown
+            .iter()
+            .map(|(u, p)| {
+                vec![
+                    TableCell::new(&p.account),
+                    TableCell::new(&p.symbol),
+                    TableCell::new(contract_text(p)),
+                    TableCell::new(days_to_expiry(&p.expiry, &today).map_or_else(|| "-".to_string(), |days| days.to_string())),
+                    TableCell::new(format!("{}", p.quantity)),
+                    TableCell { text: u.quantity.normalize().to_string(), color: Some(ORANGE_WARN), strong: true, ..TableCell::default() },
+                    TableCell::new(p.average_cost.map_or_else(|| "-".to_string(), |cost| format!("{cost:.2}"))),
+                ]
+            })
+            .collect();
+        let selection = crate::widgets::RowSelection { selected: None, ticked: &ticked, locked: &[] };
+        let clicks = crate::widgets::arranged_table(ui, "unmanaged_positions", &keys, &columns, &rows, Some(selection));
+        crate::widgets::toggle_selection(&mut self.import.selection, clicks, |row| row_keys.get(row).cloned().flatten());
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            let can_take_over = !self.import.selection.is_empty();
+            if ui.add_enabled(can_take_over, crate::widgets::MetalButton::new(self.tr("Take over as trade ...", "Als Trade übernehmen ..."))).clicked() {
+                self.open_import();
+            }
+            match self.import_selection_note() {
+                Some((note, ok)) => {
+                    ui.label(RichText::new(note).color(super::import::note_color(ok)));
+                }
+                None => {
+                    ui.label(RichText::new(self.tr("Tick the legs of one trade.", "Die Beine eines Trades anhaken.")).color(muted_text()));
+                }
+            }
+        });
+        ui.label(
+            RichText::new(self.tr(
+                "Option positions TWS holds that no open trade of this app accounts for: opened by hand in TWS, by another program or on another computer, or long options kept for reuse.",
+                "Optionspositionen der TWS, die zu keinem offenen Trade dieser App gehören: von Hand in der TWS, von einem anderen Programm oder auf einem anderen Rechner eröffnet, oder Long-Optionen, die zur Weiterverwendung liegen bleiben.",
+            ))
+            .small()
+            .color(muted_text()),
+        );
     }
 
     /// Asks TWS once per session for the portfolio values of the account (`reqAccountUpdates`): of the account the positions are on,
@@ -160,11 +240,10 @@ impl App {
             .map(|p| {
                 let (price, value) = self.position_figures(p);
                 let color = value.map(|v| if v.profit < rust_decimal::Decimal::ZERO { RED } else { GREEN_TXT });
-                let contract = if p.security_type == "OPT" { format!("{} {} {}", p.expiry, format_strike(p.strike), p.right) } else { String::new() };
                 vec![
                     TableCell::new(&p.account),
                     TableCell::new(&p.symbol),
-                    TableCell::new(contract),
+                    TableCell::new(contract_text(p)),
                     TableCell::new(&p.security_type),
                     TableCell::new(format!("{}", p.quantity)),
                     TableCell::new(p.average_cost.map_or_else(|| "-".to_string(), |cost| format!("{cost:.2}"))),
@@ -350,6 +429,22 @@ impl App {
     }
 }
 
+/// The contract of a position as the position tables show it: "20261218 6650 P" for an option, empty otherwise.
+fn contract_text(position: &broker::Position) -> String {
+    if position.security_type == "OPT" {
+        format!("{} {} {}", position.expiry, format_strike(position.strike), position.right)
+    } else {
+        String::new()
+    }
+}
+
+/// The calendar days from `today` to `expiry` (both yyyyMMdd), counted like the DTE of the option chain; `None` when one of them
+/// cannot be read (a stock has no expiry).
+fn days_to_expiry(expiry: &str, today: &str) -> Option<i64> {
+    let parse = |day: &str| chrono::NaiveDate::parse_from_str(day.trim(), "%Y%m%d").ok();
+    Some((parse(expiry)? - parse(today)?).num_days())
+}
+
 /// Whether a portfolio row of TWS agrees with the position TWS reported for the same contract: the same quantity and, when both
 /// carry one, the same average cost. Both come from TWS, so a difference means the app did not read the message where its values are.
 fn portfolio_matches(position: &broker::Position, row: &broker::PortfolioRow) -> bool {
@@ -360,7 +455,14 @@ fn portfolio_matches(position: &broker::Position, row: &broker::PortfolioRow) ->
 
 #[cfg(test)]
 mod tests {
-    use super::portfolio_matches;
+    use super::{days_to_expiry, portfolio_matches};
+
+    #[test]
+    fn days_to_expiry_counts_calendar_days() {
+        assert_eq!(days_to_expiry("20261127", "20261127"), Some(0), "expires today");
+        assert_eq!(days_to_expiry("20261130", "20261127"), Some(3), "over the weekend");
+        assert_eq!(days_to_expiry("", "20261127"), None, "a stock");
+    }
 
     fn position(quantity: f64, average_cost: Option<f64>) -> broker::Position {
         broker::Position {

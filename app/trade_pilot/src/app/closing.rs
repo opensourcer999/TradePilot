@@ -84,6 +84,7 @@ impl App {
         let price = crate::pricing::parse_decimal(&pending.price).filter(|p| *p >= Decimal::ZERO);
         if pending.kind == CloseKind::Mark {
             self.mark_closed(index, &trade, price);
+            self.trade_edit_done();
             return;
         }
 
@@ -100,6 +101,7 @@ impl App {
         match self.place_close_order(index, limit) {
             Ok(order_id) => {
                 self.instant.template_status = Some(format!("#{order_id}: {}", self.tr("close order sent to TWS", "Close-Order an die TWS gesendet")));
+                self.trade_edit_done();
             }
             Err(reason) => self.block_close(&reason),
         }
@@ -134,7 +136,7 @@ impl App {
             lmt_price: limit_price,
             tif: "DAY".to_string(),
             account: trade.account.clone(),
-            order_ref: crate::trade_rebuild::order_ref(order_id, "Close"),
+            order_ref: crate::trade_rebuild::exit_order_ref(trade.order_id, order_id, "Close"),
             oca_group,
             oca_type,
             handling: OrderHandling { transmit: true, ..OrderHandling::default() },
@@ -318,6 +320,7 @@ impl App {
             if ui.add(crate::widgets::MetalButton::new(self.tr("Yes, delete", "Ja, löschen"))).clicked() {
                 self.watch.delete_asked = None;
                 self.delete_exit_orders(index, stop);
+                self.trade_edit_done();
             }
             if ui.add(crate::widgets::MetalButton::new(self.tr("No", "Nein"))).clicked() {
                 self.watch.delete_asked = None;

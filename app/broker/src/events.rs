@@ -33,6 +33,9 @@ pub enum TwsCommand {
     /// Which orders of this client are still working (`reqOpenOrders`): answered by
     /// `TwsEvent::OpenOrder` for each, then `TwsEvent::OpenOrderEnd`.
     RequestOpenOrders,
+    /// The working orders of every API client (`reqAllOpenOrders`): answered by an `openOrder` for each, then `openOrderEnd`. The
+    /// orders of other clients come in as `TwsEvent::OtherClientOrder`.
+    RequestAllOpenOrders,
     /// The current time of TWS (`reqCurrentTime`), answered by `TwsEvent::CurrentTime`: an answer proves that the API connection
     /// carries messages both ways.
     RequestCurrentTime,
@@ -131,6 +134,26 @@ pub struct OpenOrderInfo {
     pub account: String,
     /// The order reference (`TraPi-12 (SL)` for an order of this app).
     pub order_ref: String,
+    /// The API client that placed the order (`IBApi.Order.ClientId`).
+    pub client_id: i32,
+    /// The id TWS gives the order, the same for every client (`IBApi.Order.PermId`).
+    pub perm_id: i64,
+    /// The legs of a combo order (`IBApi.Contract.ComboLegs`); empty for an order of one contract, `None` when that part of the
+    /// message cannot be read (see `open_order_combo_legs`).
+    pub combo_legs: Option<Vec<OpenOrderLeg>>,
+    /// The stop price of a trailing stop (`IBApi.Order.TrailStopPrice`); `None` when TWS sends none.
+    pub trail_stop_price: Option<f64>,
+}
+
+/// One leg of a combo order as `openOrder` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenOrderLeg {
+    /// The contract id of the leg.
+    pub con_id: i32,
+    /// How many of the leg go with one combo.
+    pub ratio: i32,
+    /// "BUY" or "SELL".
+    pub action: String,
 }
 
 /// One position of the portfolio as TWS values it (`updatePortfolio`): the figures TWS shows for it itself.
@@ -317,6 +340,21 @@ pub enum TwsEvent {
     },
     /// The list of working orders (`OpenOrder`) is complete (`openOrderEnd`).
     OpenOrderEnd,
+    /// A working order that another API client placed (`openOrder` with another `clientId`). Order ids count per client, so its id
+    /// may be the id of an order of this app as well: it is kept apart from `OpenOrder`.
+    OtherClientOrder(Box<OpenOrderInfo>),
+    /// The status of an order of another API client (`orderStatus` with another `clientId`), kept apart from `OrderStatus` for the
+    /// same reason.
+    OtherClientOrderStatus {
+        /// The order id, as the other client counts it.
+        order_id: i32,
+        /// The client that placed the order.
+        client_id: i32,
+        /// The id TWS gives the order for every client; `None` when it cannot be read.
+        perm_id: Option<i64>,
+        /// TWS's order status.
+        status: String,
+    },
     /// One position of the account with what TWS values it at (`updatePortfolio`, see `TwsCommand::SubscribePortfolio`).
     Portfolio(PortfolioRow),
     /// The current time of TWS in seconds since 1970 (`currentTime`, the answer to `TwsCommand::RequestCurrentTime`).

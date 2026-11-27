@@ -8,7 +8,7 @@
 
 use strategy::{
     bars, fees, legacy_names, market_calendar, position_value, pricing, reconcile, reports, strikes, template_form, trade_entry, trade_exit, trade_live,
-    trade_rebuild, trade_summary,
+    trade_rebuild, trade_summary, unmanaged,
 };
 mod app;
 mod calendar;

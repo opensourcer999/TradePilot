@@ -108,11 +108,17 @@ pub(super) fn target_mode(trade: &StoredTrade) -> ExitMode {
 
 /// The typed profit target as a price to close: a price, or as a percentage (`ExitUnit::Percent`, or a `%` typed after it) the share
 /// of the credit to keep (e.g. 80% of a credit of 1.60 = closed at 0.32), worked out like the percentage target of a template; a target
-/// of 100% closes at 0.05. `None` for empty or unreadable text, a percentage above 100 or a value that is not above 0.
+/// of 100% closes at 0.05. A debit trade's target is the value to sell it at; as a percentage the gain on the debit (50% of 2.00 = sold
+/// at 3.00), like the percentage target of a template. `None` for empty or unreadable text, a percentage of a credit above 100 or a value
+/// that is not above 0.
 pub(super) fn typed_target(text: &str, unit: ExitUnit, price_open: Decimal) -> Option<Decimal> {
     let (value, is_percent) = number_of(text, unit)?;
     if !is_percent {
         return Some(value);
+    }
+    if price_open < Decimal::ZERO {
+        let paid = price_open.abs();
+        return paid.checked_add(paid.checked_mul(value)?.checked_div(Decimal::ONE_HUNDRED)?);
     }
     let percent = Some(value).filter(|p| *p <= Decimal::ONE_HUNDRED)?;
     let price = price_open.checked_mul(Decimal::ONE_HUNDRED.checked_sub(percent)?)?.checked_div(Decimal::ONE_HUNDRED)?;
@@ -125,11 +131,17 @@ pub(super) fn typed_target(text: &str, unit: ExitUnit, price_open: Decimal) -> O
 
 /// The typed stop as a price to close: a price, or as a percentage (`ExitUnit::Percent`, or a `%` typed after it) the loss on the
 /// credit it allows (e.g. 300% of a credit of 1.60 = a loss of 4.80, stopped at 6.40), worked out like the stop multiple of a template
-/// (300% = multiple 3). `None` for empty or unreadable text or a value that is not above 0.
+/// (300% = multiple 3). A debit trade's stop is the value to sell it at; as a percentage the loss of the debit it allows (50% of 2.00 =
+/// stopped at 1.00), like the stop multiple of a template on a debit; a debit cannot lose more than 100%. `None` for empty or unreadable
+/// text or a value that is not above 0.
 pub(super) fn typed_stop(text: &str, unit: ExitUnit, price_open: Decimal) -> Option<Decimal> {
     let (percent, is_percent) = number_of(text, unit)?;
     if !is_percent {
         return Some(percent);
+    }
+    if price_open < Decimal::ZERO {
+        let paid = price_open.abs();
+        return paid.checked_sub(paid.checked_mul(percent)?.checked_div(Decimal::ONE_HUNDRED)?).filter(|price| *price > Decimal::ZERO);
     }
     let loss = price_open.checked_mul(percent)?.checked_div(Decimal::ONE_HUNDRED)?;
     price_open.checked_add(loss).filter(|price| *price > Decimal::ZERO)
@@ -144,9 +156,11 @@ impl App {
             return;
         }
         let (stop_mode, target_mode) = (stop_mode(trade), target_mode(trade));
+        // A debit trade's prices are shown as the value of the position: a debit combo's are negative on the wire.
+        let debit = trade.price_open < Decimal::ZERO;
         let shown = |mode: ExitMode, price: Option<Decimal>| {
             if mode == ExitMode::Change {
-                price.map(|p| p.normalize().to_string()).unwrap_or_default()
+                price.map(|p| if debit { p.abs() } else { p }.normalize().to_string()).unwrap_or_default()
             } else {
                 String::new()
             }
@@ -157,6 +171,8 @@ impl App {
         let (stop_unit, target_unit) = (unit(&stop), unit(&target));
         let key = trade.key();
         self.exits_pending = Some(PendingExits { index, key, stop, target, stop_unit, target_unit });
+        // What other API clients have working now: their orders on the trade's contracts hold back sending (`other_client_lock`).
+        self.request_all_open_orders(true);
     }
 
     fn block_exits(&mut self, reason: &str) {
@@ -171,8 +187,10 @@ impl App {
         pending.index = index;
         let de = self.german();
         let (needs_stop, needs_target) = editable_exits(&trade);
-        let ask = self.closing_price(&trade);
-        let blocked = self.order_block_note();
+        let debit = trade.price_open < Decimal::ZERO;
+        // A debit trade is sold: what closing it brings now; a credit trade: what closing it costs.
+        let now = if debit { self.closing_quotes(&trade).1 } else { self.closing_price(&trade) };
+        let blocked = self.order_block_note().map(str::to_string).or_else(|| self.other_client_lock(&trade, de));
         let (mut send, mut cancel) = (false, false);
         egui::Window::new(if de { "Stop / Ziel setzen oder ändern?" } else { "Attach or change a stop / target?" })
             .collapsible(false)
@@ -185,7 +203,15 @@ impl App {
                         ("Trade", trade.label()),
                         (if de { "Menge" } else { "Quantity" }, trade.remaining_qty().to_string()),
                         (if de { "Eröffnet zu" } else { "Opened at" }, trade.price_open.normalize().to_string()),
-                        (if de { "Schließkurs jetzt" } else { "Cost to close now" }, ask.map_or_else(|| "-".to_string(), |a| a.normalize().to_string())),
+                        (
+                            match (debit, de) {
+                                (false, true) => "Schließkurs jetzt",
+                                (false, false) => "Cost to close now",
+                                (true, true) => "Erlös beim Schließen jetzt",
+                                (true, false) => "Proceeds of closing now",
+                            },
+                            now.map_or_else(|| "-".to_string(), |a| a.normalize().to_string()),
+                        ),
                     ];
                     for (label, value) in rows {
                         ui.label(RichText::new(label).color(muted_text()));
@@ -204,15 +230,16 @@ impl App {
                     }
                 });
                 ui.add_space(8.0);
-                ui.label(if de {
-                    "Die Orders schließen alle Legs, laufen als OCA-Gruppe (eine füllt, die andere wird storniert) und werden am Trade vermerkt. Leer lassen = nicht setzen. Ein vorhandener Stop/Ziel wird mit dem neuen Preis geändert. Wähle je Feld „Kurs“ (Schließkurs pro Kontrakt) oder „%“ (vom Kredit, bei 1,60 Kredit): Ziel 80 % = Schließen zu 0,32, Stop 300 % = 300 % Verlust, Stop bei 6,40."
-                } else {
-                    "The orders close every leg and run as one OCA group (one fills, the other is cancelled); they are recorded on the trade. Leave a field empty to skip it. An existing stop/target is changed to the new price. Choose \"Price\" (price to close per contract) or \"%\" (of the credit, credit 1.60) for each field: a target of 80% closes at 0.32, a stop of 300% allows a loss of 300% and stops at 6.40."
+                ui.label(match (debit, de) {
+                    (false, true) => "Die Orders schließen alle Legs, laufen als OCA-Gruppe (eine füllt, die andere wird storniert) und werden am Trade vermerkt. Leer lassen = nicht setzen. Ein vorhandener Stop/Ziel wird mit dem neuen Preis geändert. Wähle je Feld „Kurs“ (Schließkurs pro Kontrakt) oder „%“ (vom Kredit, bei 1,60 Kredit): Ziel 80 % = Schließen zu 0,32, Stop 300 % = 300 % Verlust, Stop bei 6,40.",
+                    (false, false) => "The orders close every leg and run as one OCA group (one fills, the other is cancelled); they are recorded on the trade. Leave a field empty to skip it. An existing stop/target is changed to the new price. Choose \"Price\" (price to close per contract) or \"%\" (of the credit, credit 1.60) for each field: a target of 80% closes at 0.32, a stop of 300% allows a loss of 300% and stops at 6.40.",
+                    (true, true) => "Debit-Trade: Stop und Ziel sind der Wert pro Kontrakt, zu dem die Position verkauft wird; der Stop liegt unter dem Erlös jetzt, das Ziel darüber. Die Orders schließen alle Legs, laufen als OCA-Gruppe und werden am Trade vermerkt. Leer lassen = nicht setzen. Wähle je Feld „Kurs“ oder „%“ (vom Debit, bei 2,00 bezahlt): Stop 50 % = 50 % Verlust, Stop bei 1,00; Ziel 50 % = 50 % Gewinn, Ziel bei 3,00.",
+                    (true, false) => "Debit trade: stop and target are the value per contract the position is sold at; the stop lies below what closing brings now, the target above. The orders close every leg, run as one OCA group and are recorded on the trade. Leave a field empty to skip it. Choose \"Price\" or \"%\" (of the debit, 2.00 paid) for each field: a stop of 50% allows a loss of 50% and stops at 1.00; a target of 50% is a gain of 50%, at 3.00.",
                 });
                 if !needs_stop || !needs_target {
                     ui.label(RichText::new(locked_note(de)).small().color(muted_text()));
                 }
-                (send, cancel) = super::send_or_cancel(ui, de, if de { "Jetzt übertragen" } else { "Send now" }, blocked);
+                (send, cancel) = super::send_or_cancel(ui, de, if de { "Jetzt übertragen" } else { "Send now" }, blocked.as_deref());
             });
         if send {
             self.exits_pending = Some(pending);
@@ -241,13 +268,13 @@ impl App {
         let stop = stop_editable.then(|| typed_stop(&pending.stop, pending.stop_unit.unwrap_or(ExitUnit::Price), trade.price_open)).flatten();
         let target = target_editable.then(|| typed_target(&pending.target, pending.target_unit.unwrap_or(ExitUnit::Price), trade.price_open)).flatten();
         if stop.is_none() && target.is_none() {
-            self.block_exits("enter a price above 0 for the stop or the target, or a percentage of the credit (e.g. a stop of 300%, a target of 80%)");
+            self.block_exits("enter a price above 0 for the stop or the target, or a percentage of the entry price (e.g. a stop of 300%, a target of 80%)");
             return;
         }
-        // A stop far above anything the trade can cost to close is a percentage typed as a price.
-        if let Some(stop) =
-            stop.filter(|stop| trade.price_open.checked_mul(Decimal::from(STOP_PRICE_LIMIT)).is_some_and(|limit| limit > Decimal::ZERO && *stop > limit))
-        {
+        let debit = trade.price_open < Decimal::ZERO;
+        // A stop far above anything the trade can cost to close (or, for a debit, be worth) is a percentage typed as a price.
+        let paid = trade.price_open.abs();
+        if let Some(stop) = stop.filter(|stop| paid.checked_mul(Decimal::from(STOP_PRICE_LIMIT)).is_some_and(|limit| limit > Decimal::ZERO && *stop > limit)) {
             self.block_exits(&format!(
                 "a stop at {} is more than {STOP_PRICE_LIMIT} times the opening price {} - was it meant as a percentage?",
                 stop.normalize(),
@@ -256,11 +283,9 @@ impl App {
             self.exits_pending = Some(pending);
             return;
         }
+        // What the market says now, before the prices go on the wire: a credit trade's cost to close, a debit trade's proceeds.
+        let now = if debit { self.closing_quotes(&trade).1 } else { live_legs(&trade, &self.chains).and_then(|legs| legs.current_ask(&trade.trade_type)) };
         let legs = trade_exit::close_legs(&trade);
-        if trade.price_open <= Decimal::ZERO {
-            self.block_exits("only credit trades are supported - set the stop of a debit trade in TWS");
-            return;
-        }
         let Some(contract) = trade_exit::exit_contract(&trade, &legs) else {
             self.block_exits("the closing order cannot be built (legs missing - a trade from before V0.97?)");
             return;
@@ -269,10 +294,15 @@ impl App {
             self.block_exits("not connected to TWS");
             return;
         };
+        if let Some(reason) = self.other_client_lock(&trade, false) {
+            self.block_exits(&reason);
+            self.exits_pending = Some(pending);
+            return;
+        }
         let leg_count = legs.len();
         let on_grid = |price: Option<Decimal>| match price {
             None => Ok(None),
-            Some(price) => fix_price(price, &trade.symbol, leg_count).map(Some).ok_or(()),
+            Some(price) => fix_price(trade_exit::typed_exit_on_wire(trade.price_open, leg_count, price), &trade.symbol, leg_count).map(Some).ok_or(()),
         };
         let (Ok(stop), Ok(target)) = (on_grid(stop), on_grid(target)) else {
             self.block_exits("a price cannot be put on the exchange's price grid");
@@ -285,14 +315,21 @@ impl App {
             self.block_exits("the prices are the ones on record (on the exchange's price grid) - nothing to change");
             return;
         }
-        // A stop that is passed already or a target that is reached already would trigger at once.
-        if let Some(ask) = live_legs(&trade, &self.chains).and_then(|legs| legs.current_ask(&trade.trade_type)) {
-            if stop.is_some_and(|stop| ask >= stop) {
-                self.block_exits(&format!("the stop is passed already (the trade costs {} to close now)", ask.normalize()));
+        // A stop that is passed already or a target that is reached already would trigger at once. A debit trade is sold: its stop lies
+        // below what it brings now, its target above (the value of the position; a debit combo's wire price is that value negative).
+        if let Some(now) = now {
+            let (stop_passed, target_reached) = if debit {
+                (stop.is_some_and(|stop| now <= stop.abs()), target.is_some_and(|target| now >= target.abs()))
+            } else {
+                (stop.is_some_and(|stop| now >= stop), target.is_some_and(|target| now <= target))
+            };
+            let what = if debit { "brings" } else { "costs" };
+            if stop_passed {
+                self.block_exits(&format!("the stop is passed already (the trade {what} {} to close now)", now.normalize()));
                 return;
             }
-            if target.is_some_and(|target| ask <= target) {
-                self.block_exits(&format!("the target is reached already (the trade costs {} to close now) - it would fill at once", ask.normalize()));
+            if target_reached {
+                self.block_exits(&format!("the target is reached already (the trade {what} {} to close now) - it would fill at once", now.normalize()));
                 return;
             }
         }
@@ -326,7 +363,7 @@ impl App {
             total_quantity: f64::from(trade.remaining_qty()),
             tif: tif.to_string(),
             account: trade.account.clone(),
-            order_ref: crate::trade_rebuild::order_ref(id, kind),
+            order_ref: crate::trade_rebuild::exit_order_ref(trade.order_id, id, kind),
             oca_group: group.clone(),
             oca_type: 3,
             handling: OrderHandling { transmit: true, ..OrderHandling::default() },
@@ -387,6 +424,7 @@ impl App {
         }
         self.save_trade(index, updated);
         self.instant.template_status = Some(format!("{label}: {}", self.tr("stop/target sent to TWS", "Stop/Ziel an die TWS gesendet")));
+        self.trade_edit_done();
     }
 
     /// The status of an order: a change sent from the window takes effect on the trade once TWS reports the order as

@@ -74,6 +74,31 @@ impl Sustained {
     }
 }
 
+/// The exit a trade keeps when the person deletes the other one. Stop and target share an OCA group, and TWS cancels the other orders
+/// of the group with the one cancelled (seen in a real session: the target ended with the deleted stop). The kept exit is placed
+/// again at its price once its orders and the deleted ones have ended.
+#[derive(Clone, Debug)]
+pub struct KeptExit {
+    /// The trade (`StoredTrade::key`).
+    pub trade: String,
+    /// The kept exit is the stop (else the profit target).
+    pub stop: bool,
+    /// Its price on record, as it went to TWS.
+    pub price: Decimal,
+    /// Its orders, which TWS cancels with the deleted ones.
+    pub orders: Vec<i32>,
+    /// A kept stop of a template: its record (order type, offsets, REL, trigger, legs), so it is placed again as the same kind of
+    /// stop; `None` for a plain stop attached in the window.
+    pub record: Option<crate::storage::StopAdjustments>,
+    /// The orders the person deleted.
+    pub deleted: Vec<i32>,
+    /// When the delete was sent: a kept exit whose orders have not ended within `KEPT_EXIT_WAIT` was left alone by TWS.
+    pub at: Instant,
+}
+
+/// How long a kept exit waits for TWS to end its orders (see `KeptExit`).
+pub const KEPT_EXIT_WAIT: Duration = Duration::from_secs(60);
+
 /// What the watchers remember between two looks.
 #[derive(Debug, Default)]
 pub struct WatchState {
@@ -106,6 +131,8 @@ pub struct WatchState {
     pub user_cancelled: HashSet<i32>,
     /// The exit the person is asked to confirm deleting: the trade (index) and whether it is the stop (else the profit target).
     pub delete_asked: Option<(usize, bool)>,
+    /// The other exit of trades whose stop or target the person deleted (see `KeptExit`).
+    pub kept_exits: Vec<KeptExit>,
     /// Stops and profit targets sent again with a new price, by order id: the new price goes on the trade only once TWS
     /// confirms the change, so a modify of an order that has ended meanwhile never shows a stop that does not exist.
     pub exit_changes: HashMap<i32, Decimal>,

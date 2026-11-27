@@ -25,3 +25,4 @@ pub mod trade_rebuild;
 pub mod trade_split;
 pub mod trade_summary;
 pub mod trade_type;
+pub mod unmanaged;

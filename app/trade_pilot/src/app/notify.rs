@@ -47,9 +47,10 @@ impl App {
         self.dispatch_notification(&format!("TradePilot: {event}"), event, message, None, via_email, via_webhook);
     }
 
-    /// Sends a trade notification (opened, stopped, closed) with its HTML body through the channels that are on.
+    /// Sends a trade notification (opened, stopped, closed) with its HTML body through the channels that are on. The email subject
+    /// names the app, as the subject of every other notification does.
     pub(super) fn notify_trade_mail(&self, mail: &TradeMail, via_email: bool, via_webhook: bool) {
-        self.dispatch_notification(&mail.subject, &mail.subject, &mail.text, Some(&mail.html), via_email, via_webhook);
+        self.dispatch_notification(&format!("TradePilot: {}", mail.subject), &mail.subject, &mail.text, Some(&mail.html), via_email, via_webhook);
     }
 
     /// The email (`subject`, with `html` as its body, else `message`) and the webhook (`event`, `message`).
