@@ -32,10 +32,17 @@ use it at your own risk.
 - **Stops and profit targets:** placed once a template trade is filled (stop types,
   REL stops, guardrails, several profit target levels, stop adjustments), closing trades
   by hand, reconciliation with TWS after a connect and after every gap (see "Messages of TWS and what TradePilot does"). A stop or target of a running trade is attached or changed as a price or as a percentage; the unit has to be chosen. Changes made in TWS are taken over.
+  Stop and target share one OCA group, so TWS cancels the other one with a deleted stop or target: TradePilot then places it
+  again at its price, as the same kind of order, in a group of its own. While an order of another API client works on the
+  contracts of a trade, TradePilot sends no stop or target for that trade and says why (both could fill and open a new position).
 - **Dashboard and reports:** live P/L, premium sold and captured, PCR, win rate, delta,
   today's trades, reports with equity curve, daily view and CSV export; trade history
   rebuilt from TWS executions. This includes trades opened or closed elsewhere (another computer, by hand in TWS); a warning is raised when TWS no longer holds the options of an open trade.
 - **Live data:** index quotes with the VIX9D/VIX ratio, and the open positions with price, market value and profit or loss (amount and percent) as TWS values them.
+- **Positions without a trade:** option positions TWS holds that no open trade of TradePilot accounts for (opened by hand in
+  TWS, by another program or on another computer) are listed with their DTE and the part that has no trade. Ticking the legs
+  and "Take over as trade" makes them a trade: a window shows the trade and its entry price to check, then it is an open trade like
+  any other (valuation, stop and target, closing). Nothing is sent to TWS when taking over.
 - **Tables:** in the Dashboard tables and the live positions, columns are moved by dragging a header and sized by dragging the border between two headers (a double click on a border restores the widths); both are remembered.
 - **Automatic entries:** a template trade can be entered at a set time on set days without
   anyone present, optionally only when a market condition holds. It goes through the same
@@ -50,7 +57,8 @@ use it at your own risk.
   side then has a stop and a profit target of its own.
 - **Safety features:** a trade can be closed automatically when it stays a set percent beyond its stop for a set time, or when
   TWS refuses its stop for margin; an entry refused for margin can be sent again up to three times. Warnings for missing stops,
-  high slippage, a trade beyond its stop and more go by email or webhook.
+  high slippage, a trade beyond its stop and more go by email or webhook (switches under Settings > Notifications); every
+  email subject starts with "TradePilot:".
 - **Housekeeping:** old log lines and files are removed after a set number of days, the settings are backed up once a day (the
   file name carries the computer name), and the trades of the day can be written to a CSV file after the close.
 - **Metal design:** the one look of the whole app, modelled on brushed and polished metal: lit steel plates and frames, raised
